@@ -398,7 +398,7 @@ struct ProviderConfig {
 
 ## 8. TUI 层
 
-ratatui + crossterm。布局自上而下:**transcript(可滚动,占大部分高度)/ 状态行(1 行)/ 输入框(1–3 行)**;权限确认时,确认框内联于输入框上方(显示工具名 + diff + `[y/n]`)。
+ratatui + crossterm。布局自上而下:**顶栏(1 行,品牌标识)/ transcript(可滚动,占大部分高度)/ 状态行(1 行)/ 输入框(1–3 行)**;权限确认时,确认框内联于输入框上方(显示工具名 + diff + `[y/n]`)。顶栏据 UI 原型补入(见 `设计规范/` C1),只放品牌(`✦ mysteries agent · v1.0`);provider/model 不在顶栏重复,统一归状态行。
 
 需求点名要"可见地渲染"工具调用过程与结果:transcript 中每个 tool call 渲染成可识别的块——调了哪个工具、参数摘要、result 的 stdout/exit/是否截断,不能只躺在内部 history。状态行实时反映**阶段**(`CallingModel` / `ExecutingTool(x)` / `WaitingForPermission` / `Idle`),与 `/status` 快照(provider·model·当前轮次·cwd·消息数)是两个东西,都要。
 

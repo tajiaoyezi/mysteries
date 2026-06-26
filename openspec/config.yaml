@@ -1,20 +1,35 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+# 生成 proposal / spec / tasks 时注入给 AI 的项目上下文。
+context: |
+  # 产物形态
+  Mysteries Agent 是 Rust 实现的 TUI 终端编码 Agent(ratatui + crossterm),非 web / GUI。
+  核心能力(Agent Loop、工具系统、权限门、Provider 归一化、配置 merge)必须自实现,
+  禁止第三方 Agent SDK / Framework。详见 技术方案/ 与 CLAUDE.md。
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  # 权威次序(冲突时显式指出,不静默选边)
+  行为 / 逻辑:code / 编译器 / 测试 > spec > Agent 推断。
+  视觉 / 版式:tui/theme.rs + insta 快照(code + tests) > 设计规范/(text 契约)
+              > UI设计/*.html 原型(人工参考) > Agent 推断。
+
+  # 视觉权威 = 设计规范/
+  视觉与组件一律以 `设计规范/` 为准(令牌 / 布局 / 组件 / 交互)。
+  `UI设计/*.html` 原型仅供人工肉眼参考,禁止作为 diff 或引用依据(bundled blob)。
+  实现目标是 TUI,与 web 原型为「语义保真」非「像素一致」:
+  布局分区、信息层级、配色语义、组件状态、交互必须对齐;
+  圆角 / 阴影 / 动画等按 `设计规范/README.md` 的 port / adapt / drop 三分类处理。
+
+  # 流程
+  遵循 OpenSpec:propose / spec → 实现 → archive。
+  强制 TDD 范围(headless 内核)与 TUI 事后快照规则见 CLAUDE.md。
+
+# 按 artifact 施加的额外规则。
+rules:
+  proposal:
+    - 任何触及 UI 的 change,必须在 proposal 引用 `设计规范/` 的具体条目或组件项(如「C6 权限框」「token accent.primary」)。
+    - UI change 须显式标注与原型的偏差,并归类 port / adapt / drop。
+  spec:
+    - 触及 UI 的需求,验收场景须可由 insta 快照或 theme.rs 单测验证;不得用「看起来像原型」这类不可执行表述。
+  tasks:
+    - UI task 验收必须含:① 与 `设计规范/` 的对照点;② insta 快照(TestBackend);配色相关另加 theme.rs token 单测。
+    - 首个 UI 组件快照须人工对 `设计规范/原型截图/` 审一次,再 approve。
