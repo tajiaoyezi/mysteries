@@ -1,33 +1,14 @@
-mod agent;
-mod config;
-mod credential;
-mod error;
-mod permission;
-mod provider;
-mod tool;
-
-use crate::agent::run_single_turn;
-use crate::error::ProviderError;
-use crate::provider::mock::MockProvider;
-use crate::provider::{DeltaSink, FinishReason, ModelResponse};
+use mysteries::cli::{run_cli, CliError, CliPaths};
 use std::env;
-use std::io::{self, Write};
+use std::io;
+use std::path::PathBuf;
 
 #[tokio::main]
-async fn main() -> Result<(), ProviderError> {
-    let prompt = read_prompt()
-        .map_err(|err| ProviderError::Transport(format!("failed to read prompt: {err}")))?;
-    let provider = MockProvider::new(vec![ModelResponse {
-        text: format!("mock response: {prompt}"),
-        tool_calls: Vec::new(),
-        finish_reason: FinishReason::Stop,
-    }]);
-    let sink = StdoutSink;
+async fn main() -> Result<(), CliError> {
+    let prompt = read_prompt()?;
+    let paths = default_paths()?;
 
-    let _ = run_single_turn(&provider, &prompt, &sink).await?;
-    println!();
-
-    Ok(())
+    run_cli(paths, &prompt).await
 }
 
 fn read_prompt() -> io::Result<String> {
@@ -45,11 +26,23 @@ fn read_prompt() -> io::Result<String> {
     Ok(input)
 }
 
-struct StdoutSink;
+fn default_paths() -> io::Result<CliPaths> {
+    let cwd = env::current_dir()?;
+    let config_dir = home_dir()
+        .map(|home| home.join(".config").join("mysteries"))
+        .unwrap_or_else(|| cwd.join(".mysteries-missing-home"));
 
-impl DeltaSink for StdoutSink {
-    fn on_text(&self, text: &str) {
-        print!("{text}");
-        let _ = io::stdout().flush();
-    }
+    Ok(CliPaths {
+        user_config: config_dir.join("config.toml"),
+        project_config: cwd.join("mysteries.toml"),
+        credentials: config_dir.join("credentials"),
+        cwd,
+    })
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
 }

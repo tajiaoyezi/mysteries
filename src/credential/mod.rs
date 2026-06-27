@@ -33,6 +33,12 @@ impl EnvCredentialSource {
     }
 }
 
+impl Default for EnvCredentialSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CredentialSource for EnvCredentialSource {
     fn resolve(&self, provider: &str) -> Option<SecretString> {
         let env_name = match provider {

@@ -6,7 +6,7 @@ use crate::permission::{gate, PermissionDecider, PermissionDecision};
 use crate::provider::{DeltaSink, ModelRequest, Provider};
 use crate::tool::{ToolContext, ToolRegistry};
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant.";
 const DEFAULT_MODEL: &str = "mock-model";
 
 pub async fn run_single_turn(
