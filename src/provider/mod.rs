@@ -6,6 +6,8 @@ use serde_json::Value;
 use std::sync::Arc;
 
 pub mod mock;
+pub mod openai;
+pub mod stream;
 pub mod wire;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
