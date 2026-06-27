@@ -1,2 +1,6 @@
 # IDE — IntelliJ IDEA(含 workspace.xml 等本机用户态,不入库)
 .idea/
+.agents
+
+# Rust 构建输出
+/target/
