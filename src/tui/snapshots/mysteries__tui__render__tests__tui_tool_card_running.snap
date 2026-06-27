@@ -2,14 +2,12 @@
 source: src/tui/render.rs
 expression: text
 ---
-✦ mysteries  agent · v1.0
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
-────────────────────────────────────────────────────────────────────────────────
-┌─ ◇ read_file {"path":"note.txt"}  只读 · 自动运行
-│ output: 运行中…
-└──────────────────────────────────────────────────────────────────────────────
-
-
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹border.subtle›┌─ ‹/›‹accent.primary›◇‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› {"path":"note.txt"}‹/›‹text.secondary›  只读 · 自动运行‹/›
+‹border.subtle›│ ‹/›‹text.secondary›output: ‹/›‹text.body›运行中…‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
 
 
 
@@ -22,7 +20,9 @@ expression: text
 
 
 
-status: ◇ 就绪
-┌──────────────────────────────────────────────────────────────────────────────┐
-│mysteries ▸ 输入任务,或 / 执行命令…                                           │
-└──────────────────────────────────────────────────────────────────────────────┘
+
+
+‹text.secondary›status: ‹/›‹text.muted›◇ 就绪‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›

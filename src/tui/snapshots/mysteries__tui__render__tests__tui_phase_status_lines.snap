@@ -2,7 +2,7 @@
 source: src/tui/render.rs
 expression: text
 ---
-idle: status: ◇ 就绪
-calling: status: 调用模型…
-executing: status: 执行 write_file…
-waiting: status: ▲ 等待授权…
+idle: ‹text.secondary›status: ‹/›‹text.muted›◇ 就绪‹/›
+calling: ‹text.secondary›status: ‹/›‹accent.primary›调用模型…‹/›
+executing: ‹text.secondary›status: ‹/›‹accent.primary›执行 write_file…‹/›
+waiting: ‹text.secondary›status: ‹/›‹warning.fg›▲ 等待授权…‹/›

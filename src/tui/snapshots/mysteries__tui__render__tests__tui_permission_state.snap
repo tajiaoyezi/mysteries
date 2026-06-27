@@ -2,27 +2,27 @@
 source: src/tui/render.rs
 expression: text
 ---
-✦ mysteries  agent · v1.0
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
-────────────────────────────────────────────────────────────────────────────────
-✦ MYSTERIES
-AGENT · v1.0 · 终端编码助手
-读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等你按下 y 才动手。
-试试 ↓
-〔任务〕 给 Config 加 timeout_secs 字段
-〔/help〕 查看内置命令
-〔/status〕 当前会话快照
-〔错误〕 演示:鉴权失败(致命错误,终止 Loop)
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹text.title +bold›✦ MYSTERIES‹/›
+‹accent.primary›AGENT · v1.0 · 终端编码助手‹/›
+‹text.body›读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等你按下 y 才动手。‹/›
+‹text.muted›试试 ↓‹/›
+‹accent.primary›〔任务〕‹/›‹text.primary› 给 Config 加 timeout_secs 字段‹/›
+‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›
+‹accent.primary›〔/status〕‹/›‹text.primary› 当前会话快照‹/›
+‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
 
 
-┌──────────────────────────────────────────────────────────────────────────────┐
-│▲ 需要授权                                                                    │
-│tool: write_file                                                              │
-│args: {"content":"hello","path":"note.txt"}                                   │
-│[y · 允许]   [n · 拒绝]                                                       │
-│提示:Enter = 允许 · Esc = 拒绝                                                │
-└──────────────────────────────────────────────────────────────────────────────┘
-status: ▲ 等待授权…
-┌──────────────────────────────────────────────────────────────────────────────┐
-│mysteries ▸ 输入任务,或 / 执行命令…                                           │
-└──────────────────────────────────────────────────────────────────────────────┘
+‹warning.fg bg=warning.bg›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹warning.fg bg=warning.bg›│‹/›‹warning.fg bg=warning.bg +bold›▲ 需要授权‹/›‹text.primary bg=warning.bg›                                                                    ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›tool: ‹/›‹accent.primary bg=warning.bg›write_file‹/›‹text.primary bg=warning.bg›                                                              ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›args: ‹/›‹text.body bg=warning.bg›{"content":"hello","path":"note.txt"}‹/›‹text.primary bg=warning.bg›                                   ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│[y · 允许]   [n · 拒绝]‹/›‹text.primary bg=warning.bg›                                                       ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›提示:Enter = 允许 · Esc = 拒绝‹/›‹text.primary bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.secondary›status: ‹/›‹warning.fg›▲ 等待授权…‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›

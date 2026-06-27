@@ -13,6 +13,7 @@ pub mod app;
 pub mod channel;
 pub mod render;
 pub mod terminal;
+pub mod theme;
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -38,10 +39,11 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let mut terminal = terminal::TerminalGuard::new()?;
     let mut state = app::AppState::new();
     let mut events = EventStream::new();
+    let theme = theme::Theme::midnight();
 
     terminal
         .terminal_mut()
-        .draw(|frame| render::render(frame, &state))?;
+        .draw(|frame| render::render(frame, &state, &theme))?;
 
     loop {
         tokio::select! {
@@ -69,7 +71,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
 
         terminal
             .terminal_mut()
-            .draw(|frame| render::render(frame, &state))?;
+            .draw(|frame| render::render(frame, &state, &theme))?;
     }
 
     drop(input_tx);
