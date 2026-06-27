@@ -28,7 +28,7 @@ rules:
   proposal:
     - 任何触及 UI 的 change,必须在 proposal 引用 `设计规范/` 的具体条目或组件项(如「C6 权限框」「token accent.primary」)。
     - UI change 须显式标注与原型的偏差,并归类 port / adapt / drop。
-  spec:
+  specs:
     - 触及 UI 的需求,验收场景须可由 insta 快照或 theme.rs 单测验证;不得用「看起来像原型」这类不可执行表述。
   tasks:
     - UI task 验收必须含:① 与 `设计规范/` 的对照点;② insta 快照(TestBackend);配色相关另加 theme.rs token 单测。
