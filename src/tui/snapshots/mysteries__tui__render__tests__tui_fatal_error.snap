@@ -5,11 +5,11 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› {"path":"note.txt"}‹/›
-‹border.subtle›│ ‹/›‹text.body›pub struct Config {‹/›
-‹border.subtle›│ ‹/›‹text.body›    pub timeout_secs: u64,‹/›
-‹border.subtle›│ ‹/›‹text.body›}‹/›
-‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
+‹accent.primary›> ‹/›‹text.primary›换 anthropic provider 再跑一次‹/›
+
+‹error.border bg=error.bg›┌─ ‹/›‹error.fg bg=error.bg +bold›致命错误‹/›‹error.border bg=error.bg› ───────────────────────────────────────────────────────────────‹/›
+‹error.border bg=error.bg›│ ‹/›‹error.fg bg=error.bg›鉴权失败:未找到 OPENAI_API_KEY。Agent Loop 已终止。‹/›
+‹error.border bg=error.bg›└──────────────────────────────────────────────────────────────────────────────‹/›
 
 
 

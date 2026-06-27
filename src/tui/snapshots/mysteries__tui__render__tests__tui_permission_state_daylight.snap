@@ -14,15 +14,15 @@ expression: text
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
 
 ‹warning.fg bg=warning.bg›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
-‹warning.fg bg=warning.bg›│‹/›‹warning.fg bg=warning.bg +bold›▲ 需要授权‹/›‹text.primary bg=warning.bg›                                                                    ‹/›‹warning.fg bg=warning.bg›│‹/›
-‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›tool: ‹/›‹accent.primary bg=warning.bg›edit_file‹/›‹text.primary bg=warning.bg›                                                               ‹/›‹warning.fg bg=warning.bg›│‹/›
-‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›args: ‹/›‹text.body bg=warning.bg›path=src/config/mod.rs‹/›‹text.primary bg=warning.bg›                                                  ‹/›‹warning.fg bg=warning.bg›│‹/›
-‹warning.fg bg=warning.bg›│‹/›‹error.fg bg=warning.bg›−     pub max_iterations: u32,‹/›‹text.primary bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
-‹warning.fg bg=warning.bg›│‹/›‹success.fg bg=warning.bg›+     pub timeout_secs: u64,‹/›‹text.primary bg=warning.bg›                                                  ‹/›‹warning.fg bg=warning.bg›│‹/›
-‹warning.fg bg=warning.bg›│[y · 允许]‹/›‹text.body bg=warning.bg›   ‹/›‹error.fg bg=warning.bg›[n · 拒绝]‹/›‹text.primary bg=warning.bg›                                                       ‹/›‹warning.fg bg=warning.bg›│‹/›
-‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›提示:Enter = 允许 · Esc = 拒绝‹/›‹text.primary bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹warning.fg bg=warning.bg +bold›▲ 需要授权‹/›‹text.title bg=warning.bg›                                                                    ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›tool: ‹/›‹accent.primary bg=warning.bg›edit_file‹/›‹text.title bg=warning.bg›                                                               ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›args: ‹/›‹text.body bg=warning.bg›path=src/config/mod.rs‹/›‹text.title bg=warning.bg›                                                  ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹error.fg bg=warning.bg›−     pub max_iterations: u32,‹/›‹text.title bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹success.fg bg=warning.bg›+     pub timeout_secs: u64,‹/›‹text.title bg=warning.bg›                                                  ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│[y · 允许]‹/›‹text.body bg=warning.bg›   ‹/›‹error.fg bg=warning.bg›[n · 拒绝]‹/›‹text.title bg=warning.bg›                                                       ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›提示:Enter = 允许 · Esc = 拒绝‹/›‹text.title bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
 ‹warning.fg bg=warning.bg›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹text.secondary›status: ‹/›‹warning.fg›▲ 等待授权…‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
-‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
+‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.title›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›

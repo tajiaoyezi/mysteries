@@ -8,6 +8,7 @@ use crate::tool::ToolContext;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, MissedTickBehavior};
 
 pub mod app;
 pub mod channel;
@@ -40,6 +41,8 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let mut state = app::AppState::new();
     let mut events = EventStream::new();
     let theme = theme::Theme::midnight();
+    let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
+    spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     terminal
         .terminal_mut()
@@ -53,7 +56,9 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                         if should_exit(&state, key) {
                             break;
                         }
-                        state.on_key(key, &input_tx);
+                        if !handle_scroll_key(&mut terminal, &mut state, key, &theme)? {
+                            state.on_key(key, &input_tx);
+                        }
                     }
                     Some(Ok(Event::Resize(_, _))) => {}
                     Some(Ok(_)) => {}
@@ -66,6 +71,9 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                     Some(event) => state.apply(event),
                     None => break,
                 }
+            }
+            _ = spinner_tick.tick() => {
+                state.advance_spinner();
             }
         }
 
@@ -88,6 +96,25 @@ fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
 
     key.code == KeyCode::Esc
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn handle_scroll_key(
+    terminal: &mut terminal::TerminalGuard,
+    state: &mut app::AppState,
+    key: KeyEvent,
+    theme: &theme::Theme,
+) -> Result<bool, CliError> {
+    let scroll = match key.code {
+        KeyCode::PageUp => app::AppState::page_up,
+        KeyCode::PageDown => app::AppState::page_down,
+        _ => return Ok(false),
+    };
+    let size = terminal.terminal_mut().size()?;
+    let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+    let total_lines = render::transcript_line_count(state, theme);
+    let viewport_lines = render::transcript_viewport_height(area, state);
+    scroll(state, total_lines, viewport_lines);
+    Ok(true)
 }
 
 pub async fn run_agent_task(

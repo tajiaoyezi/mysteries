@@ -6,7 +6,7 @@ expression: text
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 ‹border.subtle›┌─ ‹/›‹error.fg›✗‹/›‹text.muted› ‹/›‹accent.primary +bold›run_shell‹/›‹text.muted› {"path":"note.txt"}‹/›
-‹border.subtle›│ ‹/›‹text.secondary›output: ‹/›‹text.body›command failed: permission denied‹/›
+‹border.subtle›│ ‹/›‹text.body›command failed: permission denied‹/›
 ‹border.subtle›│ ‹/›‹warning.fg›⋯ 输出已截断(超出 max_output_bytes)‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
 

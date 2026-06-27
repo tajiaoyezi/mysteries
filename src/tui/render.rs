@@ -1,4 +1,6 @@
-use crate::tui::app::{AppState, Phase, ToolCard, ToolCardStatus, TranscriptBlock};
+use crate::tui::app::{
+    compute_diff, AppState, DiffKind, DiffLine, Phase, ToolCard, ToolCardStatus, TranscriptBlock,
+};
 use crate::tui::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -13,16 +15,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
         area,
     );
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(permission_height(state)),
-            Constraint::Length(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
+    let rows = layout_rows(area, state);
 
     render_header(frame, rows[0], theme);
     render_transcript(frame, rows[1], state, theme);
@@ -33,12 +26,33 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     render_input(frame, rows[4], state, theme);
 }
 
+pub(crate) fn transcript_line_count(state: &AppState, theme: &Theme) -> usize {
+    transcript_content_lines(state, theme).len()
+}
+
+pub(crate) fn transcript_viewport_height(area: Rect, state: &AppState) -> usize {
+    layout_rows(area, state)[1].height as usize
+}
+
+fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(permission_height(state)),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .split(area)
+}
+
 fn permission_height(state: &AppState) -> u16 {
-    if state.pending_permission.is_some() {
-        7
-    } else {
-        0
-    }
+    let Some(request) = &state.pending_permission else {
+        return 0;
+    };
+    let diff_rows = compute_diff(&request.tool_name, &request.args).len() as u16;
+    7 + diff_rows
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -64,16 +78,34 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
-    let lines = if state.transcript.is_empty() && state.tool_cards.is_empty() {
-        welcome_lines(theme)
-    } else {
-        transcript_lines(state, theme)
-    };
+    let lines = visible_transcript_lines(state, theme, area.height as usize);
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::NONE))
         .style(Style::default().fg(theme.text_primary).bg(theme.bg_base))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn transcript_content_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    if state.transcript.is_empty() && state.tool_cards.is_empty() {
+        welcome_lines(theme)
+    } else {
+        transcript_lines(state, theme)
+    }
+}
+
+fn visible_transcript_lines(
+    state: &AppState,
+    theme: &Theme,
+    viewport_lines: usize,
+) -> Vec<Line<'static>> {
+    let lines = transcript_content_lines(state, theme);
+    let offset = state.visible_scroll_offset(lines.len(), viewport_lines);
+    lines
+        .into_iter()
+        .skip(offset)
+        .take(viewport_lines)
+        .collect()
 }
 
 fn welcome_lines(theme: &Theme) -> Vec<Line<'static>> {
@@ -143,27 +175,57 @@ fn transcript_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
                 ]));
             }
             TranscriptBlock::Error(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled("! ", Style::default().fg(theme.error_fg).bg(theme.bg_base)),
-                    Span::styled(
-                        text.clone(),
-                        Style::default().fg(theme.error_fg).bg(theme.bg_base),
-                    ),
-                ]));
+                lines.extend(error_block_lines(text, theme));
             }
         }
         lines.push(Line::from(""));
     }
     for card in &state.tool_cards {
-        lines.extend(tool_card_lines(card, theme));
+        lines.extend(tool_card_lines(card, state, theme));
         lines.push(Line::from(""));
     }
     lines
 }
 
-fn tool_card_lines(card: &ToolCard, theme: &Theme) -> Vec<Line<'static>> {
+fn error_block_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled(
+                "┌─ ",
+                Style::default().fg(theme.error_border).bg(theme.error_bg),
+            ),
+            Span::styled(
+                "致命错误",
+                Style::default()
+                    .fg(theme.error_fg)
+                    .bg(theme.error_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ───────────────────────────────────────────────────────────────",
+                Style::default().fg(theme.error_border).bg(theme.error_bg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "│ ",
+                Style::default().fg(theme.error_border).bg(theme.error_bg),
+            ),
+            Span::styled(
+                text.to_string(),
+                Style::default().fg(theme.error_fg).bg(theme.error_bg),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "└──────────────────────────────────────────────────────────────────────────────",
+            Style::default().fg(theme.error_border).bg(theme.error_bg),
+        )),
+    ]
+}
+
+fn tool_card_lines(card: &ToolCard, state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let (glyph, glyph_color) = match card.status {
-        ToolCardStatus::Running => ("◇", theme.accent_primary),
+        ToolCardStatus::Running => (state.spinner_glyph(), theme.accent_primary),
         ToolCardStatus::Done => ("✓", theme.success_fg),
         ToolCardStatus::Error => ("✗", theme.error_fg),
     };
@@ -231,10 +293,6 @@ fn tool_output_line(text: &str, theme: &Theme) -> Line<'static> {
             Style::default().fg(theme.border_subtle).bg(theme.bg_base),
         ),
         Span::styled(
-            "output: ",
-            Style::default().fg(theme.text_secondary).bg(theme.bg_base),
-        ),
-        Span::styled(
             text.to_string(),
             Style::default().fg(theme.text_body).bg(theme.bg_base),
         ),
@@ -245,7 +303,7 @@ fn render_permission(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
     let Some(request) = &state.pending_permission else {
         return;
     };
-    let paragraph = Paragraph::new(vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             "▲ 需要授权",
             Style::default()
@@ -275,37 +333,91 @@ fn render_permission(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
                     .bg(theme.warning_bg),
             ),
             Span::styled(
-                request.args.to_string(),
+                permission_args_preview(&request.tool_name, &request.args),
                 Style::default().fg(theme.text_body).bg(theme.warning_bg),
             ),
         ]),
-        Line::from(Span::styled(
-            "[y · 允许]   [n · 拒绝]",
-            Style::default().fg(theme.warning_fg).bg(theme.warning_bg),
-        )),
+    ];
+    lines.extend(
+        compute_diff(&request.tool_name, &request.args)
+            .into_iter()
+            .map(|line| diff_line(line, theme)),
+    );
+    lines.extend([
+        Line::from(vec![
+            Span::styled(
+                "[y · 允许]",
+                Style::default().fg(theme.warning_fg).bg(theme.warning_bg),
+            ),
+            Span::styled(
+                "   ",
+                Style::default().fg(theme.text_body).bg(theme.warning_bg),
+            ),
+            Span::styled(
+                "[n · 拒绝]",
+                Style::default().fg(theme.error_fg).bg(theme.warning_bg),
+            ),
+        ]),
         Line::from(Span::styled(
             "提示:Enter = 允许 · Esc = 拒绝",
             Style::default()
                 .fg(theme.text_secondary)
                 .bg(theme.warning_bg),
         )),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.warning_fg).bg(theme.warning_bg))
-            .style(Style::default().fg(theme.text_primary).bg(theme.warning_bg)),
-    )
-    .style(Style::default().fg(theme.text_primary).bg(theme.warning_bg));
+    ]);
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.warning_fg).bg(theme.warning_bg))
+                .style(Style::default().fg(theme.text_primary).bg(theme.warning_bg)),
+        )
+        .style(Style::default().fg(theme.text_primary).bg(theme.warning_bg));
     frame.render_widget(paragraph, area);
+}
+
+fn permission_args_preview(tool_name: &str, args: &serde_json::Value) -> String {
+    match tool_name {
+        "write_file" | "edit_file" => args
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| format!("path={path}"))
+            .unwrap_or_else(|| args.to_string()),
+        "run_shell" => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|command| format!("command={command}"))
+            .unwrap_or_else(|| args.to_string()),
+        _ => args.to_string(),
+    }
+}
+
+fn diff_line(line: DiffLine, theme: &Theme) -> Line<'static> {
+    let (prefix, color) = match line.kind {
+        DiffKind::Add => ("+ ", theme.success_fg),
+        DiffKind::Del => ("− ", theme.error_fg),
+        DiffKind::Ctx => ("  ", theme.text_body),
+    };
+
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(color).bg(theme.warning_bg)),
+        Span::styled(line.text, Style::default().fg(color).bg(theme.warning_bg)),
+    ])
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
     let (label, color) = match &state.phase {
         Phase::Ready => ("◇ 就绪".to_string(), theme.text_muted),
         Phase::Busy => ("忙".to_string(), theme.accent_primary),
-        Phase::CallingModel => ("调用模型…".to_string(), theme.accent_primary),
-        Phase::ExecutingTool(name) => (format!("执行 {name}…"), theme.accent_primary),
+        Phase::CallingModel => (
+            format!("{} 调用模型…", state.spinner_glyph()),
+            theme.accent_primary,
+        ),
+        Phase::ExecutingTool(name) => (
+            format!("{} 执行 {name}…", state.spinner_glyph()),
+            theme.accent_primary,
+        ),
         Phase::WaitingForPermission => ("▲ 等待授权…".to_string(), theme.warning_fg),
     };
     let paragraph = Paragraph::new(Line::from(vec![
@@ -356,8 +468,8 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
 
 #[cfg(test)]
 mod tests {
-    use super::render;
-    use crate::tui::app::{AppState, Phase, ToolCard, ToolCardStatus};
+    use super::{render, transcript_line_count};
+    use crate::tui::app::{AppState, Phase, ToolCard, ToolCardStatus, TranscriptBlock};
     use crate::tui::channel::{AgentEvent, PermissionRequest};
     use crate::tui::theme::Theme;
     use ratatui::backend::TestBackend;
@@ -543,13 +655,7 @@ mod tests {
 
     #[test]
     fn permission_state_snapshot() {
-        let (tx, _rx) = oneshot::channel();
-        let mut state = AppState::new();
-        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
-            tool_name: "write_file".to_string(),
-            args: json!({ "path": "note.txt", "content": "hello" }),
-            responder: tx,
-        }));
+        let state = permission_state();
         let theme = Theme::midnight();
         let text = render_to_styled(&state, &theme);
 
@@ -558,8 +664,20 @@ mod tests {
     }
 
     #[test]
+    fn permission_state_daylight_snapshot() {
+        let state = permission_state();
+        let text = render_to_styled(&state, &Theme::daylight());
+
+        println!(
+            "\n--- permission daylight frame ---\n{text}\n--- end permission daylight frame ---"
+        );
+        insta::assert_snapshot!("tui_permission_state_daylight", text);
+    }
+
+    #[test]
     fn tool_card_running_snapshot() {
         let mut state = AppState::new();
+        state.spinner_frame = 3;
         state.tool_cards.push(tool_card(
             "read_file",
             ToolCardStatus::Running,
@@ -580,7 +698,7 @@ mod tests {
         state.tool_cards.push(tool_card(
             "write_file",
             ToolCardStatus::Done,
-            Some("wrote note.txt"),
+            Some("pub struct Config {\n    pub timeout_secs: u64,\n}"),
             false,
             false,
         ));
@@ -609,6 +727,92 @@ mod tests {
     }
 
     #[test]
+    fn fatal_error_snapshot() {
+        let state = fatal_error_state();
+        let theme = Theme::midnight();
+        let text = render_to_styled(&state, &theme);
+
+        println!("\n--- fatal error frame ---\n{text}\n--- end fatal error frame ---");
+        insta::assert_snapshot!("tui_fatal_error", text);
+    }
+
+    #[test]
+    fn fatal_error_daylight_snapshot() {
+        let state = fatal_error_state();
+        let text = render_to_styled(&state, &Theme::daylight());
+
+        println!(
+            "\n--- fatal error daylight frame ---\n{text}\n--- end fatal error daylight frame ---"
+        );
+        insta::assert_snapshot!("tui_fatal_error_daylight", text);
+    }
+
+    fn permission_state() -> AppState {
+        let (tx, _rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state.transcript.push(TranscriptBlock::User(
+            "在 Config 里加一个 timeout_secs 字段,默认 30 秒".to_string(),
+        ));
+        state.transcript.push(TranscriptBlock::Assistant(
+            "好的。我先读一下 src/config/schema.rs 里 Config 的结构。".to_string(),
+        ));
+        state.tool_cards.push(ToolCard {
+            id: "read-file-1".to_string(),
+            name: "read_file".to_string(),
+            args: json!({ "path": "schema.rs", "offset": 0, "limit": 40 }),
+            readonly: true,
+            status: ToolCardStatus::Done,
+            output: Some(
+                "pub struct Config {\n    pub model: String,\n    pub max_iterations: u32,\n}"
+                    .to_string(),
+            ),
+            truncated: false,
+        });
+        state.transcript.push(TranscriptBlock::Assistant(
+            "结构清楚了。我在 Config 上加 timeout_secs: u64,并在 Default 里给默认值 30。"
+                .to_string(),
+        ));
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "edit_file".to_string(),
+            args: json!({
+                "path": "src/config/mod.rs",
+                "old_string": "    pub max_iterations: u32,",
+                "new_string": "    pub timeout_secs: u64,"
+            }),
+            responder: tx,
+        }));
+        state
+    }
+
+    fn fatal_error_state() -> AppState {
+        let mut state = AppState::new();
+        state.transcript.push(TranscriptBlock::User(
+            "换 anthropic provider 再跑一次".to_string(),
+        ));
+        state.transcript.push(TranscriptBlock::Error(
+            "鉴权失败:未找到 OPENAI_API_KEY。Agent Loop 已终止。".to_string(),
+        ));
+        state
+    }
+
+    #[test]
+    fn transcript_scroll_window_snapshot() {
+        let mut state = AppState::new();
+        for index in 1..=30 {
+            state
+                .transcript
+                .push(TranscriptBlock::User(format!("line {index:02}")));
+        }
+        let theme = Theme::midnight();
+        let total_lines = transcript_line_count(&state, &theme);
+        state.page_up(total_lines, 17);
+        let text = render_to_styled(&state, &theme);
+
+        println!("\n--- transcript scroll frame ---\n{text}\n--- end transcript scroll frame ---");
+        insta::assert_snapshot!("tui_transcript_scroll_window", text);
+    }
+
+    #[test]
     fn phase_status_lines_snapshot() {
         let phases = [
             ("idle", Phase::Ready),
@@ -621,6 +825,7 @@ mod tests {
         for (label, phase) in phases {
             let mut state = AppState::new();
             state.phase = phase;
+            state.spinner_frame = 3;
             text.push_str(label);
             text.push_str(": ");
             text.push_str(&status_line(&render_to_styled(&state, &Theme::midnight())));

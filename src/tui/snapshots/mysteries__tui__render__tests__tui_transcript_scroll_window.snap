@@ -5,23 +5,23 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› {"path":"note.txt"}‹/›
-‹border.subtle›│ ‹/›‹text.body›pub struct Config {‹/›
-‹border.subtle›│ ‹/›‹text.body›    pub timeout_secs: u64,‹/›
-‹border.subtle›│ ‹/›‹text.body›}‹/›
-‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
+‹accent.primary›> ‹/›‹text.primary›line 14‹/›
 
+‹accent.primary›> ‹/›‹text.primary›line 15‹/›
 
+‹accent.primary›> ‹/›‹text.primary›line 16‹/›
 
+‹accent.primary›> ‹/›‹text.primary›line 17‹/›
 
+‹accent.primary›> ‹/›‹text.primary›line 18‹/›
 
+‹accent.primary›> ‹/›‹text.primary›line 19‹/›
 
+‹accent.primary›> ‹/›‹text.primary›line 20‹/›
 
+‹accent.primary›> ‹/›‹text.primary›line 21‹/›
 
-
-
-
-
+‹accent.primary›> ‹/›‹text.primary›line 22‹/›
 ‹text.secondary›status: ‹/›‹text.muted›◇ 就绪‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›

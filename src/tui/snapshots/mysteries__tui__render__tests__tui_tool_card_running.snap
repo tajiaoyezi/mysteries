@@ -5,8 +5,8 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›┌─ ‹/›‹accent.primary›◇‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› {"path":"note.txt"}‹/›‹text.secondary›  只读 · 自动运行‹/›
-‹border.subtle›│ ‹/›‹text.secondary›output: ‹/›‹text.body›运行中…‹/›
+‹border.subtle›┌─ ‹/›‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› {"path":"note.txt"}‹/›‹text.secondary›  只读 · 自动运行‹/›
+‹border.subtle›│ ‹/›‹text.body›运行中…‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
 
 
