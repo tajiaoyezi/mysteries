@@ -1,20 +1,30 @@
 use mysteries::cli::{run_cli, CliError, CliPaths};
+use mysteries::tui::run_tui;
 use std::env;
 use std::io;
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<(), CliError> {
-    let prompt = read_prompt()?;
+    let args = env::args().skip(1).collect::<Vec<_>>();
     let paths = default_paths()?;
 
-    run_cli(paths, &prompt).await
+    if args.iter().any(|arg| arg == "--headless") {
+        let prompt = read_prompt(&args)?;
+        run_cli(paths, &prompt).await
+    } else {
+        run_tui(paths).await
+    }
 }
 
-fn read_prompt() -> io::Result<String> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    if !args.is_empty() {
-        return Ok(args.join(" "));
+fn read_prompt(args: &[String]) -> io::Result<String> {
+    let prompt_args = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--headless")
+        .cloned()
+        .collect::<Vec<_>>();
+    if !prompt_args.is_empty() {
+        return Ok(prompt_args.join(" "));
     }
 
     let mut input = String::new();

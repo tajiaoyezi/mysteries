@@ -7,6 +7,7 @@ pub mod error;
 pub mod permission;
 pub mod provider;
 pub mod tool;
+pub mod tui;
 
 pub use agent::Agent;
 pub use config::Config;
