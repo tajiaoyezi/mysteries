@@ -5,8 +5,12 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›┌─ ‹/›‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› {"path":"note.txt"}‹/›‹text.secondary›  只读 · 自动运行‹/›
-‹border.subtle›│ ‹/›‹text.body›运行中…‹/›
+‹accent.primary›> ‹/›‹text.primary›给我看一下当前会话状态‹/›
+
+‹border.subtle›┌─ ‹/›‹info.fg +bold›会话快照‹/›‹border.subtle› ───────────────────────────────────────────────────────────‹/›
+‹border.subtle›│ ‹/›‹text.secondary›provider: ‹/›‹text.primary›anthropic               ‹/›‹text.secondary›model: ‹/›‹text.primary›claude-test‹/›
+‹border.subtle›│ ‹/›‹text.secondary›iter: ‹/›‹text.primary›2/8                     ‹/›‹text.secondary›msgs: ‹/›‹text.primary›1‹/›
+‹border.subtle›│ ‹/›‹text.secondary›cwd: ‹/›‹text.primary›workspace               ‹/›‹text.secondary›tools: ‹/›‹text.primary›7‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
 
 
@@ -18,11 +22,7 @@ expression: text
 
 
 
-
-
-
-
-‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                         mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.secondary›status: ‹/›‹text.muted›◇ 就绪           anthropic · claude-test · iter 2/8 · 1 msgs · workspace‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›

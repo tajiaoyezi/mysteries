@@ -12,6 +12,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 
 pub mod app;
 pub mod channel;
+pub mod command;
 pub mod render;
 pub mod terminal;
 pub mod theme;
@@ -25,6 +26,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
         Box::new(FileCredentialSource::new(paths.credentials.clone())),
     ]);
     let provider = crate::app::select_provider(&config, credentials)?;
+    let provider_name = provider.name().to_string();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
     let agent = crate::app::assemble_agent(
@@ -32,13 +34,20 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
         &config,
         Box::new(channel::ChannelDecider::new(ui_tx.clone())),
     );
+    let cwd = paths.cwd.clone();
     let ctx = ToolContext {
-        cwd: paths.cwd,
+        cwd: cwd.clone(),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
     };
     let agent_handle = tokio::spawn(run_agent_task(agent, input_rx, ui_tx, ctx));
     let mut terminal = terminal::TerminalGuard::new()?;
-    let mut state = app::AppState::new();
+    let mut state = app::AppState::with_session(app::SessionSnapshot {
+        provider: provider_name,
+        model: config.model.clone(),
+        max_iterations: config.max_iterations,
+        cwd,
+        tools: crate::app::default_registry().schemas().len(),
+    });
     let mut events = EventStream::new();
     let theme = theme::Theme::midnight();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
@@ -58,6 +67,9 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                         }
                         if !handle_scroll_key(&mut terminal, &mut state, key, &theme)? {
                             state.on_key(key, &input_tx);
+                            if state.should_exit {
+                                break;
+                            }
                         }
                     }
                     Some(Ok(Event::Resize(_, _))) => {}
@@ -118,13 +130,14 @@ fn handle_scroll_key(
 }
 
 pub async fn run_agent_task(
-    agent: Agent,
+    mut agent: Agent,
     mut input_rx: mpsc::UnboundedReceiver<channel::UserInput>,
     ui_tx: mpsc::UnboundedSender<channel::AgentEvent>,
     ctx: ToolContext,
 ) {
     while let Some(input) = input_rx.recv().await {
         match input {
+            channel::UserInput::SetModel(model) => agent.set_model(model),
             channel::UserInput::Prompt(prompt) => {
                 let mut history = vec![
                     Message::System(DEFAULT_SYSTEM_PROMPT.to_string()),
@@ -365,5 +378,46 @@ mod tests {
         let recorded = provider.recorded_requests();
         assert_eq!(recorded[0].model, "tui-test-model");
         assert!(matches!(recorded[0].messages[0], Message::System(_)));
+    }
+
+    #[tokio::test]
+    async fn run_agent_task_applies_set_model_to_next_prompt_without_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "done".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+        }]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let agent = assemble_agent(
+            Box::new(provider.clone()),
+            &config(),
+            Box::new(ChannelDecider::new(ui_tx.clone())),
+        );
+        let ctx = ToolContext {
+            cwd: temp.path().to_path_buf(),
+            max_output_bytes: 4096,
+        };
+
+        let handle = tokio::spawn(run_agent_task(agent, input_rx, ui_tx, ctx));
+        input_tx
+            .send(UserInput::SetModel("tui-next-model".to_string()))
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt("hello".to_string()))
+            .unwrap();
+
+        loop {
+            if let Some(AgentEvent::TurnComplete) = ui_rx.recv().await {
+                break;
+            }
+        }
+
+        drop(input_tx);
+        handle.await.unwrap();
+
+        let recorded = provider.recorded_requests();
+        assert_eq!(recorded[0].model, "tui-next-model");
     }
 }

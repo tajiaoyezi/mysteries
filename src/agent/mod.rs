@@ -84,6 +84,10 @@ impl Agent {
         }
     }
 
+    pub fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+
     pub async fn run(
         &self,
         history: &mut Vec<Message>,
@@ -133,6 +137,7 @@ impl Agent {
                         content: format!("unknown tool: {}", call.name),
                         is_error: true,
                         truncated: false,
+                        exit: None,
                     };
                     history.push(Message::ToolResult {
                         call_id: call.id.clone(),
@@ -155,6 +160,7 @@ impl Agent {
                         content: "user denied tool execution".to_string(),
                         is_error: true,
                         truncated: false,
+                        exit: None,
                     };
                     history.push(Message::ToolResult {
                         call_id: call.id.clone(),
@@ -345,6 +351,7 @@ mod tests {
                 content: args["input"].as_str().unwrap().to_string(),
                 is_error: false,
                 truncated: false,
+                exit: None,
             }
         }
     }
@@ -374,6 +381,7 @@ mod tests {
                 content: "tool failed".to_string(),
                 is_error: true,
                 truncated: false,
+                exit: None,
             }
         }
     }
@@ -406,6 +414,7 @@ mod tests {
                 content: "changed".to_string(),
                 is_error: false,
                 truncated: false,
+                exit: None,
             }
         }
     }
@@ -492,6 +501,27 @@ mod tests {
             })
         );
         assert_eq!(provider.recorded_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_model_updates_next_model_request() {
+        let provider = Arc::new(MockProvider::new(vec![response("after switch")]));
+        let mut agent = Agent::new(
+            Box::new(provider.clone()),
+            ToolRegistry::new(),
+            Box::new(AllowAll),
+            "m1".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let mut history = vec![Message::User("hello".to_string())];
+
+        agent.set_model("m2".to_string());
+        let text = agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        assert_eq!(text, "after switch");
+        let recorded = provider.recorded_requests();
+        assert_eq!(recorded[0].model, "m2");
     }
 
     #[tokio::test]
@@ -599,6 +629,7 @@ mod tests {
                         content: "from tool".to_string(),
                         is_error: false,
                         truncated: false,
+                        exit: None,
                     },
                 },
                 ObservedEvent::Status(AgentStatus::CallingModel),
@@ -653,6 +684,7 @@ mod tests {
                         content: "user denied tool execution".to_string(),
                         is_error: true,
                         truncated: false,
+                        exit: None,
                     },
                 },
                 ObservedEvent::Status(AgentStatus::CallingModel),

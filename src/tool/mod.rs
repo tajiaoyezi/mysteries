@@ -72,6 +72,7 @@ pub struct ToolOutcome {
     pub content: String,
     pub is_error: bool,
     pub truncated: bool,
+    pub exit: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +129,7 @@ mod tests {
                 content: format!("{}:{}", self.name, args["input"].as_str().unwrap()),
                 is_error: false,
                 truncated: false,
+                exit: None,
             }
         }
     }
@@ -160,6 +162,7 @@ mod tests {
                 content: "read_mock:abc".to_string(),
                 is_error: false,
                 truncated: false,
+                exit: None,
             }
         );
         assert!(registry.get("missing").is_none());

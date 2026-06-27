@@ -60,6 +60,7 @@ mod tests {
                 content: "ok".to_string(),
                 is_error: false,
                 truncated: false,
+                exit: None,
             }
         }
     }

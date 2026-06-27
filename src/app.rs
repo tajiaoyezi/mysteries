@@ -13,6 +13,7 @@ use crate::tool::ToolRegistry;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -50,18 +51,25 @@ pub fn select_provider(
     config: &Config,
     credentials: CredentialChain,
 ) -> Result<Box<dyn Provider>, AssemblyError> {
+    let attempt_timeout = Duration::from_secs(config.timeout_secs);
     match config.provider.kind {
         ProviderKind::OpenAi => {
             let provider = match &config.provider.base_url {
-                Some(base_url) => OpenAiProvider::new(base_url, credentials),
-                None => OpenAiProvider::default(credentials),
+                Some(base_url) => {
+                    OpenAiProvider::with_attempt_timeout(base_url, credentials, attempt_timeout)
+                }
+                None => OpenAiProvider::default_with_attempt_timeout(credentials, attempt_timeout),
             };
             Ok(Box::new(provider))
         }
         ProviderKind::Anthropic => {
             let provider = match &config.provider.base_url {
-                Some(base_url) => AnthropicProvider::new(base_url, credentials),
-                None => AnthropicProvider::default(credentials),
+                Some(base_url) => {
+                    AnthropicProvider::with_attempt_timeout(base_url, credentials, attempt_timeout)
+                }
+                None => {
+                    AnthropicProvider::default_with_attempt_timeout(credentials, attempt_timeout)
+                }
             };
             Ok(Box::new(provider))
         }
@@ -115,6 +123,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn load_config_merges_user_and_project_with_project_overrides() {
@@ -234,6 +243,13 @@ kind = "mock"
         }
     }
 
+    fn config_for_with_timeout(kind: ProviderKind, timeout_secs: u64) -> Config {
+        Config {
+            timeout_secs,
+            ..config_for(kind)
+        }
+    }
+
     fn empty_credentials() -> CredentialChain {
         CredentialChain::new(Vec::new())
     }
@@ -252,6 +268,16 @@ kind = "mock"
             .expect("Anthropic should be selectable offline");
 
         assert_eq!(provider.name(), "anthropic");
+    }
+
+    #[test]
+    fn select_provider_injects_configured_attempt_timeout_without_network() {
+        for kind in [ProviderKind::OpenAi, ProviderKind::Anthropic] {
+            let provider = select_provider(&config_for_with_timeout(kind, 12), empty_credentials())
+                .expect("provider should be selectable offline");
+
+            assert_eq!(provider.attempt_timeout(), Some(Duration::from_secs(12)));
+        }
     }
 
     #[tokio::test]

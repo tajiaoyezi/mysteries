@@ -65,16 +65,14 @@ impl Tool for RunShellTool {
             Err(_) => return error_outcome(format!("command timed out after {timeout_secs}s")),
         };
 
-        let code = output
-            .status
-            .code()
-            .map_or_else(|| "signal".to_string(), |code| code.to_string());
+        let exit = output.status.code();
+        let code = exit.map_or_else(|| "signal".to_string(), |code| code.to_string());
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let content = format!("exit: {code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
         let is_error = !output.status.success();
 
-        outcome_with_truncation(content, is_error, ctx.max_output_bytes)
+        outcome_with_truncation(content, is_error, ctx.max_output_bytes, exit)
     }
 }
 
@@ -106,12 +104,14 @@ fn outcome_with_truncation(
     content: String,
     is_error: bool,
     max_output_bytes: usize,
+    exit: Option<i32>,
 ) -> ToolOutcome {
     let (content, truncated) = truncate_utf8(content, max_output_bytes);
     ToolOutcome {
         content,
         is_error,
         truncated,
+        exit,
     }
 }
 
@@ -120,6 +120,7 @@ fn error_outcome(content: impl Into<String>) -> ToolOutcome {
         content: content.into(),
         is_error: true,
         truncated: false,
+        exit: None,
     }
 }
 
@@ -215,6 +216,7 @@ mod tests {
             PermissionLevel::RequiresConfirmation
         );
         assert!(!outcome.is_error);
+        assert_eq!(outcome.exit, Some(0));
         assert!(outcome.content.contains("exit: 0"));
         assert!(outcome.content.contains("shell-out"));
         assert!(outcome.content.contains("shell-err"));
@@ -233,6 +235,7 @@ mod tests {
             .await;
 
         assert!(outcome.is_error);
+        assert_eq!(outcome.exit, Some(7));
         assert!(outcome.content.contains("exit: 7"));
         assert!(outcome.content.contains("failed"));
     }

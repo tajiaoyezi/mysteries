@@ -5,14 +5,14 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹text.title +bold›✦ MYSTERIES‹/›
-‹accent.primary›AGENT · v1.0 · 终端编码助手‹/›
-‹text.body›读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等你按下 y 才动手。‹/›
-‹text.muted›试试 ↓‹/›
-‹accent.primary›〔任务〕‹/›‹text.title› 给 Config 加 timeout_secs 字段‹/›
-‹accent.primary›〔/help〕‹/›‹text.title› 查看内置命令‹/›
-‹accent.primary›〔/status〕‹/›‹text.title› 当前会话快照‹/›
-‹accent.primary›〔错误〕‹/›‹text.title› 演示:鉴权失败(致命错误,终止 Loop)‹/›
+‹border.subtle›┌─ ‹/›‹error.fg›✗‹/›‹text.muted› ‹/›‹accent.primary +bold›run_shell‹/›‹text.muted› {"command":"exit 7"}‹/›
+‹border.subtle›│ ‹/›‹text.body›--- stdout ---‹/›
+‹border.subtle›│ ‹/›‹text.body›failed‹/›
+‹border.subtle›│ ‹/›‹text.body›--- stderr ---‹/›
+‹border.subtle›│ ‹/›‹error.fg›exit 7‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
+
+
 
 
 
@@ -24,5 +24,5 @@ expression: text
 
 ‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                         mock · mock-model · iter 0/4 · 0 msgs · .‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
-‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.title›                                           ‹/›‹border.subtle›│‹/›
+‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›

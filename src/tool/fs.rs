@@ -157,6 +157,7 @@ impl Tool for GlobTool {
             content: entries.join("\n"),
             is_error: false,
             truncated: false,
+            exit: None,
         }
     }
 }
@@ -212,6 +213,7 @@ impl Tool for ListDirTool {
             content: entries.join("\n"),
             is_error: false,
             truncated: false,
+            exit: None,
         }
     }
 }
@@ -309,6 +311,7 @@ fn success_with_truncation(content: String, max_output_bytes: usize) -> ToolOutc
         content,
         is_error: false,
         truncated,
+        exit: None,
     }
 }
 
@@ -317,6 +320,7 @@ fn error_outcome(content: impl Into<String>) -> ToolOutcome {
         content: content.into(),
         is_error: true,
         truncated: false,
+        exit: None,
     }
 }
 
@@ -369,6 +373,7 @@ mod tests {
         assert_eq!(outcome.content, "alpha\nbeta\n");
         assert!(!outcome.is_error);
         assert!(!outcome.truncated);
+        assert_eq!(outcome.exit, None);
     }
 
     #[tokio::test]
@@ -432,6 +437,7 @@ mod tests {
         assert_eq!(tool.name(), "list_dir");
         assert_eq!(tool.permission_level(), PermissionLevel::ReadOnly);
         assert!(!outcome.is_error);
+        assert_eq!(outcome.exit, None);
         assert!(outcome.content.contains("visible.txt"));
         assert!(!outcome.content.contains("ignored.txt"));
     }
@@ -465,6 +471,7 @@ mod tests {
         assert_eq!(tool.name(), "glob");
         assert_eq!(tool.permission_level(), PermissionLevel::ReadOnly);
         assert!(!outcome.is_error);
+        assert_eq!(outcome.exit, None);
         assert!(outcome.content.contains("src/main.rs"));
         assert!(!outcome.content.contains("src/notes.txt"));
         assert!(!outcome.content.contains("src/ignored.rs"));
@@ -497,6 +504,7 @@ mod tests {
         assert_eq!(tool.name(), "grep");
         assert_eq!(tool.permission_level(), PermissionLevel::ReadOnly);
         assert!(!outcome.is_error);
+        assert_eq!(outcome.exit, None);
         assert!(outcome.content.contains("visible.txt:2:needle beta"));
         assert!(!outcome.content.contains("ignored.txt"));
     }

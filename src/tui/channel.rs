@@ -29,6 +29,7 @@ pub enum AgentEvent {
 #[derive(Debug, PartialEq, Eq)]
 pub enum UserInput {
     Prompt(String),
+    SetModel(String),
 }
 
 #[derive(Debug)]
@@ -191,6 +192,7 @@ mod tests {
             content: "ok".to_string(),
             is_error: false,
             truncated: false,
+            exit: None,
         };
 
         observer.on_tool_call_finished("call-1", &outcome);
@@ -232,6 +234,7 @@ mod tests {
                 content: "ok".to_string(),
                 is_error: false,
                 truncated: false,
+                exit: None,
             }
         }
     }

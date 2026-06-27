@@ -22,7 +22,7 @@ expression: text
 ‹accent.primary›> ‹/›‹text.primary›line 21‹/›
 
 ‹accent.primary›> ‹/›‹text.primary›line 22‹/›
-‹text.secondary›status: ‹/›‹text.muted›◇ 就绪‹/›
+‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                        mock · mock-model · iter 0/4 · 30 msgs · .‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›

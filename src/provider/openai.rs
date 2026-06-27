@@ -32,6 +32,25 @@ impl OpenAiProvider {
         Self::new(DEFAULT_BASE_URL, credentials)
     }
 
+    pub fn with_attempt_timeout(
+        base_url: impl Into<String>,
+        credentials: CredentialChain,
+        attempt_timeout: Duration,
+    ) -> Self {
+        Self::with_retry_policy(
+            base_url,
+            credentials,
+            retry_policy_with_attempt_timeout(attempt_timeout),
+        )
+    }
+
+    pub fn default_with_attempt_timeout(
+        credentials: CredentialChain,
+        attempt_timeout: Duration,
+    ) -> Self {
+        Self::with_attempt_timeout(DEFAULT_BASE_URL, credentials, attempt_timeout)
+    }
+
     fn with_retry_policy(
         base_url: impl Into<String>,
         credentials: CredentialChain,
@@ -54,12 +73,20 @@ impl OpenAiProvider {
         body["stream"] = Value::Bool(true);
         body
     }
+
+    pub fn attempt_timeout(&self) -> Duration {
+        self.retry_policy.attempt_timeout
+    }
 }
 
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn attempt_timeout(&self) -> Option<Duration> {
+        Some(self.attempt_timeout())
     }
 
     async fn complete(
@@ -115,11 +142,11 @@ impl Provider for OpenAiProvider {
 }
 
 fn default_retry_policy() -> RetryPolicy {
-    RetryPolicy::new(
-        DEFAULT_MAX_RETRIES,
-        DEFAULT_ATTEMPT_TIMEOUT,
-        DEFAULT_BACKOFF_BASE,
-    )
+    retry_policy_with_attempt_timeout(DEFAULT_ATTEMPT_TIMEOUT)
+}
+
+fn retry_policy_with_attempt_timeout(attempt_timeout: Duration) -> RetryPolicy {
+    RetryPolicy::new(DEFAULT_MAX_RETRIES, attempt_timeout, DEFAULT_BACKOFF_BASE)
 }
 
 #[cfg(test)]

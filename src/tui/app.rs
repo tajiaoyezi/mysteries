@@ -1,8 +1,10 @@
 use crate::agent::AgentStatus;
 use crate::permission::PermissionDecision;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
+use crate::tui::command::{parse_command, Command};
 use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::Value;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -22,6 +24,41 @@ pub enum TranscriptBlock {
     User(String),
     Assistant(String),
     Error(String),
+    Help,
+    Status(StatusSnapshot),
+    Notice(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub provider: String,
+    pub model: String,
+    pub max_iterations: u32,
+    pub cwd: PathBuf,
+    pub tools: usize,
+}
+
+impl Default for SessionSnapshot {
+    fn default() -> Self {
+        Self {
+            provider: "mock".to_string(),
+            model: "mock-model".to_string(),
+            max_iterations: 4,
+            cwd: PathBuf::from("."),
+            tools: 7,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusSnapshot {
+    pub provider: String,
+    pub model: String,
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub messages: usize,
+    pub cwd: PathBuf,
+    pub tools: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +77,7 @@ pub struct ToolCard {
     pub status: ToolCardStatus,
     pub output: Option<String>,
     pub truncated: bool,
+    pub exit: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +120,8 @@ fn diff_lines(value: Option<&Value>, kind: DiffKind) -> Vec<DiffLine> {
 }
 
 pub struct AppState {
+    pub session: SessionSnapshot,
+    pub iteration: u32,
     pub transcript: Vec<TranscriptBlock>,
     pub tool_cards: Vec<ToolCard>,
     pub input: String,
@@ -89,12 +129,19 @@ pub struct AppState {
     pub pending_permission: Option<PermissionRequest>,
     pub scroll_offset: usize,
     pub spinner_frame: usize,
+    pub should_exit: bool,
     follows_bottom: bool,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        Self::with_session(SessionSnapshot::default())
+    }
+
+    pub fn with_session(session: SessionSnapshot) -> Self {
         Self {
+            session,
+            iteration: 0,
             transcript: Vec::new(),
             tool_cards: Vec::new(),
             input: String::new(),
@@ -102,8 +149,33 @@ impl AppState {
             pending_permission: None,
             scroll_offset: 0,
             spinner_frame: 0,
+            should_exit: false,
             follows_bottom: true,
         }
+    }
+
+    pub fn status_snapshot(&self) -> StatusSnapshot {
+        StatusSnapshot {
+            provider: self.session.provider.clone(),
+            model: self.session.model.clone(),
+            iteration: self.iteration,
+            max_iterations: self.session.max_iterations,
+            messages: self.dialog_message_count(),
+            cwd: self.session.cwd.clone(),
+            tools: self.session.tools,
+        }
+    }
+
+    pub fn dialog_message_count(&self) -> usize {
+        self.transcript
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block,
+                    TranscriptBlock::User(_) | TranscriptBlock::Assistant(_)
+                )
+            })
+            .count()
     }
 
     pub fn visible_scroll_offset(&self, total_lines: usize, viewport_lines: usize) -> usize {
@@ -164,6 +236,7 @@ impl AppState {
                     status: ToolCardStatus::Running,
                     output: None,
                     truncated: false,
+                    exit: None,
                 });
             }
             AgentEvent::ToolCallFinished { id, outcome } => {
@@ -179,6 +252,7 @@ impl AppState {
                         card.status = status;
                         card.output = Some(outcome.content);
                         card.truncated = outcome.truncated;
+                        card.exit = outcome.exit;
                     }
                     None => {
                         self.tool_cards.push(ToolCard {
@@ -189,11 +263,15 @@ impl AppState {
                             status,
                             output: Some(outcome.content),
                             truncated: outcome.truncated,
+                            exit: outcome.exit,
                         });
                     }
                 }
             }
             AgentEvent::StatusChanged(status) => {
+                if status == AgentStatus::CallingModel {
+                    self.iteration += 1;
+                }
                 self.phase = match status {
                     AgentStatus::Idle => Phase::Ready,
                     AgentStatus::CallingModel => Phase::CallingModel,
@@ -207,10 +285,12 @@ impl AppState {
             }
             AgentEvent::TurnComplete => {
                 self.pending_permission = None;
+                self.iteration = 0;
                 self.phase = Phase::Ready;
             }
             AgentEvent::Error(message) => {
                 self.pending_permission = None;
+                self.iteration = 0;
                 self.phase = Phase::Ready;
                 self.transcript.push(TranscriptBlock::Error(message));
             }
@@ -242,11 +322,50 @@ impl AppState {
                     return;
                 }
                 self.input.clear();
+                if let Some(command) = parse_command(&prompt) {
+                    self.execute_command(command, input_tx);
+                    return;
+                }
+                self.iteration = 0;
                 self.phase = Phase::Busy;
                 self.transcript.push(TranscriptBlock::User(prompt.clone()));
                 let _ = input_tx.send(UserInput::Prompt(prompt));
             }
             _ => {}
+        }
+    }
+
+    pub fn execute_command(
+        &mut self,
+        command: Command,
+        _input_tx: &mpsc::UnboundedSender<UserInput>,
+    ) {
+        match command {
+            Command::Help => self.transcript.push(TranscriptBlock::Help),
+            Command::Clear => self.transcript.clear(),
+            Command::Status => self
+                .transcript
+                .push(TranscriptBlock::Status(self.status_snapshot())),
+            Command::Exit => self.should_exit = true,
+            Command::Login => self.transcript.push(TranscriptBlock::Notice(
+                "凭据占位:请通过 config / 环境变量配置 API key。".to_string(),
+            )),
+            Command::Logout => self.transcript.push(TranscriptBlock::Notice(
+                "凭据占位:当前版本未保存登录态,无需 logout。".to_string(),
+            )),
+            Command::Unknown(name) => self
+                .transcript
+                .push(TranscriptBlock::Notice(format!("未知命令: /{name}"))),
+            Command::Model(None) => {
+                self.transcript.push(TranscriptBlock::Notice(format!(
+                    "当前 model: {}",
+                    self.session.model
+                )));
+            }
+            Command::Model(Some(model)) => {
+                self.session.model = model.clone();
+                let _ = _input_tx.send(UserInput::SetModel(model));
+            }
         }
     }
 
@@ -279,8 +398,8 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_diff, AppState, DiffKind, DiffLine, Phase, ToolCard, ToolCardStatus,
-        TranscriptBlock,
+        compute_diff, AppState, DiffKind, DiffLine, Phase, SessionSnapshot, StatusSnapshot,
+        ToolCard, ToolCardStatus, TranscriptBlock,
     };
     use crate::agent::AgentStatus;
     use crate::permission::PermissionDecision;
@@ -288,6 +407,7 @@ mod tests {
     use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
+    use std::path::PathBuf;
     use tokio::sync::{mpsc, oneshot};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -298,6 +418,16 @@ mod tests {
         DiffLine {
             kind,
             text: text.to_string(),
+        }
+    }
+
+    fn session() -> SessionSnapshot {
+        SessionSnapshot {
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+            max_iterations: 8,
+            cwd: PathBuf::from("workspace"),
+            tools: 7,
         }
     }
 
@@ -376,6 +506,138 @@ mod tests {
     }
 
     #[test]
+    fn app_state_tracks_session_snapshot_and_iteration_counter() {
+        let mut state = AppState::with_session(session());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        assert_eq!(state.session.provider, "anthropic");
+        assert_eq!(state.session.model, "claude-test");
+        assert_eq!(state.session.max_iterations, 8);
+        assert_eq!(state.session.cwd, PathBuf::from("workspace"));
+        assert_eq!(state.session.tools, 7);
+
+        state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
+        assert_eq!(state.iteration, 1);
+        state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
+        assert_eq!(state.iteration, 2);
+
+        state.apply(AgentEvent::TurnComplete);
+        assert_eq!(state.iteration, 0);
+
+        state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
+        assert_eq!(state.iteration, 1);
+        state.input = "next prompt".to_string();
+        state.on_key(key(KeyCode::Enter), &tx);
+        assert_eq!(state.iteration, 0);
+    }
+
+    #[test]
+    fn slash_commands_clear_help_status_exit_and_do_not_submit_prompt() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::with_session(session());
+        state
+            .transcript
+            .push(TranscriptBlock::User("old".to_string()));
+
+        state.input = "/clear".to_string();
+        state.on_key(key(KeyCode::Enter), &tx);
+        assert!(state.transcript.is_empty());
+        assert!(rx.try_recv().is_err());
+
+        state.input = "/help".to_string();
+        state.on_key(key(KeyCode::Enter), &tx);
+        assert_eq!(state.transcript, vec![TranscriptBlock::Help]);
+
+        state.iteration = 3;
+        state.input = "/status".to_string();
+        state.on_key(key(KeyCode::Enter), &tx);
+        assert_eq!(
+            state.transcript.last(),
+            Some(&TranscriptBlock::Status(StatusSnapshot {
+                provider: "anthropic".to_string(),
+                model: "claude-test".to_string(),
+                iteration: 3,
+                max_iterations: 8,
+                messages: 0,
+                cwd: PathBuf::from("workspace"),
+                tools: 7,
+            }))
+        );
+
+        state.input = "/exit".to_string();
+        state.on_key(key(KeyCode::Enter), &tx);
+        assert!(state.should_exit);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn placeholder_and_unknown_commands_append_notice_without_agent_input() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::with_session(session());
+
+        for input in ["/login", "/logout", "/xyz"] {
+            state.input = input.to_string();
+            state.on_key(key(KeyCode::Enter), &tx);
+        }
+
+        assert!(matches!(
+            &state.transcript[0],
+            TranscriptBlock::Notice(text) if text.contains("凭据")
+        ));
+        assert!(matches!(
+            &state.transcript[1],
+            TranscriptBlock::Notice(text) if text.contains("凭据")
+        ));
+        assert!(matches!(
+            &state.transcript[2],
+            TranscriptBlock::Notice(text) if text.contains("未知命令") && text.contains("xyz")
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn status_snapshot_counts_only_user_and_assistant_dialog_messages() {
+        let mut state = AppState::with_session(session());
+        state
+            .transcript
+            .push(TranscriptBlock::User("u1".to_string()));
+        state.transcript.push(TranscriptBlock::Help);
+        state
+            .transcript
+            .push(TranscriptBlock::Assistant("a1".to_string()));
+        state
+            .transcript
+            .push(TranscriptBlock::Notice("notice".to_string()));
+        state
+            .transcript
+            .push(TranscriptBlock::Error("fatal".to_string()));
+
+        assert_eq!(state.status_snapshot().messages, 2);
+    }
+
+    #[test]
+    fn model_command_shows_current_model_or_sends_set_model() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::with_session(session());
+
+        state.input = "/model".to_string();
+        state.on_key(key(KeyCode::Enter), &tx);
+        assert!(matches!(
+            state.transcript.last(),
+            Some(TranscriptBlock::Notice(text))
+                if text.contains("claude-test") && text.contains("model")
+        ));
+
+        state.input = "/model claude-next".to_string();
+        state.on_key(key(KeyCode::Enter), &tx);
+        assert_eq!(state.session.model, "claude-next");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            UserInput::SetModel("claude-next".to_string())
+        );
+    }
+
+    #[test]
     fn apply_tool_call_started_adds_running_tool_card() {
         let mut state = AppState::new();
 
@@ -396,6 +658,7 @@ mod tests {
                 status: ToolCardStatus::Running,
                 output: None,
                 truncated: false,
+                exit: None,
             }]
         );
     }
@@ -415,6 +678,7 @@ mod tests {
                 content: "wrote note.txt".to_string(),
                 is_error: false,
                 truncated: false,
+                exit: None,
             },
         });
 
@@ -436,6 +700,7 @@ mod tests {
                 content: "command failed: permission denied".to_string(),
                 is_error: true,
                 truncated: true,
+                exit: None,
             },
         });
 

@@ -60,6 +60,7 @@ impl Tool for EditFileTool {
                 content: format!("edited {}", path.display()),
                 is_error: false,
                 truncated: false,
+                exit: None,
             },
             Err(err) => error_outcome(format!("failed to write {}: {err}", path.display())),
         }
@@ -105,6 +106,7 @@ impl Tool for WriteFileTool {
                 content: format!("wrote {}", path.display()),
                 is_error: false,
                 truncated: false,
+                exit: None,
             },
             Err(err) => error_outcome(format!("failed to write {}: {err}", path.display())),
         }
@@ -129,6 +131,7 @@ fn error_outcome(content: impl Into<String>) -> ToolOutcome {
         content: content.into(),
         is_error: true,
         truncated: false,
+        exit: None,
     }
 }
 
@@ -164,6 +167,7 @@ mod tests {
             PermissionLevel::RequiresConfirmation
         );
         assert!(!outcome.is_error);
+        assert_eq!(outcome.exit, None);
         assert_eq!(
             fs::read_to_string(temp.path().join("new.txt")).unwrap(),
             "hello"
@@ -184,6 +188,7 @@ mod tests {
             .await;
 
         assert!(!outcome.is_error);
+        assert_eq!(outcome.exit, None);
         assert_eq!(
             fs::read_to_string(temp.path().join("note.txt")).unwrap(),
             "new"
@@ -245,6 +250,7 @@ mod tests {
             PermissionLevel::RequiresConfirmation
         );
         assert!(!outcome.is_error);
+        assert_eq!(outcome.exit, None);
         assert_eq!(
             fs::read_to_string(temp.path().join("note.txt")).unwrap(),
             "alpha delta gamma"

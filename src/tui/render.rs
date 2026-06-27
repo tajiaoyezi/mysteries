@@ -1,5 +1,6 @@
 use crate::tui::app::{
-    compute_diff, AppState, DiffKind, DiffLine, Phase, ToolCard, ToolCardStatus, TranscriptBlock,
+    compute_diff, AppState, DiffKind, DiffLine, Phase, StatusSnapshot, ToolCard, ToolCardStatus,
+    TranscriptBlock,
 };
 use crate::tui::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -177,6 +178,15 @@ fn transcript_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
             TranscriptBlock::Error(text) => {
                 lines.extend(error_block_lines(text, theme));
             }
+            TranscriptBlock::Help => {
+                lines.extend(help_block_lines(theme));
+            }
+            TranscriptBlock::Status(snapshot) => {
+                lines.extend(status_block_lines(snapshot, theme));
+            }
+            TranscriptBlock::Notice(text) => {
+                lines.extend(notice_block_lines(text, theme));
+            }
         }
         lines.push(Line::from(""));
     }
@@ -185,6 +195,156 @@ fn transcript_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
     lines
+}
+
+fn help_block_lines(theme: &Theme) -> Vec<Line<'static>> {
+    let commands = [
+        ("/help", "查看内置命令"),
+        ("/clear", "清空当前 transcript"),
+        ("/model", "查看当前 model"),
+        ("/model <name>", "切换后续请求 model"),
+        ("/status", "当前会话快照"),
+        ("/exit", "退出 TUI"),
+        ("/login /logout", "凭据占位"),
+    ];
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "┌─ ",
+            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+        ),
+        Span::styled(
+            "帮助",
+            Style::default()
+                .fg(theme.info_fg)
+                .bg(theme.bg_base)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ───────────────────────────────────────────────────────────────",
+            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+        ),
+    ])];
+
+    for row in commands.chunks(2) {
+        let mut spans = vec![Span::styled(
+            "│ ",
+            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+        )];
+        for (index, (cmd, desc)) in row.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(
+                    "   ",
+                    Style::default().fg(theme.text_body).bg(theme.bg_base),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{cmd:<14}"),
+                Style::default()
+                    .fg(theme.accent_primary)
+                    .bg(theme.bg_base)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!("{desc:<18}"),
+                Style::default().fg(theme.text_body).bg(theme.bg_base),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "└──────────────────────────────────────────────────────────────────────────────",
+        Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+    )));
+    lines
+}
+
+fn status_block_lines(snapshot: &StatusSnapshot, theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled(
+                "┌─ ",
+                Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+            ),
+            Span::styled(
+                "会话快照",
+                Style::default()
+                    .fg(theme.info_fg)
+                    .bg(theme.bg_base)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ───────────────────────────────────────────────────────────",
+                Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+            ),
+        ]),
+        status_field_line(
+            "provider",
+            &snapshot.provider,
+            "model",
+            &snapshot.model,
+            theme,
+        ),
+        status_field_line(
+            "iter",
+            &format!("{}/{}", snapshot.iteration, snapshot.max_iterations),
+            "msgs",
+            &snapshot.messages.to_string(),
+            theme,
+        ),
+        status_field_line(
+            "cwd",
+            &snapshot.cwd.display().to_string(),
+            "tools",
+            &snapshot.tools.to_string(),
+            theme,
+        ),
+        Line::from(Span::styled(
+            "└──────────────────────────────────────────────────────────────────────────────",
+            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+        )),
+    ]
+}
+
+fn status_field_line(
+    left_label: &str,
+    left_value: &str,
+    right_label: &str,
+    right_value: &str,
+    theme: &Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "│ ",
+            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+        ),
+        Span::styled(
+            format!("{left_label}: "),
+            Style::default().fg(theme.text_secondary).bg(theme.bg_base),
+        ),
+        Span::styled(
+            format!("{left_value:<24}"),
+            Style::default().fg(theme.text_primary).bg(theme.bg_base),
+        ),
+        Span::styled(
+            format!("{right_label}: "),
+            Style::default().fg(theme.text_secondary).bg(theme.bg_base),
+        ),
+        Span::styled(
+            right_value.to_string(),
+            Style::default().fg(theme.text_primary).bg(theme.bg_base),
+        ),
+    ])
+}
+
+fn notice_block_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    vec![Line::from(vec![
+        Span::styled("◇ ", Style::default().fg(theme.info_fg).bg(theme.bg_base)),
+        Span::styled(
+            text.to_string(),
+            Style::default().fg(theme.text_body).bg(theme.bg_base),
+        ),
+    ])]
 }
 
 fn error_block_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
@@ -259,7 +419,7 @@ fn tool_card_lines(card: &ToolCard, state: &AppState, theme: &Theme) -> Vec<Line
     match &card.output {
         Some(output) if output.is_empty() => lines.push(tool_output_line("", theme)),
         Some(output) => {
-            for line in output.lines() {
+            for line in visible_tool_output_lines(card, output) {
                 lines.push(tool_output_line(line, theme));
             }
         }
@@ -275,6 +435,24 @@ fn tool_card_lines(card: &ToolCard, state: &AppState, theme: &Theme) -> Vec<Line
             Span::styled(
                 "⋯ 输出已截断(超出 max_output_bytes)",
                 Style::default().fg(theme.warning_fg).bg(theme.bg_base),
+            ),
+        ]));
+    }
+
+    if let Some(exit) = card.exit {
+        let color = if exit == 0 {
+            theme.success_fg
+        } else {
+            theme.error_fg
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                "│ ",
+                Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+            ),
+            Span::styled(
+                format!("exit {exit}"),
+                Style::default().fg(color).bg(theme.bg_base),
             ),
         ]));
     }
@@ -297,6 +475,17 @@ fn tool_output_line(text: &str, theme: &Theme) -> Line<'static> {
             Style::default().fg(theme.text_body).bg(theme.bg_base),
         ),
     ])
+}
+
+fn visible_tool_output_lines<'a>(card: &ToolCard, output: &'a str) -> Vec<&'a str> {
+    let mut lines = output.lines().collect::<Vec<_>>();
+    if let Some(exit) = card.exit {
+        let expected_exit = format!("exit: {exit}");
+        if lines.first().is_some_and(|line| *line == expected_exit) {
+            lines.remove(0);
+        }
+    }
+    lines
 }
 
 fn render_permission(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
@@ -420,15 +609,62 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Th
         ),
         Phase::WaitingForPermission => ("▲ 等待授权…".to_string(), theme.warning_fg),
     };
+    let meta = status_meta(state);
+    let left_plain = format!("status: {label}");
+    let padding = area
+        .width
+        .saturating_sub((display_width(&left_plain) + display_width(&meta)) as u16)
+        as usize;
     let paragraph = Paragraph::new(Line::from(vec![
         Span::styled(
             "status: ",
             Style::default().fg(theme.text_secondary).bg(theme.bg_base),
         ),
         Span::styled(label, Style::default().fg(color).bg(theme.bg_base)),
+        Span::styled(
+            " ".repeat(padding),
+            Style::default().fg(theme.text_muted).bg(theme.bg_base),
+        ),
+        Span::styled(
+            meta,
+            Style::default().fg(theme.text_muted).bg(theme.bg_base),
+        ),
     ]))
     .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
     frame.render_widget(paragraph, area);
+}
+
+fn status_meta(state: &AppState) -> String {
+    format!(
+        "{} · {} · iter {}/{} · {} msgs · {}",
+        state.session.provider,
+        state.session.model,
+        state.iteration,
+        state.session.max_iterations,
+        state.dialog_message_count(),
+        state.session.cwd.display()
+    )
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
+}
+
+fn char_width(ch: char) -> usize {
+    if matches!(
+        ch as u32,
+        0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+    ) {
+        2
+    } else {
+        1
+    }
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
@@ -469,7 +705,9 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
 #[cfg(test)]
 mod tests {
     use super::{render, transcript_line_count};
-    use crate::tui::app::{AppState, Phase, ToolCard, ToolCardStatus, TranscriptBlock};
+    use crate::tui::app::{
+        AppState, Phase, SessionSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
+    };
     use crate::tui::channel::{AgentEvent, PermissionRequest};
     use crate::tui::theme::Theme;
     use ratatui::backend::TestBackend;
@@ -477,6 +715,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
     use ratatui::Terminal;
     use serde_json::json;
+    use std::path::PathBuf;
     use tokio::sync::oneshot;
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -627,6 +866,17 @@ mod tests {
             status,
             output: output.map(str::to_string),
             truncated,
+            exit: None,
+        }
+    }
+
+    fn session() -> SessionSnapshot {
+        SessionSnapshot {
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+            max_iterations: 8,
+            cwd: PathBuf::from("workspace"),
+            tools: 7,
         }
     }
 
@@ -672,6 +922,31 @@ mod tests {
             "\n--- permission daylight frame ---\n{text}\n--- end permission daylight frame ---"
         );
         insta::assert_snapshot!("tui_permission_state_daylight", text);
+    }
+
+    #[test]
+    fn help_block_snapshot() {
+        let mut state = AppState::with_session(session());
+        state.transcript.push(TranscriptBlock::Help);
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!("\n--- help block frame ---\n{text}\n--- end help block frame ---");
+        insta::assert_snapshot!("tui_help_block", text);
+    }
+
+    #[test]
+    fn status_block_snapshot() {
+        let mut state = AppState::with_session(session());
+        state
+            .transcript
+            .push(TranscriptBlock::User("给我看一下当前会话状态".to_string()));
+        state.iteration = 2;
+        let snapshot = state.status_snapshot();
+        state.transcript.push(TranscriptBlock::Status(snapshot));
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!("\n--- status block frame ---\n{text}\n--- end status block frame ---");
+        insta::assert_snapshot!("tui_status_block", text);
     }
 
     #[test]
@@ -727,6 +1002,27 @@ mod tests {
     }
 
     #[test]
+    fn run_shell_exit_foot_snapshot() {
+        let mut state = AppState::new();
+        state.tool_cards.push(ToolCard {
+            id: "run-shell-1".to_string(),
+            name: "run_shell".to_string(),
+            args: json!({ "command": "exit 7" }),
+            readonly: false,
+            status: ToolCardStatus::Error,
+            output: Some("exit: 7\n--- stdout ---\nfailed\n--- stderr ---\n".to_string()),
+            truncated: false,
+            exit: Some(7),
+        });
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!(
+            "\n--- run shell exit foot frame ---\n{text}\n--- end run shell exit foot frame ---"
+        );
+        insta::assert_snapshot!("tui_run_shell_exit_foot", text);
+    }
+
+    #[test]
     fn fatal_error_snapshot() {
         let state = fatal_error_state();
         let theme = Theme::midnight();
@@ -767,6 +1063,7 @@ mod tests {
                     .to_string(),
             ),
             truncated: false,
+            exit: None,
         });
         state.transcript.push(TranscriptBlock::Assistant(
             "结构清楚了。我在 Config 上加 timeout_secs: u64,并在 Default 里给默认值 30。"

@@ -5,8 +5,11 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›┌─ ‹/›‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› {"path":"note.txt"}‹/›‹text.secondary›  只读 · 自动运行‹/›
-‹border.subtle›│ ‹/›‹text.body›运行中…‹/›
+‹border.subtle›┌─ ‹/›‹info.fg +bold›帮助‹/›‹border.subtle› ───────────────────────────────────────────────────────────────‹/›
+‹border.subtle›│ ‹/›‹accent.primary +bold›/help         ‹/›‹text.body›查看内置命令               ‹/›‹accent.primary +bold›/clear        ‹/›‹text.body›清空当前 transcript‹/›
+‹border.subtle›│ ‹/›‹accent.primary +bold›/model        ‹/›‹text.body›查看当前 model           ‹/›‹accent.primary +bold›/model <name> ‹/›‹text.body›切换后续请求 model‹/›
+‹border.subtle›│ ‹/›‹accent.primary +bold›/status       ‹/›‹text.body›当前会话快照               ‹/›‹accent.primary +bold›/exit         ‹/›‹text.body›退出 TUI‹/›
+‹border.subtle›│ ‹/›‹accent.primary +bold›/login /logout‹/›‹text.body›凭据占位‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
 
 
@@ -19,10 +22,7 @@ expression: text
 
 
 
-
-
-
-‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                         mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.secondary›status: ‹/›‹text.muted›◇ 就绪           anthropic · claude-test · iter 0/8 · 0 msgs · workspace‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›

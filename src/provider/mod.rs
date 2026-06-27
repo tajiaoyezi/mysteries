@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub mod anthropic;
 pub mod anthropic_stream;
@@ -59,6 +60,10 @@ pub trait DeltaSink: Send + Sync {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
 
+    fn attempt_timeout(&self) -> Option<Duration> {
+        None
+    }
+
     async fn complete(
         &self,
         req: ModelRequest,
@@ -73,6 +78,10 @@ where
 {
     fn name(&self) -> &str {
         self.as_ref().name()
+    }
+
+    fn attempt_timeout(&self) -> Option<Duration> {
+        self.as_ref().attempt_timeout()
     }
 
     async fn complete(
