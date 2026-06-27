@@ -131,6 +131,7 @@ mod tests {
     use crate::permission::{PermissionDecider, PermissionDecision};
     use crate::provider::mock::MockProvider;
     use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall};
+    use crate::tool::edit::WriteFileTool;
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome, ToolRegistry};
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -301,19 +302,27 @@ mod tests {
 
     fn registry_with_echo() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(EchoTool));
+        registry.register(Box::new(EchoTool)).unwrap();
         registry
     }
 
     fn registry_with_error_tool() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ErrorTool));
+        registry.register(Box::new(ErrorTool)).unwrap();
         registry
     }
 
     fn registry_with_confirm_tool(executions: Arc<AtomicUsize>) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ConfirmTool { executions }));
+        registry
+            .register(Box::new(ConfirmTool { executions }))
+            .unwrap();
+        registry
+    }
+
+    fn registry_with_write_file() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WriteFileTool)).unwrap();
         registry
     }
 
@@ -520,6 +529,45 @@ mod tests {
 
         assert_eq!(text, "recovered");
         assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            &history[2],
+            Message::ToolResult {
+                call_id,
+                is_error: true,
+                ..
+            } if call_id == "call-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_loop_denies_write_file_without_creating_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({ "path": "denied.txt", "content": "blocked" }),
+            }]),
+            response("recovered"),
+        ]));
+        let agent = Agent::new(
+            Box::new(provider),
+            registry_with_write_file(),
+            Box::new(DenyAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let mut history = vec![Message::User("hello".to_string())];
+        let ctx = ToolContext {
+            cwd: temp.path().to_path_buf(),
+            max_output_bytes: 4096,
+        };
+
+        let text = agent.run(&mut history, &ctx, &sink).await.unwrap();
+
+        assert_eq!(text, "recovered");
+        assert!(!temp.path().join("denied.txt").exists());
         assert!(matches!(
             &history[2],
             Message::ToolResult {
