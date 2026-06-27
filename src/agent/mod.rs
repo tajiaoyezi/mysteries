@@ -4,7 +4,7 @@ use crate::agent::message::Message;
 use crate::error::{AgentError, ProviderError};
 use crate::permission::{gate, PermissionDecider, PermissionDecision};
 use crate::provider::{DeltaSink, ModelRequest, Provider};
-use crate::tool::{ToolContext, ToolRegistry};
+use crate::tool::{PermissionLevel, ToolContext, ToolOutcome, ToolRegistry};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant.";
 const DEFAULT_MODEL: &str = "mock-model";
@@ -31,6 +31,33 @@ pub async fn run_single_turn(
 
     Ok(response.text)
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentStatus {
+    Idle,
+    CallingModel,
+    ExecutingTool(String),
+    WaitingForPermission,
+}
+
+pub trait AgentObserver: Send + Sync {
+    fn on_status(&self, _status: AgentStatus) {}
+
+    fn on_tool_call_started(
+        &self,
+        _id: &str,
+        _name: &str,
+        _args: &serde_json::Value,
+        _readonly: bool,
+    ) {
+    }
+
+    fn on_tool_call_finished(&self, _id: &str, _outcome: &crate::tool::ToolOutcome) {}
+}
+
+pub struct NoopObserver;
+
+impl AgentObserver for NoopObserver {}
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -63,7 +90,18 @@ impl Agent {
         ctx: &ToolContext,
         sink: &dyn DeltaSink,
     ) -> Result<String, AgentError> {
+        self.run_observed(history, ctx, sink, &NoopObserver).await
+    }
+
+    pub async fn run_observed(
+        &self,
+        history: &mut Vec<Message>,
+        ctx: &ToolContext,
+        sink: &dyn DeltaSink,
+        observer: &dyn AgentObserver,
+    ) -> Result<String, AgentError> {
         for _ in 0..self.max_iterations {
+            observer.on_status(AgentStatus::CallingModel);
             let response = self
                 .provider
                 .complete(
@@ -85,35 +123,57 @@ impl Agent {
             });
 
             if tool_calls.is_empty() {
+                observer.on_status(AgentStatus::Idle);
                 return Ok(text);
             }
 
             for call in tool_calls {
                 let Some(tool) = self.registry.get(&call.name) else {
-                    history.push(Message::ToolResult {
-                        call_id: call.id,
+                    let outcome = ToolOutcome {
                         content: format!("unknown tool: {}", call.name),
                         is_error: true,
+                        truncated: false,
+                    };
+                    history.push(Message::ToolResult {
+                        call_id: call.id.clone(),
+                        content: outcome.content.clone(),
+                        is_error: outcome.is_error,
                     });
+                    observer.on_tool_call_finished(&call.id, &outcome);
                     continue;
                 };
 
+                let readonly = tool.permission_level() == PermissionLevel::ReadOnly;
+                observer.on_tool_call_started(&call.id, &call.name, &call.arguments, readonly);
+
+                if !readonly {
+                    observer.on_status(AgentStatus::WaitingForPermission);
+                }
+
                 if gate(&call, tool, self.decider.as_ref()).await == PermissionDecision::Deny {
-                    history.push(Message::ToolResult {
-                        call_id: call.id,
+                    let outcome = ToolOutcome {
                         content: "user denied tool execution".to_string(),
                         is_error: true,
+                        truncated: false,
+                    };
+                    history.push(Message::ToolResult {
+                        call_id: call.id.clone(),
+                        content: outcome.content.clone(),
+                        is_error: outcome.is_error,
                     });
+                    observer.on_tool_call_finished(&call.id, &outcome);
                     continue;
                 }
 
+                observer.on_status(AgentStatus::ExecutingTool(call.name.clone()));
                 let outcome = tool.execute(call.arguments.clone(), ctx).await;
 
                 history.push(Message::ToolResult {
-                    call_id: call.id,
-                    content: outcome.content,
+                    call_id: call.id.clone(),
+                    content: outcome.content.clone(),
                     is_error: outcome.is_error,
                 });
+                observer.on_tool_call_finished(&call.id, &outcome);
             }
         }
 
@@ -125,7 +185,7 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_single_turn, Agent};
+    use super::{run_single_turn, Agent, AgentObserver, AgentStatus};
     use crate::agent::message::Message;
     use crate::error::{AgentError, ProviderError};
     use crate::permission::{PermissionDecider, PermissionDecision};
@@ -138,6 +198,63 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, PartialEq)]
+    enum ObservedEvent {
+        Status(AgentStatus),
+        ToolCallStarted {
+            id: String,
+            name: String,
+            args: Value,
+            readonly: bool,
+        },
+        ToolCallFinished {
+            id: String,
+            outcome: ToolOutcome,
+        },
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<ObservedEvent>>,
+    }
+
+    impl RecordingObserver {
+        fn events(&self) -> Vec<ObservedEvent> {
+            self.events.lock().unwrap().drain(..).collect()
+        }
+    }
+
+    impl AgentObserver for RecordingObserver {
+        fn on_status(&self, status: AgentStatus) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(ObservedEvent::Status(status));
+        }
+
+        fn on_tool_call_started(&self, id: &str, name: &str, args: &Value, readonly: bool) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(ObservedEvent::ToolCallStarted {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    args: args.clone(),
+                    readonly,
+                });
+        }
+
+        fn on_tool_call_finished(&self, id: &str, outcome: &ToolOutcome) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(ObservedEvent::ToolCallFinished {
+                    id: id.to_string(),
+                    outcome: outcome.clone(),
+                });
+        }
+    }
 
     struct CaptureSink {
         chunks: Mutex<Vec<String>>,
@@ -436,6 +553,112 @@ mod tests {
         assert_eq!(recorded[1].messages, history[..4].to_vec());
         assert_eq!(recorded[1].tools.len(), 1);
         assert_eq!(recorded[1].tools[0].name, "echo");
+    }
+
+    #[tokio::test]
+    async fn run_observed_emits_tool_call_sequence() {
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "echo".to_string(),
+                arguments: json!({ "input": "from tool" }),
+            }]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            Box::new(provider),
+            registry_with_echo(),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let mut history = vec![Message::User("hello".to_string())];
+
+        let text = agent
+            .run_observed(&mut history, &ctx(), &sink, &observer)
+            .await
+            .unwrap();
+
+        assert_eq!(text, "done");
+        assert_eq!(
+            observer.events(),
+            vec![
+                ObservedEvent::Status(AgentStatus::CallingModel),
+                ObservedEvent::ToolCallStarted {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    args: json!({ "input": "from tool" }),
+                    readonly: true,
+                },
+                ObservedEvent::Status(AgentStatus::ExecutingTool("echo".to_string())),
+                ObservedEvent::ToolCallFinished {
+                    id: "call-1".to_string(),
+                    outcome: ToolOutcome {
+                        content: "from tool".to_string(),
+                        is_error: false,
+                        truncated: false,
+                    },
+                },
+                ObservedEvent::Status(AgentStatus::CallingModel),
+                ObservedEvent::Status(AgentStatus::Idle),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_observed_emits_denied_permission_sequence() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "confirm".to_string(),
+                arguments: json!({}),
+            }]),
+            response("recovered"),
+        ]));
+        let agent = Agent::new(
+            Box::new(provider),
+            registry_with_confirm_tool(executions.clone()),
+            Box::new(DenyAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let mut history = vec![Message::User("hello".to_string())];
+
+        let text = agent
+            .run_observed(&mut history, &ctx(), &sink, &observer)
+            .await
+            .unwrap();
+
+        assert_eq!(text, "recovered");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            observer.events(),
+            vec![
+                ObservedEvent::Status(AgentStatus::CallingModel),
+                ObservedEvent::ToolCallStarted {
+                    id: "call-1".to_string(),
+                    name: "confirm".to_string(),
+                    args: json!({}),
+                    readonly: false,
+                },
+                ObservedEvent::Status(AgentStatus::WaitingForPermission),
+                ObservedEvent::ToolCallFinished {
+                    id: "call-1".to_string(),
+                    outcome: ToolOutcome {
+                        content: "user denied tool execution".to_string(),
+                        is_error: true,
+                        truncated: false,
+                    },
+                },
+                ObservedEvent::Status(AgentStatus::CallingModel),
+                ObservedEvent::Status(AgentStatus::Idle),
+            ]
+        );
     }
 
     #[tokio::test]

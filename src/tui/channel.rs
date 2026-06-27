@@ -1,7 +1,8 @@
+use crate::agent::{AgentObserver, AgentStatus};
 use crate::permission::PermissionDecider;
 use crate::permission::PermissionDecision;
 use crate::provider::{DeltaSink, ToolCall};
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolOutcome};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -9,6 +10,17 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Debug)]
 pub enum AgentEvent {
     TextDelta(String),
+    ToolCallStarted {
+        id: String,
+        name: String,
+        args: Value,
+        readonly: bool,
+    },
+    ToolCallFinished {
+        id: String,
+        outcome: ToolOutcome,
+    },
+    StatusChanged(AgentStatus),
     PermissionRequired(PermissionRequest),
     TurnComplete,
     Error(String),
@@ -46,6 +58,38 @@ impl DeltaSink for ChannelSink {
     }
 }
 
+pub struct ChannelObserver {
+    tx: mpsc::UnboundedSender<AgentEvent>,
+}
+
+impl ChannelObserver {
+    pub fn new(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        Self { tx }
+    }
+}
+
+impl AgentObserver for ChannelObserver {
+    fn on_status(&self, status: AgentStatus) {
+        let _ = self.tx.send(AgentEvent::StatusChanged(status));
+    }
+
+    fn on_tool_call_started(&self, id: &str, name: &str, args: &Value, readonly: bool) {
+        let _ = self.tx.send(AgentEvent::ToolCallStarted {
+            id: id.to_string(),
+            name: name.to_string(),
+            args: args.clone(),
+            readonly,
+        });
+    }
+
+    fn on_tool_call_finished(&self, id: &str, outcome: &ToolOutcome) {
+        let _ = self.tx.send(AgentEvent::ToolCallFinished {
+            id: id.to_string(),
+            outcome: outcome.clone(),
+        });
+    }
+}
+
 pub struct ChannelDecider {
     tx: mpsc::UnboundedSender<AgentEvent>,
 }
@@ -80,7 +124,8 @@ impl PermissionDecider for ChannelDecider {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentEvent, ChannelDecider, ChannelSink};
+    use super::{AgentEvent, ChannelDecider, ChannelObserver, ChannelSink};
+    use crate::agent::{AgentObserver, AgentStatus};
     use crate::permission::{PermissionDecider, PermissionDecision};
     use crate::provider::{DeltaSink, ToolCall};
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
@@ -99,6 +144,66 @@ mod tests {
         match rx.try_recv().unwrap() {
             AgentEvent::TextDelta(text) => assert_eq!(text, "hello"),
             other => panic!("expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_observer_sends_status_changed() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let observer = ChannelObserver::new(tx);
+
+        observer.on_status(AgentStatus::CallingModel);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::StatusChanged(status) => assert_eq!(status, AgentStatus::CallingModel),
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_observer_sends_tool_call_started() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let observer = ChannelObserver::new(tx);
+
+        observer.on_tool_call_started("call-1", "read_file", &json!({ "path": "note.txt" }), true);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCallStarted {
+                id,
+                name,
+                args,
+                readonly,
+            } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "read_file");
+                assert_eq!(args, json!({ "path": "note.txt" }));
+                assert!(readonly);
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_observer_sends_tool_call_finished() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let observer = ChannelObserver::new(tx);
+        let outcome = ToolOutcome {
+            content: "ok".to_string(),
+            is_error: false,
+            truncated: false,
+        };
+
+        observer.on_tool_call_finished("call-1", &outcome);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCallFinished {
+                id,
+                outcome: actual,
+            } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(actual, outcome);
+            }
+            other => panic!("expected ToolCallFinished, got {other:?}"),
         }
     }
 

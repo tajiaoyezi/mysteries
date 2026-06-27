@@ -1,12 +1,16 @@
+use crate::agent::AgentStatus;
 use crate::permission::PermissionDecision;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
 use crossterm::event::{KeyCode, KeyEvent};
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
     Ready,
     Busy,
+    CallingModel,
+    ExecutingTool(String),
     WaitingForPermission,
 }
 
@@ -17,8 +21,27 @@ pub enum TranscriptBlock {
     Error(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolCardStatus {
+    Running,
+    Done,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolCard {
+    pub id: String,
+    pub name: String,
+    pub args: Value,
+    pub readonly: bool,
+    pub status: ToolCardStatus,
+    pub output: Option<String>,
+    pub truncated: bool,
+}
+
 pub struct AppState {
     pub transcript: Vec<TranscriptBlock>,
+    pub tool_cards: Vec<ToolCard>,
     pub input: String,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
@@ -28,6 +51,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             transcript: Vec::new(),
+            tool_cards: Vec::new(),
             input: String::new(),
             phase: Phase::Ready,
             pending_permission: None,
@@ -37,11 +61,64 @@ impl AppState {
     pub fn apply(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta(text) => {
-                self.phase = Phase::Busy;
+                if self.phase == Phase::Ready {
+                    self.phase = Phase::Busy;
+                }
                 match self.transcript.last_mut() {
                     Some(TranscriptBlock::Assistant(current)) => current.push_str(&text),
                     _ => self.transcript.push(TranscriptBlock::Assistant(text)),
                 }
+            }
+            AgentEvent::ToolCallStarted {
+                id,
+                name,
+                args,
+                readonly,
+            } => {
+                self.tool_cards.push(ToolCard {
+                    id,
+                    name,
+                    args,
+                    readonly,
+                    status: ToolCardStatus::Running,
+                    output: None,
+                    truncated: false,
+                });
+            }
+            AgentEvent::ToolCallFinished { id, outcome } => {
+                let status = if outcome.is_error {
+                    ToolCardStatus::Error
+                } else {
+                    ToolCardStatus::Done
+                };
+                let card = self.tool_cards.iter_mut().find(|card| card.id == id);
+
+                match card {
+                    Some(card) => {
+                        card.status = status;
+                        card.output = Some(outcome.content);
+                        card.truncated = outcome.truncated;
+                    }
+                    None => {
+                        self.tool_cards.push(ToolCard {
+                            id: id.clone(),
+                            name: id,
+                            args: Value::Null,
+                            readonly: false,
+                            status,
+                            output: Some(outcome.content),
+                            truncated: outcome.truncated,
+                        });
+                    }
+                }
+            }
+            AgentEvent::StatusChanged(status) => {
+                self.phase = match status {
+                    AgentStatus::Idle => Phase::Ready,
+                    AgentStatus::CallingModel => Phase::CallingModel,
+                    AgentStatus::ExecutingTool(name) => Phase::ExecutingTool(name),
+                    AgentStatus::WaitingForPermission => Phase::WaitingForPermission,
+                };
             }
             AgentEvent::PermissionRequired(request) => {
                 self.pending_permission = Some(request);
@@ -108,8 +185,10 @@ impl Default for AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, Phase, TranscriptBlock};
+    use super::{AppState, Phase, ToolCard, ToolCardStatus, TranscriptBlock};
+    use crate::agent::AgentStatus;
     use crate::permission::PermissionDecision;
+    use crate::tool::ToolOutcome;
     use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
@@ -117,6 +196,89 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn apply_tool_call_started_adds_running_tool_card() {
+        let mut state = AppState::new();
+
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            args: json!({ "path": "note.txt" }),
+            readonly: true,
+        });
+
+        assert_eq!(
+            state.tool_cards,
+            vec![ToolCard {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                args: json!({ "path": "note.txt" }),
+                readonly: true,
+                status: ToolCardStatus::Running,
+                output: None,
+                truncated: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_tool_call_finished_updates_card_to_done_or_error() {
+        let mut state = AppState::new();
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".to_string(),
+            name: "write_file".to_string(),
+            args: json!({ "path": "note.txt" }),
+            readonly: false,
+        });
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "call-1".to_string(),
+            outcome: ToolOutcome {
+                content: "wrote note.txt".to_string(),
+                is_error: false,
+                truncated: false,
+            },
+        });
+
+        assert_eq!(state.tool_cards[0].status, ToolCardStatus::Done);
+        assert_eq!(
+            state.tool_cards[0].output.as_deref(),
+            Some("wrote note.txt")
+        );
+
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-2".to_string(),
+            name: "run_shell".to_string(),
+            args: json!({ "command": "false" }),
+            readonly: false,
+        });
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "call-2".to_string(),
+            outcome: ToolOutcome {
+                content: "command failed: permission denied".to_string(),
+                is_error: true,
+                truncated: true,
+            },
+        });
+
+        assert_eq!(state.tool_cards[1].status, ToolCardStatus::Error);
+        assert_eq!(
+            state.tool_cards[1].output.as_deref(),
+            Some("command failed: permission denied")
+        );
+        assert!(state.tool_cards[1].truncated);
+    }
+
+    #[test]
+    fn apply_status_changed_updates_full_phase() {
+        let mut state = AppState::new();
+
+        state.apply(AgentEvent::StatusChanged(AgentStatus::ExecutingTool(
+            "write_file".to_string(),
+        )));
+
+        assert_eq!(state.phase, Phase::ExecutingTool("write_file".to_string()));
     }
 
     #[test]

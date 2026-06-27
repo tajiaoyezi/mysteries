@@ -102,7 +102,11 @@ pub async fn run_agent_task(
                     Message::User(prompt),
                 ];
                 let sink = channel::ChannelSink::new(ui_tx.clone());
-                match agent.run(&mut history, &ctx, &sink).await {
+                let observer = channel::ChannelObserver::new(ui_tx.clone());
+                match agent
+                    .run_observed(&mut history, &ctx, &sink, &observer)
+                    .await
+                {
                     Ok(_) => {
                         let _ = ui_tx.send(channel::AgentEvent::TurnComplete);
                     }
@@ -124,8 +128,10 @@ mod tests {
     use super::channel::{AgentEvent, ChannelDecider, UserInput};
     use super::run_agent_task;
     use crate::agent::message::Message;
+    use crate::agent::AgentStatus;
     use crate::app::assemble_agent;
     use crate::config::{AuthType, Config, ProviderConfig, ProviderKind};
+    use crate::permission::PermissionDecision;
     use crate::provider::mock::MockProvider;
     use crate::provider::{FinishReason, ModelResponse, ToolCall};
     use crate::tool::ToolContext;
@@ -145,6 +151,116 @@ mod tests {
             max_iterations: 4,
             timeout_secs: 30,
         }
+    }
+
+    #[tokio::test]
+    async fn run_agent_task_forwards_observed_tool_events_without_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "note.txt", "content": "from tui" }),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+            },
+            ModelResponse {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+            },
+        ]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let agent = assemble_agent(
+            Box::new(provider),
+            &config(),
+            Box::new(ChannelDecider::new(ui_tx.clone())),
+        );
+        let ctx = ToolContext {
+            cwd: temp.path().to_path_buf(),
+            max_output_bytes: 4096,
+        };
+
+        let handle = tokio::spawn(run_agent_task(agent, input_rx, ui_tx, ctx));
+        input_tx
+            .send(UserInput::Prompt("write note".to_string()))
+            .unwrap();
+
+        match ui_rx.recv().await.expect("calling model status") {
+            AgentEvent::StatusChanged(AgentStatus::CallingModel) => {}
+            other => panic!("expected StatusChanged(CallingModel), got {other:?}"),
+        }
+
+        match ui_rx.recv().await.expect("tool call started") {
+            AgentEvent::ToolCallStarted {
+                id,
+                name,
+                args,
+                readonly,
+            } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "write_file");
+                assert_eq!(args, json!({ "path": "note.txt", "content": "from tui" }));
+                assert!(!readonly);
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+
+        match ui_rx.recv().await.expect("waiting permission status") {
+            AgentEvent::StatusChanged(AgentStatus::WaitingForPermission) => {}
+            other => panic!("expected StatusChanged(WaitingForPermission), got {other:?}"),
+        }
+
+        match ui_rx.recv().await.expect("permission event") {
+            AgentEvent::PermissionRequired(request) => {
+                assert_eq!(request.tool_name, "write_file");
+                request.responder.send(PermissionDecision::Allow).unwrap();
+            }
+            other => panic!("expected PermissionRequired, got {other:?}"),
+        }
+
+        match ui_rx.recv().await.expect("executing status") {
+            AgentEvent::StatusChanged(AgentStatus::ExecutingTool(name)) => {
+                assert_eq!(name, "write_file");
+            }
+            other => panic!("expected StatusChanged(ExecutingTool), got {other:?}"),
+        }
+
+        match ui_rx.recv().await.expect("tool call finished") {
+            AgentEvent::ToolCallFinished { id, outcome } => {
+                assert_eq!(id, "call-1");
+                assert!(!outcome.is_error);
+                assert!(outcome.content.contains("note.txt"));
+            }
+            other => panic!("expected ToolCallFinished, got {other:?}"),
+        }
+
+        match ui_rx.recv().await.expect("second model status") {
+            AgentEvent::StatusChanged(AgentStatus::CallingModel) => {}
+            other => panic!("expected second StatusChanged(CallingModel), got {other:?}"),
+        }
+
+        match ui_rx.recv().await.expect("text event") {
+            AgentEvent::TextDelta(text) => assert_eq!(text, "done"),
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+
+        match ui_rx.recv().await.expect("idle status") {
+            AgentEvent::StatusChanged(AgentStatus::Idle) => {}
+            other => panic!("expected StatusChanged(Idle), got {other:?}"),
+        }
+
+        assert!(matches!(ui_rx.recv().await, Some(AgentEvent::TurnComplete)));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("note.txt")).unwrap(),
+            "from tui"
+        );
+
+        drop(input_tx);
+        handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -183,29 +299,32 @@ mod tests {
             .send(UserInput::Prompt("write note".to_string()))
             .unwrap();
 
-        let permission = ui_rx.recv().await.expect("permission event");
-        match permission {
-            AgentEvent::PermissionRequired(request) => {
+        loop {
+            if let AgentEvent::PermissionRequired(request) =
+                ui_rx.recv().await.expect("permission event")
+            {
                 assert_eq!(request.tool_name, "write_file");
                 assert_eq!(
                     request.args,
                     json!({ "path": "note.txt", "content": "from tui" })
                 );
-                request
-                    .responder
-                    .send(crate::permission::PermissionDecision::Allow)
-                    .unwrap();
+                request.responder.send(PermissionDecision::Allow).unwrap();
+                break;
             }
-            other => panic!("expected PermissionRequired, got {other:?}"),
         }
 
-        let text = ui_rx.recv().await.expect("text event");
-        match text {
-            AgentEvent::TextDelta(text) => assert_eq!(text, "done"),
-            other => panic!("expected TextDelta, got {other:?}"),
+        loop {
+            if let AgentEvent::TextDelta(text) = ui_rx.recv().await.expect("text event") {
+                assert_eq!(text, "done");
+                break;
+            }
         }
 
-        assert!(matches!(ui_rx.recv().await, Some(AgentEvent::TurnComplete)));
+        loop {
+            if matches!(ui_rx.recv().await, Some(AgentEvent::TurnComplete)) {
+                break;
+            }
+        }
         assert_eq!(
             fs::read_to_string(temp.path().join("note.txt")).unwrap(),
             "from tui"

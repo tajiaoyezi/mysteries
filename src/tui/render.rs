@@ -1,4 +1,4 @@
-use crate::tui::app::{AppState, Phase, TranscriptBlock};
+use crate::tui::app::{AppState, Phase, ToolCard, ToolCardStatus, TranscriptBlock};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -53,7 +53,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let lines = if state.transcript.is_empty() {
+    let lines = if state.transcript.is_empty() && state.tool_cards.is_empty() {
         welcome_lines()
     } else {
         transcript_lines(state)
@@ -109,6 +109,46 @@ fn transcript_lines(state: &AppState) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(""));
     }
+    for card in &state.tool_cards {
+        lines.extend(tool_card_lines(card));
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn tool_card_lines(card: &ToolCard) -> Vec<Line<'static>> {
+    let glyph = match card.status {
+        ToolCardStatus::Running => "◇",
+        ToolCardStatus::Done => "✓",
+        ToolCardStatus::Error => "✗",
+    };
+    let badge = if card.readonly {
+        "  只读 · 自动运行"
+    } else {
+        ""
+    };
+    let mut lines = vec![Line::from(format!(
+        "┌─ {glyph} {} {}{}",
+        card.name, card.args, badge
+    ))];
+
+    match &card.output {
+        Some(output) if output.is_empty() => lines.push(Line::from("│ output:")),
+        Some(output) => {
+            for line in output.lines() {
+                lines.push(Line::from(format!("│ output: {line}")));
+            }
+        }
+        None => lines.push(Line::from("│ output: 运行中…")),
+    }
+
+    if card.truncated {
+        lines.push(Line::from("│ ⋯ 输出已截断(超出 max_output_bytes)"));
+    }
+
+    lines.push(Line::from(
+        "└──────────────────────────────────────────────────────────────────────────────",
+    ));
     lines
 }
 
@@ -137,10 +177,12 @@ fn render_permission(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let label = match state.phase {
-        Phase::Ready => "就绪",
-        Phase::Busy => "忙",
-        Phase::WaitingForPermission => "等待授权",
+    let label = match &state.phase {
+        Phase::Ready => "◇ 就绪".to_string(),
+        Phase::Busy => "忙".to_string(),
+        Phase::CallingModel => "调用模型…".to_string(),
+        Phase::ExecutingTool(name) => format!("执行 {name}…"),
+        Phase::WaitingForPermission => "▲ 等待授权…".to_string(),
     };
     let paragraph = Paragraph::new(format!("status: {label}"));
     frame.render_widget(paragraph, area);
@@ -163,7 +205,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::render;
-    use crate::tui::app::AppState;
+    use crate::tui::app::{AppState, Phase, ToolCard, ToolCardStatus};
     use crate::tui::channel::{AgentEvent, PermissionRequest};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -209,6 +251,31 @@ mod tests {
         })
     }
 
+    fn status_line(text: &str) -> String {
+        text.lines()
+            .find(|line| line.starts_with("status:"))
+            .unwrap()
+            .to_string()
+    }
+
+    fn tool_card(
+        name: &str,
+        status: ToolCardStatus,
+        output: Option<&str>,
+        readonly: bool,
+        truncated: bool,
+    ) -> ToolCard {
+        ToolCard {
+            id: format!("{name}-1"),
+            name: name.to_string(),
+            args: json!({ "path": "note.txt" }),
+            readonly,
+            status,
+            output: output.map(str::to_string),
+            truncated,
+        }
+    }
+
     #[test]
     fn welcome_state_snapshot() {
         let state = AppState::new();
@@ -231,5 +298,76 @@ mod tests {
 
         println!("\n--- permission frame ---\n{text}\n--- end permission frame ---");
         insta::assert_snapshot!("tui_permission_state", text);
+    }
+
+    #[test]
+    fn tool_card_running_snapshot() {
+        let mut state = AppState::new();
+        state.tool_cards.push(tool_card(
+            "read_file",
+            ToolCardStatus::Running,
+            None,
+            true,
+            false,
+        ));
+        let text = render_to_text(&state);
+
+        println!("\n--- tool card running frame ---\n{text}\n--- end tool card running frame ---");
+        insta::assert_snapshot!("tui_tool_card_running", text);
+    }
+
+    #[test]
+    fn tool_card_done_snapshot() {
+        let mut state = AppState::new();
+        state.tool_cards.push(tool_card(
+            "write_file",
+            ToolCardStatus::Done,
+            Some("wrote note.txt"),
+            false,
+            false,
+        ));
+        let text = render_to_text(&state);
+
+        println!("\n--- tool card done frame ---\n{text}\n--- end tool card done frame ---");
+        insta::assert_snapshot!("tui_tool_card_done", text);
+    }
+
+    #[test]
+    fn tool_card_error_snapshot() {
+        let mut state = AppState::new();
+        state.tool_cards.push(tool_card(
+            "run_shell",
+            ToolCardStatus::Error,
+            Some("command failed: permission denied"),
+            false,
+            true,
+        ));
+        let text = render_to_text(&state);
+
+        println!("\n--- tool card error frame ---\n{text}\n--- end tool card error frame ---");
+        insta::assert_snapshot!("tui_tool_card_error", text);
+    }
+
+    #[test]
+    fn phase_status_lines_snapshot() {
+        let phases = [
+            ("idle", Phase::Ready),
+            ("calling", Phase::CallingModel),
+            ("executing", Phase::ExecutingTool("write_file".to_string())),
+            ("waiting", Phase::WaitingForPermission),
+        ];
+        let mut text = String::new();
+
+        for (label, phase) in phases {
+            let mut state = AppState::new();
+            state.phase = phase;
+            text.push_str(label);
+            text.push_str(": ");
+            text.push_str(&status_line(&render_to_text(&state)));
+            text.push('\n');
+        }
+
+        println!("\n--- phase status lines ---\n{text}--- end phase status lines ---");
+        insta::assert_snapshot!("tui_phase_status_lines", text);
     }
 }
