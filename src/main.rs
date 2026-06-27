@@ -1,6 +1,8 @@
 mod agent;
 mod error;
+mod permission;
 mod provider;
+mod tool;
 
 use crate::agent::run_single_turn;
 use crate::error::ProviderError;

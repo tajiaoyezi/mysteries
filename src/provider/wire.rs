@@ -18,6 +18,23 @@ pub fn serialize_request(req: &ModelRequest) -> Value {
         body["max_tokens"] = json!(max_tokens);
     }
 
+    if !req.tools.is_empty() {
+        body["tools"] = json!(req
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                })
+            })
+            .collect::<Vec<_>>());
+    }
+
     body
 }
 
@@ -154,7 +171,7 @@ mod tests {
     use super::{parse_response, serialize_request};
     use crate::agent::message::Message;
     use crate::error::ProviderError;
-    use crate::provider::{FinishReason, ModelRequest, ModelResponse, ToolCall};
+    use crate::provider::{FinishReason, ModelRequest, ModelResponse, ToolCall, ToolSchema};
     use serde_json::json;
 
     #[test]
@@ -178,6 +195,7 @@ mod tests {
                     is_error: true,
                 },
             ],
+            tools: Vec::new(),
             max_tokens: Some(128),
         };
 
@@ -213,6 +231,82 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn serialize_request_includes_tools_only_when_present() {
+        let req = ModelRequest {
+            model: "gpt-test".to_string(),
+            messages: vec![Message::User("use tools".to_string())],
+            tools: vec![
+                ToolSchema {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        },
+                        "required": ["path"]
+                    }),
+                },
+                ToolSchema {
+                    name: "list_dir".to_string(),
+                    description: "List a directory".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        }
+                    }),
+                },
+            ],
+            max_tokens: None,
+        };
+
+        let body = serialize_request(&req);
+
+        assert_eq!(
+            body["tools"],
+            json!([
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" }
+                            },
+                            "required": ["path"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_dir",
+                        "description": "List a directory",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            ])
+        );
+
+        let no_tools_req = ModelRequest {
+            model: "gpt-test".to_string(),
+            messages: vec![Message::User("no tools".to_string())],
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+
+        assert!(serialize_request(&no_tools_req).get("tools").is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::provider::ToolCall;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub enum Message {
     System(String),
     User(String),

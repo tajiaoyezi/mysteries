@@ -82,6 +82,7 @@ mod tests {
         ModelRequest {
             model: model.to_string(),
             messages: vec![Message::User(prompt.to_string())],
+            tools: Vec::new(),
             max_tokens: None,
         }
     }

@@ -3,6 +3,7 @@ use crate::error::ProviderError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 pub mod mock;
 pub mod wire;
@@ -14,10 +15,18 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct ModelRequest {
     pub model: String,
     pub messages: Vec<Message>,
+    pub tools: Vec<ToolSchema>,
     pub max_tokens: Option<u32>,
 }
 
@@ -49,6 +58,24 @@ pub trait Provider: Send + Sync {
         req: ModelRequest,
         sink: &dyn DeltaSink,
     ) -> Result<ModelResponse, ProviderError>;
+}
+
+#[async_trait]
+impl<T> Provider for Arc<T>
+where
+    T: Provider + ?Sized,
+{
+    fn name(&self) -> &str {
+        self.as_ref().name()
+    }
+
+    async fn complete(
+        &self,
+        req: ModelRequest,
+        sink: &dyn DeltaSink,
+    ) -> Result<ModelResponse, ProviderError> {
+        self.as_ref().complete(req, sink).await
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +143,7 @@ mod tests {
         ModelRequest {
             model: "test-model".to_string(),
             messages: vec![Message::User("hello provider".to_string())],
+            tools: Vec::new(),
             max_tokens: Some(64),
         }
     }
