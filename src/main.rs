@@ -1,4 +1,5 @@
 mod agent;
+mod credential;
 mod error;
 mod permission;
 mod provider;
