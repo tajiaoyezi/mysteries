@@ -1,0 +1,425 @@
+use crate::error::ProviderError;
+use crate::provider::transport::SseAccumulator;
+use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+pub struct AnthropicAccumulator {
+    buffer: Vec<u8>,
+    text: String,
+    tool_calls: BTreeMap<usize, PartialToolUse>,
+    finish_reason: FinishReason,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct PartialToolUse {
+    id: Option<String>,
+    name: Option<String>,
+    input_json: String,
+}
+
+impl AnthropicAccumulator {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            text: String::new(),
+            tool_calls: BTreeMap::new(),
+            finish_reason: FinishReason::Other(String::new()),
+            finished: false,
+        }
+    }
+
+    pub fn push_chunk(
+        &mut self,
+        chunk: &[u8],
+        sink: &dyn DeltaSink,
+    ) -> Result<Option<ModelResponse>, ProviderError> {
+        self.buffer.extend_from_slice(chunk);
+
+        while let Some((delimiter_start, delimiter_len)) = find_event_delimiter(&self.buffer) {
+            let event = self.buffer[..delimiter_start].to_vec();
+            self.buffer.drain(..delimiter_start + delimiter_len);
+
+            if let Some(response) = self.process_event(&event, sink)? {
+                return Ok(Some(response));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn process_event(
+        &mut self,
+        event: &[u8],
+        sink: &dyn DeltaSink,
+    ) -> Result<Option<ModelResponse>, ProviderError> {
+        let event = std::str::from_utf8(event)
+            .map_err(|err| ProviderError::Decode(format!("SSE event is not UTF-8: {err}")))?;
+        let mut event_name = None;
+        let mut data_lines = Vec::new();
+
+        for line in event.lines().map(|line| line.trim_end_matches('\r')) {
+            let line = line.trim_start();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            if let Some(next_event) = line.strip_prefix("event:") {
+                event_name = Some(next_event.trim().to_string());
+                continue;
+            }
+            if let Some(data) = line.strip_prefix("data:") {
+                data_lines.push(data.trim_start());
+            }
+        }
+
+        if data_lines.is_empty() {
+            return Ok(None);
+        }
+
+        let data = data_lines.join("\n");
+        if data.trim() == "[DONE]" {
+            self.finished = true;
+            return self.finish().map(Some);
+        }
+
+        let body: Value = serde_json::from_str(&data)
+            .map_err(|err| ProviderError::Decode(format!("SSE data JSON invalid: {err}")))?;
+        let event_type = body
+            .get("type")
+            .and_then(Value::as_str)
+            .or(event_name.as_deref());
+
+        match event_type {
+            Some("content_block_start") => self.apply_content_block_start(&body)?,
+            Some("content_block_delta") => self.apply_content_block_delta(&body, sink)?,
+            Some("message_delta") => self.apply_message_delta(&body),
+            Some("message_stop") => {
+                self.finished = true;
+                return self.finish().map(Some);
+            }
+            Some("message_start" | "content_block_stop" | "ping") | None => {}
+            Some(_) => {}
+        }
+
+        Ok(None)
+    }
+
+    fn apply_content_block_start(&mut self, body: &Value) -> Result<(), ProviderError> {
+        let index = required_index(body)?;
+        let Some(block) = body.get("content_block") else {
+            return Ok(());
+        };
+
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            return Ok(());
+        }
+
+        let partial = self.tool_calls.entry(index).or_default();
+        if partial.id.is_none() {
+            if let Some(id) = block.get("id").and_then(Value::as_str) {
+                partial.id = Some(id.to_string());
+            }
+        }
+        if partial.name.is_none() {
+            if let Some(name) = block.get("name").and_then(Value::as_str) {
+                partial.name = Some(name.to_string());
+            }
+        }
+
+        if partial.input_json.is_empty() {
+            if let Some(input) = block.get("input") {
+                if input.is_object() && input.as_object().is_some_and(|object| !object.is_empty()) {
+                    partial.input_json = serde_json::to_string(input).expect("Value serializes");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_content_block_delta(
+        &mut self,
+        body: &Value,
+        sink: &dyn DeltaSink,
+    ) -> Result<(), ProviderError> {
+        let index = required_index(body)?;
+        let delta = body.get("delta").ok_or_else(|| {
+            ProviderError::Decode("content_block_delta.delta missing".to_string())
+        })?;
+
+        match delta.get("type").and_then(Value::as_str) {
+            Some("text_delta") => {
+                let text = delta
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ProviderError::Decode("text_delta.text missing".to_string()))?;
+                self.text.push_str(text);
+                sink.on_text(text);
+            }
+            Some("input_json_delta") => {
+                let partial_json = delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::Decode("input_json_delta.partial_json missing".to_string())
+                    })?;
+                self.tool_calls
+                    .entry(index)
+                    .or_default()
+                    .input_json
+                    .push_str(partial_json);
+            }
+            Some(_) | None => {}
+        }
+
+        Ok(())
+    }
+
+    fn apply_message_delta(&mut self, body: &Value) {
+        if let Some(reason) = body
+            .get("delta")
+            .and_then(|delta| delta.get("stop_reason"))
+            .and_then(Value::as_str)
+        {
+            self.finish_reason = parse_finish_reason(reason);
+        }
+    }
+
+    pub fn finish(&self) -> Result<ModelResponse, ProviderError> {
+        let mut tool_calls = Vec::new();
+
+        for partial in self.tool_calls.values() {
+            let id = partial
+                .id
+                .clone()
+                .ok_or_else(|| ProviderError::Decode("tool_use.id missing".to_string()))?;
+            let name = partial
+                .name
+                .clone()
+                .ok_or_else(|| ProviderError::Decode("tool_use.name missing".to_string()))?;
+            let input_json = if partial.input_json.trim().is_empty() {
+                "{}"
+            } else {
+                partial.input_json.trim()
+            };
+            let arguments = serde_json::from_str(input_json).map_err(|err| {
+                ProviderError::Decode(format!("tool_use input JSON invalid: {err}"))
+            })?;
+
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
+
+        Ok(ModelResponse {
+            text: self.text.clone(),
+            tool_calls,
+            finish_reason: self.finish_reason.clone(),
+        })
+    }
+}
+
+impl SseAccumulator for AnthropicAccumulator {
+    fn push_chunk(
+        &mut self,
+        _chunk: &[u8],
+        _sink: &dyn DeltaSink,
+    ) -> Result<Option<ModelResponse>, ProviderError> {
+        Self::push_chunk(self, _chunk, _sink)
+    }
+
+    fn finish(&self) -> Result<ModelResponse, ProviderError> {
+        Self::finish(self)
+    }
+}
+
+impl Default for AnthropicAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn required_index(body: &Value) -> Result<usize, ProviderError> {
+    body.get("index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
+        .ok_or_else(|| ProviderError::Decode("content_block.index missing".to_string()))
+}
+
+fn parse_finish_reason(reason: &str) -> FinishReason {
+    match reason {
+        "end_turn" => FinishReason::Stop,
+        "max_tokens" => FinishReason::Length,
+        "tool_use" => FinishReason::ToolCalls,
+        other => FinishReason::Other(other.to_string()),
+    }
+}
+
+fn find_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_bytes(buffer, b"\n\n").map(|start| (start, 2));
+    let crlf = find_bytes(buffer, b"\r\n\r\n").map(|start| (start, 4));
+
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) => Some(if lf.0 <= crlf.0 { lf } else { crlf }),
+        (Some(lf), None) => Some(lf),
+        (None, Some(crlf)) => Some(crlf),
+        (None, None) => None,
+    }
+}
+
+fn find_bytes(buffer: &[u8], needle: &[u8]) -> Option<usize> {
+    buffer
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnthropicAccumulator;
+    use crate::error::ProviderError;
+    use crate::provider::transport::accumulate_stream;
+    use crate::provider::{DeltaSink, FinishReason, ToolCall};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    const PROVIDER_LABEL: &str = "Anthropic";
+
+    struct CaptureSink {
+        chunks: Mutex<Vec<String>>,
+    }
+
+    impl CaptureSink {
+        fn new() -> Self {
+            Self {
+                chunks: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn chunks(&self) -> Vec<String> {
+            self.chunks.lock().unwrap().clone()
+        }
+    }
+
+    impl DeltaSink for CaptureSink {
+        fn on_text(&self, text: &str) {
+            self.chunks.lock().unwrap().push(text.to_string());
+        }
+    }
+
+    fn official_tool_use_fixture() -> &'static [u8] {
+        br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_014p7gG3wDgGV9EUtLvnow3U","type":"message","role":"assistant","model":"claude-opus-4-8","stop_sequence":null,"usage":{"input_tokens":472,"output_tokens":2},"content":[],"stop_reason":null}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Okay"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":", let's check"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"location\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" \"San"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" Francisco, CA\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":89}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_text_and_tool_use_normalize_to_model_response() {
+        let sink = CaptureSink::new();
+        let stream =
+            futures_util::stream::iter([Ok::<_, &'static str>(official_tool_use_fixture())]);
+
+        let response =
+            accumulate_stream(stream, &sink, AnthropicAccumulator::new(), PROVIDER_LABEL)
+                .await
+                .unwrap();
+
+        assert_eq!(sink.chunks(), vec!["Okay", ", let's check"]);
+        assert_eq!(response.text, "Okay, let's check");
+        assert_eq!(
+            response.tool_calls,
+            vec![ToolCall {
+                id: "toolu_01T1x1fJ34qAmk2tNTrN7Up6".to_string(),
+                name: "get_weather".to_string(),
+                arguments: json!({ "location": "San Francisco, CA" }),
+            }]
+        );
+        assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_stitches_events_across_chunk_boundaries() {
+        let sink = CaptureSink::new();
+        let fixture = official_tool_use_fixture();
+        let stream = futures_util::stream::iter([
+            Ok::<_, &'static str>(&fixture[..37]),
+            Ok::<_, &'static str>(&fixture[37..521]),
+            Ok::<_, &'static str>(&fixture[521..]),
+        ]);
+
+        let response =
+            accumulate_stream(stream, &sink, AnthropicAccumulator::new(), PROVIDER_LABEL)
+                .await
+                .unwrap();
+
+        assert_eq!(sink.chunks(), vec!["Okay", ", let's check"]);
+        assert_eq!(response.text, "Okay, let's check");
+        assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_invalid_tool_input_returns_decode() {
+        let sink = CaptureSink::new();
+        let stream = futures_util::stream::iter([Ok::<_, &'static str>(
+            br#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_bad","name":"lookup","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"location\""}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+        )]);
+
+        let err = accumulate_stream(stream, &sink, AnthropicAccumulator::new(), PROVIDER_LABEL)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ProviderError::Decode(message) if message.contains("tool_use")));
+        assert_eq!(sink.chunks(), Vec::<String>::new());
+    }
+}

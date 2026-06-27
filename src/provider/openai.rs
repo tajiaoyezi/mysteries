@@ -1,18 +1,20 @@
 use crate::credential::CredentialChain;
 use crate::error::ProviderError;
 use crate::provider::stream::StreamAccumulator;
+use crate::provider::transport::{
+    accumulate_stream, classify, classify_reqwest_error, with_retry, RetryPolicy, TransportFailure,
+};
 use crate::provider::{wire, DeltaSink, ModelRequest, ModelResponse, Provider};
 use async_trait::async_trait;
-use futures_util::{Stream, StreamExt};
 use secrecy::ExposeSecret;
 use serde_json::Value;
-use std::future::Future;
 use std::time::Duration;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RETRIES: usize = 2;
 const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(250);
+const PROVIDER_LABEL: &str = "OpenAI";
 
 pub struct OpenAiProvider {
     base_url: String,
@@ -88,12 +90,13 @@ impl Provider for OpenAiProvider {
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|err| classify_reqwest_error(&err))?;
+                    .map_err(|err| classify_reqwest_error(&err, PROVIDER_LABEL))?;
 
                 if !response.status().is_success() {
-                    return Err(classify(TransportFailure::Status(
-                        response.status().as_u16(),
-                    )));
+                    return Err(classify(
+                        TransportFailure::Status(response.status().as_u16()),
+                        PROVIDER_LABEL,
+                    ));
                 }
 
                 Ok(response)
@@ -101,17 +104,13 @@ impl Provider for OpenAiProvider {
         })
         .await?;
 
-        accumulate_stream(response.bytes_stream(), sink).await
-    }
-}
-
-fn classify_reqwest_error(err: &reqwest::Error) -> ErrorClassification {
-    if err.is_timeout() {
-        classify(TransportFailure::Error(TransportErrorKind::Timeout))
-    } else if err.is_decode() {
-        classify(TransportFailure::Error(TransportErrorKind::Decode))
-    } else {
-        classify(TransportFailure::Error(TransportErrorKind::Network))
+        accumulate_stream(
+            response.bytes_stream(),
+            sink,
+            StreamAccumulator::new(),
+            PROVIDER_LABEL,
+        )
+        .await
     }
 }
 
@@ -123,131 +122,17 @@ fn default_retry_policy() -> RetryPolicy {
     )
 }
 
-pub async fn accumulate_stream<S, B, E>(
-    stream: S,
-    sink: &dyn DeltaSink,
-) -> Result<ModelResponse, ProviderError>
-where
-    S: Stream<Item = Result<B, E>>,
-    B: AsRef<[u8]>,
-    E: std::fmt::Display,
-{
-    let mut accumulator = StreamAccumulator::new();
-
-    futures_util::pin_mut!(stream);
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|err| ProviderError::Transport(format!("OpenAI stream error: {err}")))?;
-        if let Some(response) = accumulator.push_chunk(chunk.as_ref(), sink)? {
-            return Ok(response);
-        }
-    }
-
-    accumulator.finish()
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum ErrorClassification {
-    Retryable(ProviderError),
-    Fatal(ProviderError),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RetryPolicy {
-    pub max_retries: usize,
-    pub attempt_timeout: Duration,
-    pub backoff_base: Duration,
-}
-
-impl RetryPolicy {
-    pub fn new(max_retries: usize, attempt_timeout: Duration, backoff_base: Duration) -> Self {
-        Self {
-            max_retries,
-            attempt_timeout,
-            backoff_base,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportErrorKind {
-    Timeout,
-    Network,
-    Decode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportFailure {
-    Status(u16),
-    Error(TransportErrorKind),
-}
-
-pub fn classify(failure: TransportFailure) -> ErrorClassification {
-    match failure {
-        TransportFailure::Status(401 | 403) => ErrorClassification::Fatal(ProviderError::Auth),
-        TransportFailure::Status(429) => ErrorClassification::Retryable(ProviderError::RateLimited),
-        TransportFailure::Status(status) if (500..=599).contains(&status) => {
-            ErrorClassification::Retryable(ProviderError::RateLimited)
-        }
-        TransportFailure::Status(status) => ErrorClassification::Fatal(ProviderError::Transport(
-            format!("OpenAI HTTP status {status}"),
-        )),
-        TransportFailure::Error(TransportErrorKind::Timeout) => {
-            ErrorClassification::Retryable(ProviderError::Timeout)
-        }
-        TransportFailure::Error(TransportErrorKind::Network) => ErrorClassification::Retryable(
-            ProviderError::Transport("OpenAI network error".to_string()),
-        ),
-        TransportFailure::Error(TransportErrorKind::Decode) => ErrorClassification::Fatal(
-            ProviderError::Decode("OpenAI response decode error".to_string()),
-        ),
-    }
-}
-
-pub async fn with_retry<T, F, Fut>(policy: RetryPolicy, attempt: F) -> Result<T, ProviderError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, ErrorClassification>>,
-{
-    let mut attempt = attempt;
-    let mut retries_used = 0;
-
-    loop {
-        let outcome = tokio::time::timeout(policy.attempt_timeout, attempt()).await;
-        let classification = match outcome {
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(classification)) => classification,
-            Err(_) => ErrorClassification::Retryable(ProviderError::Timeout),
-        };
-
-        match classification {
-            ErrorClassification::Fatal(error) => return Err(error),
-            ErrorClassification::Retryable(error) => {
-                if retries_used >= policy.max_retries {
-                    return Err(error);
-                }
-
-                tokio::time::sleep(backoff_delay(policy.backoff_base, retries_used)).await;
-                retries_used += 1;
-            }
-        }
-    }
-}
-
-fn backoff_delay(base: Duration, retries_used: usize) -> Duration {
-    let factor = 1_u32.checked_shl(retries_used as u32).unwrap_or(u32::MAX);
-    base.saturating_mul(factor)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        accumulate_stream, classify, with_retry, ErrorClassification, OpenAiProvider, RetryPolicy,
-        TransportErrorKind, TransportFailure,
-    };
+    use super::{OpenAiProvider, PROVIDER_LABEL};
     use crate::agent::message::Message;
     use crate::credential::{CredentialChain, EnvCredentialSource};
     use crate::error::ProviderError;
+    use crate::provider::stream::StreamAccumulator;
+    use crate::provider::transport::{
+        accumulate_stream, classify, with_retry, ErrorClassification, RetryPolicy,
+        TransportErrorKind, TransportFailure,
+    };
     use crate::provider::{DeltaSink, ModelRequest, Provider, ToolCall, ToolSchema};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -312,11 +197,11 @@ mod tests {
     #[test]
     fn classify_auth_statuses_as_fatal_auth() {
         assert_eq!(
-            classify(TransportFailure::Status(401)),
+            classify(TransportFailure::Status(401), PROVIDER_LABEL),
             ErrorClassification::Fatal(ProviderError::Auth)
         );
         assert_eq!(
-            classify(TransportFailure::Status(403)),
+            classify(TransportFailure::Status(403), PROVIDER_LABEL),
             ErrorClassification::Fatal(ProviderError::Auth)
         );
     }
@@ -324,15 +209,15 @@ mod tests {
     #[test]
     fn classify_retryable_statuses_as_rate_limited() {
         assert_eq!(
-            classify(TransportFailure::Status(429)),
+            classify(TransportFailure::Status(429), PROVIDER_LABEL),
             ErrorClassification::Retryable(ProviderError::RateLimited)
         );
         assert_eq!(
-            classify(TransportFailure::Status(500)),
+            classify(TransportFailure::Status(500), PROVIDER_LABEL),
             ErrorClassification::Retryable(ProviderError::RateLimited)
         );
         assert_eq!(
-            classify(TransportFailure::Status(503)),
+            classify(TransportFailure::Status(503), PROVIDER_LABEL),
             ErrorClassification::Retryable(ProviderError::RateLimited)
         );
     }
@@ -340,9 +225,9 @@ mod tests {
     #[test]
     fn classify_non_retryable_client_statuses_as_fatal_transport() {
         for status in [400, 404] {
-            match classify(TransportFailure::Status(status)) {
+            match classify(TransportFailure::Status(status), PROVIDER_LABEL) {
                 ErrorClassification::Fatal(ProviderError::Transport(message)) => {
-                    assert!(message.contains(&status.to_string()));
+                    assert_eq!(message, format!("OpenAI HTTP status {status}"));
                 }
                 other => panic!("expected fatal transport for {status}, got {other:?}"),
             }
@@ -352,20 +237,29 @@ mod tests {
     #[test]
     fn classify_transport_error_kinds() {
         assert_eq!(
-            classify(TransportFailure::Error(TransportErrorKind::Timeout)),
+            classify(
+                TransportFailure::Error(TransportErrorKind::Timeout),
+                PROVIDER_LABEL
+            ),
             ErrorClassification::Retryable(ProviderError::Timeout)
         );
 
-        match classify(TransportFailure::Error(TransportErrorKind::Network)) {
+        match classify(
+            TransportFailure::Error(TransportErrorKind::Network),
+            PROVIDER_LABEL,
+        ) {
             ErrorClassification::Retryable(ProviderError::Transport(message)) => {
-                assert!(message.contains("network"));
+                assert_eq!(message, "OpenAI network error");
             }
             other => panic!("expected retryable network transport, got {other:?}"),
         }
 
-        match classify(TransportFailure::Error(TransportErrorKind::Decode)) {
+        match classify(
+            TransportFailure::Error(TransportErrorKind::Decode),
+            PROVIDER_LABEL,
+        ) {
             ErrorClassification::Fatal(ProviderError::Decode(message)) => {
-                assert!(message.contains("decode"));
+                assert_eq!(message, "OpenAI response decode error");
             }
             other => panic!("expected fatal decode, got {other:?}"),
         }
@@ -515,9 +409,13 @@ mod tests {
             Err("connection reset"),
         ]);
 
-        let err = accumulate_stream(stream, &sink).await.unwrap_err();
+        let err = accumulate_stream(stream, &sink, StreamAccumulator::new(), PROVIDER_LABEL)
+            .await
+            .unwrap_err();
 
-        assert!(matches!(err, ProviderError::Transport(message) if message.contains("stream")));
+        assert!(
+            matches!(err, ProviderError::Transport(message) if message == "OpenAI stream error: connection reset")
+        );
         assert_eq!(sink.chunks(), vec!["partial"]);
     }
 

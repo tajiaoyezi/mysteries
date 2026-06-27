@@ -43,6 +43,7 @@ impl CredentialSource for EnvCredentialSource {
     fn resolve(&self, provider: &str) -> Option<SecretString> {
         let env_name = match provider {
             "openai" => "OPENAI_API_KEY",
+            "anthropic" => "ANTHROPIC_API_KEY",
             _ => return None,
         };
 
@@ -155,10 +156,26 @@ mod tests {
     }
 
     #[test]
+    fn env_credential_source_resolves_anthropic_from_injected_lookup() {
+        let source = EnvCredentialSource::with_lookup(|name| {
+            if name == "ANTHROPIC_API_KEY" {
+                Some("sk-ant-env".to_string())
+            } else {
+                None
+            }
+        });
+
+        let secret = source.resolve("anthropic").unwrap();
+
+        assert_eq!(secret.expose_secret(), "sk-ant-env");
+    }
+
+    #[test]
     fn env_credential_source_returns_none_when_variable_is_missing() {
         let source = EnvCredentialSource::with_lookup(|_| None);
 
         assert!(source.resolve("openai").is_none());
+        assert!(source.resolve("anthropic").is_none());
     }
 
     #[test]

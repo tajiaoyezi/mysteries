@@ -5,9 +5,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
+pub mod anthropic;
+pub mod anthropic_stream;
+pub mod anthropic_wire;
 pub mod mock;
 pub mod openai;
 pub mod stream;
+pub mod transport;
 pub mod wire;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]

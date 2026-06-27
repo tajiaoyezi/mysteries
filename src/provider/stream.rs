@@ -1,4 +1,5 @@
 use crate::error::ProviderError;
+use crate::provider::transport::SseAccumulator;
 use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -163,6 +164,20 @@ impl StreamAccumulator {
             tool_calls,
             finish_reason: self.finish_reason.clone(),
         })
+    }
+}
+
+impl SseAccumulator for StreamAccumulator {
+    fn push_chunk(
+        &mut self,
+        chunk: &[u8],
+        sink: &dyn DeltaSink,
+    ) -> Result<Option<ModelResponse>, ProviderError> {
+        Self::push_chunk(self, chunk, sink)
+    }
+
+    fn finish(&self) -> Result<ModelResponse, ProviderError> {
+        Self::finish(self)
     }
 }
 

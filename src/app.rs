@@ -2,6 +2,7 @@ use crate::agent::Agent;
 use crate::config::{self, Config, ConfigError, ProviderKind, RawConfig};
 use crate::credential::CredentialChain;
 use crate::permission::PermissionDecider;
+use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::mock::MockProvider;
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::{FinishReason, ModelResponse, Provider};
@@ -57,7 +58,13 @@ pub fn select_provider(
             };
             Ok(Box::new(provider))
         }
-        ProviderKind::Anthropic => Err(AssemblyError::UnsupportedProvider("anthropic".to_string())),
+        ProviderKind::Anthropic => {
+            let provider = match &config.provider.base_url {
+                Some(base_url) => AnthropicProvider::new(base_url, credentials),
+                None => AnthropicProvider::default(credentials),
+            };
+            Ok(Box::new(provider))
+        }
         ProviderKind::Mock => Ok(Box::new(MockProvider::new(vec![ModelResponse {
             text: "mock response".to_string(),
             tool_calls: Vec::new(),
@@ -240,19 +247,11 @@ kind = "mock"
     }
 
     #[test]
-    fn select_provider_rejects_unsupported_anthropic() {
-        let err = match select_provider(&config_for(ProviderKind::Anthropic), empty_credentials()) {
-            Ok(provider) => panic!(
-                "expected unsupported provider error, got {}",
-                provider.name()
-            ),
-            Err(err) => err,
-        };
+    fn select_provider_returns_anthropic_provider_without_network() {
+        let provider = select_provider(&config_for(ProviderKind::Anthropic), empty_credentials())
+            .expect("Anthropic should be selectable offline");
 
-        assert_eq!(
-            err,
-            AssemblyError::UnsupportedProvider("anthropic".to_string())
-        );
+        assert_eq!(provider.name(), "anthropic");
     }
 
     #[tokio::test]
