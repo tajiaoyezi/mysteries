@@ -3,9 +3,11 @@
 //! OAuth credential support is reserved for 2.0 as another
 //! `CredentialSource` implementation once token storage is designed.
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use std::fs;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 // struct OAuthCredentialSource; // 2.0 落地
 
@@ -81,6 +83,96 @@ impl CredentialSource for FileCredentialSource {
     }
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CredentialError {
+    #[error("failed to write credentials: {0}")]
+    Write(String),
+}
+
+pub fn write_credential(
+    path: &Path,
+    provider: &str,
+    key: &SecretString,
+) -> Result<(), CredentialError> {
+    let plain_key = key.expose_secret();
+
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(CredentialError::Write(format!(
+                "read {}: {}",
+                path.display(),
+                err.kind()
+            )));
+        }
+    };
+
+    let updated = upsert_credential_line(&content, provider, plain_key);
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                return Err(CredentialError::Write(format!(
+                    "create dir {}: {}",
+                    parent.display(),
+                    err.kind()
+                )));
+            }
+        }
+    }
+
+    if let Err(err) = fs::write(path, updated.as_bytes()) {
+        return Err(CredentialError::Write(format!(
+            "write {}: {}",
+            path.display(),
+            err.kind()
+        )));
+    }
+
+    #[cfg(unix)]
+    restrict_permissions(path)?;
+
+    Ok(())
+}
+
+fn upsert_credential_line(content: &str, provider: &str, key: &str) -> String {
+    let mut replaced = false;
+    let mut out_lines = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Some((line_provider, _)) = trimmed.split_once('=') {
+                if line_provider.trim() == provider {
+                    out_lines.push(format!("{provider} = {key}"));
+                    replaced = true;
+                    continue;
+                }
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+
+    if !replaced {
+        out_lines.push(format!("{provider} = {key}"));
+    }
+
+    let mut result = out_lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+#[cfg(unix)]
+fn restrict_permissions(path: &Path) -> Result<(), CredentialError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| CredentialError::Write(format!("chmod {}: {}", path.display(), err.kind())))
+}
+
 pub struct CredentialChain(Vec<Box<dyn CredentialSource>>);
 
 impl CredentialChain {
@@ -101,7 +193,10 @@ impl CredentialChain {
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialChain, CredentialSource, EnvCredentialSource, FileCredentialSource};
+    use super::{
+        write_credential, CredentialChain, CredentialSource, EnvCredentialSource,
+        FileCredentialSource,
+    };
     use secrecy::{ExposeSecret, SecretString};
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -275,5 +370,61 @@ mod tests {
         assert!(!debug.contains("sk-secret-xxx"));
         assert!(debug.contains("REDACTED"));
         assert_eq!(secret.expose_secret(), "sk-secret-xxx");
+    }
+
+    #[test]
+    fn write_credential_upserts_new_and_replaces_existing_preserving_other_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+        fs::write(
+            &path,
+            "# header comment\nanthropic = sk-a\n# trailing comment\n",
+        )
+        .unwrap();
+
+        write_credential(&path, "openai", &SecretString::from("sk-o".to_string())).unwrap();
+        write_credential(&path, "anthropic", &SecretString::from("sk-a2".to_string())).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("openai = sk-o"));
+        assert!(content.contains("anthropic = sk-a2"));
+        assert!(!content.contains("anthropic = sk-a\n"));
+        assert!(content.contains("# header comment"));
+        assert!(content.contains("# trailing comment"));
+
+        let source = FileCredentialSource::new(&path);
+        assert_eq!(source.resolve("openai").unwrap().expose_secret(), "sk-o");
+        assert_eq!(
+            source.resolve("anthropic").unwrap().expose_secret(),
+            "sk-a2"
+        );
+    }
+
+    #[test]
+    fn write_credential_error_does_not_leak_plaintext() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocker = temp.path().join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+        let path = blocker.join("credentials");
+
+        let secret = SecretString::from("sk-super-secret-key".to_string());
+        let err = write_credential(&path, "openai", &secret).unwrap_err();
+
+        let message = err.to_string();
+        assert!(!message.contains("sk-super-secret-key"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_credential_sets_owner_only_permissions_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+
+        write_credential(&path, "openai", &SecretString::from("sk-o".to_string())).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
