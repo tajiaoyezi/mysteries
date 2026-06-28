@@ -8,7 +8,7 @@ expression: text
 ‹accent.primary›> ‹/›‹text.primary›第一行用户消息‹/›
 ‹text.primary›  第二行用户消息仍然完整显示‹/›
 
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=note.txt‹/›‹text.secondary›  只读 · 自动运行 · 2 行 ⌄‹/›
+‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=note.txt‹/›‹text.secondary›  只读 · 自动运行 · 2 行 ⌄‹/›‹text.muted› · ctrl+o 展开‹/›
 
 ‹info.fg›◆ ‹/›‹text.body›第一行最终回答‹/›
 ‹text.body›  第二行最终回答仍然完整显示‹/›

@@ -7,7 +7,7 @@ expression: text
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 ‹accent.primary›> ‹/›‹text.primary›总结这个项目‹/›
 
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=note.txt‹/›‹text.secondary›  只读 · 自动运行 · 2 行 ⌄‹/›
+‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=note.txt‹/›‹text.secondary›  只读 · 自动运行 · 2 行 ⌄‹/›‹text.muted› · ctrl+o 展开‹/›
 
 ‹info.fg›◆ ‹/›‹text.body›这是一个 Rust 编写的终端编码助手。‹/›
 

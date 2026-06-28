@@ -9,7 +9,7 @@ expression: text
 
 ‹info.fg›◆ ‹/›‹text.body›好的。我先读一下 src/config/schema.rs 里 Config 的结构。‹/›
 
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=schema.rs‹/›‹text.secondary›  只读 · 自动运行 · 4 行 ⌄‹/›
+‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=schema.rs‹/›‹text.secondary›  只读 · 自动运行 · 4 行 ⌄‹/›‹text.muted› · ctrl+o 展开‹/›
 
 ‹info.fg›◆ ‹/›‹text.body›结构清楚了。我在 Config 上加 timeout_secs: u64,并在 Default 里给默认值 30。‹/›
 

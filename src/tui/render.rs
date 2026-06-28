@@ -222,7 +222,7 @@ fn suggestion_line(
 
 fn transcript_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for block in &state.transcript {
+    for (index, block) in state.transcript.iter().enumerate() {
         match block {
             TranscriptBlock::User(text) => {
                 lines.extend(message_lines(
@@ -255,10 +255,20 @@ fn transcript_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'
                 lines.extend(notice_block_lines(text, theme, width));
             }
             TranscriptBlock::Tool(card) => {
-                lines.extend(tool_card_lines(card, state, theme, width));
+                let prev_is_tool =
+                    index > 0 && matches!(state.transcript[index - 1], TranscriptBlock::Tool(_));
+                let is_group_first = !prev_is_tool;
+                lines.extend(tool_card_lines(card, state, theme, width, is_group_first));
             }
         }
-        lines.push(Line::from(""));
+        let cur_is_tool = matches!(block, TranscriptBlock::Tool(_));
+        let next_is_tool = state
+            .transcript
+            .get(index + 1)
+            .is_some_and(|next| matches!(next, TranscriptBlock::Tool(_)));
+        if !(cur_is_tool && next_is_tool) {
+            lines.push(Line::from(""));
+        }
     }
     lines
 }
@@ -535,15 +545,17 @@ fn tool_card_lines(
     state: &AppState,
     theme: &Theme,
     width: usize,
+    is_group_first: bool,
 ) -> Vec<Line<'static>> {
     let args = if state.tools_expanded {
         card.args.to_string()
     } else {
         tool_args_preview(&card.name, &card.args)
     };
-    let mut head = tool_card_head(card, state, theme, args);
-    if !state.tools_expanded {
-        head.extend(collapsed_tool_summary(card, theme, width));
+    let collapsed = !state.tools_expanded;
+    let mut head = tool_card_head(card, state, theme, args, collapsed);
+    if collapsed {
+        head.extend(collapsed_tool_summary(card, theme, width, is_group_first));
         return vec![Line::from(head)];
     }
 
@@ -602,17 +614,21 @@ fn tool_card_head(
     state: &AppState,
     theme: &Theme,
     args: String,
+    collapsed: bool,
 ) -> Vec<Span<'static>> {
     let (glyph, glyph_color) = match card.status {
         ToolCardStatus::Running => (state.spinner_glyph(), theme.accent_primary),
         ToolCardStatus::Done => ("✓", theme.success_fg),
         ToolCardStatus::Error => ("✗", theme.error_fg),
     };
-    let mut head = vec![
-        Span::styled(
+    let mut head = Vec::new();
+    if !collapsed {
+        head.push(Span::styled(
             "┌─ ",
             Style::default().fg(theme.border_subtle).bg(theme.bg_base),
-        ),
+        ));
+    }
+    head.extend([
         Span::styled(glyph, Style::default().fg(glyph_color).bg(theme.bg_base)),
         Span::styled(" ", Style::default().fg(theme.text_muted).bg(theme.bg_base)),
         Span::styled(
@@ -626,7 +642,7 @@ fn tool_card_head(
             format!(" {args}"),
             Style::default().fg(theme.text_muted).bg(theme.bg_base),
         ),
-    ];
+    ]);
     if card.readonly {
         head.push(Span::styled(
             "  只读 · 自动运行",
@@ -636,36 +652,41 @@ fn tool_card_head(
     head
 }
 
-fn collapsed_tool_summary(card: &ToolCard, theme: &Theme, width: usize) -> Vec<Span<'static>> {
-    if matches!(card.status, ToolCardStatus::Running) {
-        return vec![Span::styled(
-            " · 运行中…",
-            Style::default().fg(theme.text_secondary).bg(theme.bg_base),
-        )];
-    }
+fn collapsed_tool_summary(
+    card: &ToolCard,
+    theme: &Theme,
+    width: usize,
+    show_expand_hint: bool,
+) -> Vec<Span<'static>> {
+    let secondary = Style::default().fg(theme.text_secondary).bg(theme.bg_base);
+    let muted = Style::default().fg(theme.text_muted).bg(theme.bg_base);
 
-    if let Some(exit) = card.exit {
+    let mut spans = if matches!(card.status, ToolCardStatus::Running) {
+        vec![Span::styled(" · 运行中…", secondary)]
+    } else if let Some(exit) = card.exit {
         let color = if exit == 0 {
             theme.success_fg
         } else {
             theme.error_fg
         };
-        return vec![Span::styled(
+        vec![Span::styled(
             format!(" · exit {exit}"),
             Style::default().fg(color).bg(theme.bg_base),
-        )];
-    }
-
-    match &card.output {
-        Some(output) if !output.is_empty() => {
-            let line_count = visible_tool_output_lines(card, output, width).len();
-            vec![Span::styled(
-                format!(" · {line_count} 行 ⌄"),
-                Style::default().fg(theme.text_secondary).bg(theme.bg_base),
-            )]
+        )]
+    } else {
+        match &card.output {
+            Some(output) if !output.is_empty() => {
+                let line_count = visible_tool_output_lines(card, output, width).len();
+                vec![Span::styled(format!(" · {line_count} 行 ⌄"), secondary)]
+            }
+            _ => Vec::new(),
         }
-        _ => Vec::new(),
+    };
+
+    if show_expand_hint {
+        spans.push(Span::styled(" · ctrl+o 展开", muted));
     }
+    spans
 }
 
 fn tool_args_preview(tool_name: &str, args: &serde_json::Value) -> String {
@@ -1645,6 +1666,146 @@ mod tests {
 
         println!("\n--- transcript scroll frame ---\n{text}\n--- end transcript scroll frame ---");
         insta::assert_snapshot!("tui_transcript_scroll_window", text);
+    }
+
+    #[test]
+    fn collapsed_group_first_tool_shows_ctrl_o_expand_hint_on_summary_only() {
+        let theme = Theme::midnight();
+
+        let mut single = AppState::new();
+        single.transcript.push(TranscriptBlock::Tool(tool_card(
+            "read_file",
+            ToolCardStatus::Done,
+            Some("line one\nline two\nline three"),
+            true,
+            false,
+        )));
+        let single_text = render_to_styled(&single, &theme);
+        assert!(
+            single_text.contains("ctrl+o 展开"),
+            "transcript 开头 Tool 组首应含 ctrl+o 展开"
+        );
+        assert!(
+            !status_line(&single_text).contains("ctrl+o"),
+            "状态行不应含 ctrl+o 提示"
+        );
+
+        let mut dual = AppState::new();
+        dual.transcript.push(TranscriptBlock::Tool(tool_card(
+            "read_file",
+            ToolCardStatus::Done,
+            Some("first"),
+            true,
+            false,
+        )));
+        dual.transcript.push(TranscriptBlock::Tool(tool_card(
+            "write_file",
+            ToolCardStatus::Done,
+            Some("second\nline"),
+            false,
+            false,
+        )));
+        let dual_text = render_to_styled(&dual, &theme);
+        assert_eq!(
+            dual_text.matches("ctrl+o 展开").count(),
+            1,
+            "同组仅组首 Tool 带 ctrl+o 展开: {dual_text}"
+        );
+
+        let mut grouped = AppState::new();
+        grouped
+            .transcript
+            .push(TranscriptBlock::User("先做 read".to_string()));
+        grouped.transcript.push(TranscriptBlock::Tool(tool_card(
+            "read_file",
+            ToolCardStatus::Done,
+            Some("chunk"),
+            true,
+            false,
+        )));
+        grouped.transcript.push(TranscriptBlock::Assistant(
+            "读完了,再写两个文件".to_string(),
+        ));
+        grouped.transcript.push(TranscriptBlock::Tool(tool_card(
+            "write_file",
+            ToolCardStatus::Done,
+            Some("a"),
+            false,
+            false,
+        )));
+        grouped.transcript.push(TranscriptBlock::Tool(tool_card(
+            "grep",
+            ToolCardStatus::Done,
+            Some("match\nline"),
+            false,
+            false,
+        )));
+        let grouped_text = render_to_styled(&grouped, &theme);
+        assert_eq!(
+            grouped_text.matches("ctrl+o 展开").count(),
+            2,
+            "User→Tool 与 Assistant 后新 Tool 组各应有一个 hint: {grouped_text}"
+        );
+        let grouped_lines: Vec<_> = grouped_text.lines().collect();
+        let read_line = grouped_lines
+            .iter()
+            .find(|line| line.contains("read_file"))
+            .expect("read_file 行");
+        let write_line = grouped_lines
+            .iter()
+            .find(|line| line.contains("write_file"))
+            .expect("write_file 行");
+        let grep_line = grouped_lines
+            .iter()
+            .find(|line| line.contains("grep"))
+            .expect("grep 行");
+        assert!(read_line.contains("ctrl+o 展开"));
+        assert!(write_line.contains("ctrl+o 展开"));
+        assert!(!grep_line.contains("ctrl+o"));
+
+        let mut expanded = single;
+        expanded.tools_expanded = true;
+        let expanded_text = render_to_styled(&expanded, &theme);
+        assert!(
+            !expanded_text.contains("ctrl+o"),
+            "展开态不应显示 ctrl+o 提示: {expanded_text}"
+        );
+    }
+
+    #[test]
+    fn tool_group_ctrl_o_hints_snapshot() {
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(TranscriptBlock::User("先做 read".to_string()));
+        state.transcript.push(TranscriptBlock::Tool(tool_card(
+            "read_file",
+            ToolCardStatus::Done,
+            Some("chunk one\nchunk two"),
+            true,
+            false,
+        )));
+        state.transcript.push(TranscriptBlock::Assistant(
+            "读完了,再写两个文件".to_string(),
+        ));
+        state.transcript.push(TranscriptBlock::Tool(tool_card(
+            "write_file",
+            ToolCardStatus::Done,
+            Some("written"),
+            false,
+            false,
+        )));
+        state.transcript.push(TranscriptBlock::Tool(tool_card(
+            "grep",
+            ToolCardStatus::Done,
+            Some("match"),
+            false,
+            false,
+        )));
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!("\n--- tool group ctrl+o hints frame ---\n{text}\n--- end ---");
+        insta::assert_snapshot!("tui_tool_group_ctrl_o_hints", text);
     }
 
     #[test]

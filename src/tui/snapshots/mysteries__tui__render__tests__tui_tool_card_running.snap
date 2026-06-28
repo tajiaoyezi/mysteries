@@ -5,7 +5,7 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›┌─ ‹/›‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=note.txt‹/›‹text.secondary›  只读 · 自动运行 · 运行中…‹/›
+‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=note.txt‹/›‹text.secondary›  只读 · 自动运行 · 运行中…‹/›‹text.muted› · ctrl+o 展开‹/›
 
 
 
