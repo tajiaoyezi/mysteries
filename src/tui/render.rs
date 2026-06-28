@@ -25,9 +25,10 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     if state.pending_permission.is_some() {
         render_permission(frame, rows[2], state, theme);
     }
-    render_input(frame, rows[4], state, theme);
-    render_command_completion(frame, rows[4], state, theme);
-    render_status(frame, rows[5], state, theme);
+    render_activity(frame, rows[4], state, theme);
+    render_input(frame, rows[5], state, theme);
+    render_command_completion(frame, rows[5], state, theme);
+    render_status(frame, rows[6], state, theme);
 }
 
 pub(crate) fn transcript_line_count(state: &AppState, theme: &Theme, width: usize) -> usize {
@@ -46,6 +47,7 @@ fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
             Constraint::Min(8),
             Constraint::Length(permission_height(state)),
             Constraint::Length(status_top_gap_height(state)),
+            Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
@@ -863,41 +865,97 @@ fn diff_line(line: DiffLine, theme: &Theme) -> Line<'static> {
     ])
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
-    let (label, color) = match &state.phase {
-        Phase::Ready => ("◇ 就绪".to_string(), theme.text_muted),
-        Phase::Busy => ("忙".to_string(), theme.accent_primary),
-        Phase::CallingModel => (
-            format!("{} 调用模型…", state.spinner_glyph()),
-            theme.accent_primary,
-        ),
-        Phase::ExecutingTool(name) => (
+fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+    let spans = activity_spans(state, theme);
+    let paragraph = Paragraph::new(Line::from(spans))
+        .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
+    frame.render_widget(paragraph, area);
+}
+
+fn activity_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
+    let base = Style::default().bg(theme.bg_base);
+    match &state.phase {
+        Phase::Ready => {
+            if state.idle_output_tokens() > 0 || state.idle_rate_tps().is_some() {
+                idle_token_summary_spans(state, theme)
+            } else {
+                vec![Span::styled("◇ 就绪", base.fg(theme.text_muted))]
+            }
+        }
+        Phase::Busy => {
+            running_activity_spans(state, theme, format!("{} 处理…", state.spinner_glyph()))
+        }
+        Phase::CallingModel => {
+            running_activity_spans(state, theme, format!("{} 调用模型…", state.spinner_glyph()))
+        }
+        Phase::ExecutingTool(name) => running_activity_spans(
+            state,
+            theme,
             format!("{} 执行 {name}…", state.spinner_glyph()),
-            theme.accent_primary,
         ),
-        Phase::WaitingForPermission => ("▲ 等待授权…".to_string(), theme.warning_fg),
-    };
+        Phase::WaitingForPermission => {
+            let mut spans = vec![Span::styled("▲ 等待授权…", base.fg(theme.warning_fg))];
+            spans.extend(token_rate_spans(state, theme));
+            spans
+        }
+    }
+}
+
+fn idle_token_summary_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
+    let base = Style::default().bg(theme.bg_base).fg(theme.text_muted);
+    let mut text = format!("↓ {} tok", state.idle_output_tokens());
+    if let Some(rate) = state.idle_rate_tps() {
+        text.push_str(" · ");
+        if state.idle_rate_is_approximate() {
+            text.push_str(&format!("~{rate:.0} t/s"));
+        } else {
+            text.push_str(&format!("{rate:.0} t/s"));
+        }
+    }
+    vec![Span::styled(text, base)]
+}
+
+fn running_activity_spans(state: &AppState, theme: &Theme, label: String) -> Vec<Span<'static>> {
+    let base = Style::default().bg(theme.bg_base);
+    let mut spans = vec![Span::styled(label, base.fg(theme.accent_primary))];
+    spans.push(Span::styled(" · esc 中断", base.fg(theme.text_muted)));
+    spans.extend(token_rate_spans(state, theme));
+    spans
+}
+
+fn token_rate_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
+    let tokens = state.output_tokens_this_turn();
+    let rate = state.last_rate_tps();
+    if tokens == 0 && rate.is_none() {
+        return Vec::new();
+    }
+
+    let base = Style::default().bg(theme.bg_base).fg(theme.text_muted);
+    let mut text = String::new();
+    if tokens > 0 {
+        text.push_str(&format!(" · ↓ {tokens} tok"));
+    }
+    if let Some(rate) = rate {
+        text.push_str(" · ");
+        if state.last_rate_is_approximate() {
+            text.push_str(&format!("~{rate:.0} t/s"));
+        } else {
+            text.push_str(&format!("{rate:.0} t/s"));
+        }
+    }
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(text, base)]
+    }
+}
+
+fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
     let meta = status_meta(state);
-    let left_plain = format!("status: {label}");
-    let padding = area
-        .width
-        .saturating_sub((display_width(&left_plain) + display_width(&meta)) as u16)
-        as usize;
-    let paragraph = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "status: ",
-            Style::default().fg(theme.text_secondary).bg(theme.bg_base),
-        ),
-        Span::styled(label, Style::default().fg(color).bg(theme.bg_base)),
-        Span::styled(
-            " ".repeat(padding),
-            Style::default().fg(theme.text_muted).bg(theme.bg_base),
-        ),
-        Span::styled(
-            meta,
-            Style::default().fg(theme.text_muted).bg(theme.bg_base),
-        ),
-    ]))
+    let paragraph = Paragraph::new(Line::from(vec![Span::styled(
+        meta,
+        Style::default().fg(theme.text_muted).bg(theme.bg_base),
+    )]))
     .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
     frame.render_widget(paragraph, area);
 }
@@ -1061,6 +1119,7 @@ fn input_cursor_position(area: Rect, input: &str) -> Position {
 #[cfg(test)]
 mod tests {
     use super::{render, transcript_line_count};
+    use crate::provider::Usage;
     use crate::tui::app::{
         AppState, Phase, SessionSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
     };
@@ -1074,6 +1133,7 @@ mod tests {
     use ratatui::Terminal;
     use serde_json::json;
     use std::path::PathBuf;
+    use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1215,9 +1275,24 @@ mod tests {
         Some(format!("‹{}›", parts.join(" ")))
     }
 
-    fn status_line(text: &str) -> String {
+    fn activity_line(text: &str) -> String {
         text.lines()
-            .find(|line| line.contains("status:"))
+            .find(|line| {
+                line.contains("◇ 就绪")
+                    || line.contains("调用模型")
+                    || line.contains("执行 ")
+                    || line.contains("等待授权")
+                    || line.contains("处理…")
+                    || line.contains("↓ ")
+                    || line.contains("t/s")
+            })
+            .unwrap()
+            .to_string()
+    }
+
+    fn meta_line(text: &str) -> String {
+        text.lines()
+            .find(|line| line.contains(" · iter "))
             .unwrap()
             .to_string()
     }
@@ -1763,8 +1838,8 @@ mod tests {
             "transcript 开头 Tool 组首应含 ctrl+o 展开"
         );
         assert!(
-            !status_line(&single_text).contains("ctrl+o"),
-            "状态行不应含 ctrl+o 提示"
+            !meta_line(&single_text).contains("ctrl+o"),
+            "底部 meta 行不应含 ctrl+o 提示"
         );
 
         let mut dual = AppState::new();
@@ -1899,13 +1974,60 @@ mod tests {
             let mut state = AppState::new();
             state.phase = phase;
             state.spinner_frame = 3;
+            let rendered = render_to_styled(&state, &Theme::midnight());
             text.push_str(label);
             text.push_str(": ");
-            text.push_str(&status_line(&render_to_styled(&state, &Theme::midnight())));
+            text.push_str(&activity_line(&rendered));
+            text.push_str(" | meta: ");
+            text.push_str(&meta_line(&rendered));
             text.push('\n');
         }
 
         println!("\n--- phase status lines ---\n{text}--- end phase status lines ---");
         insta::assert_snapshot!("tui_phase_status_lines", text);
+    }
+
+    #[test]
+    fn activity_token_rate_snapshots() {
+        let theme = Theme::midnight();
+        let mut text = String::new();
+
+        let mut streaming = AppState::new();
+        streaming.phase = Phase::CallingModel;
+        streaming.spinner_frame = 3;
+        streaming.record_streaming_chars(400, Duration::from_secs(2));
+        text.push_str("streaming_approx: ");
+        text.push_str(&activity_line(&render_to_styled(&streaming, &theme)));
+        text.push('\n');
+
+        let mut real_running = AppState::new();
+        real_running.phase = Phase::CallingModel;
+        real_running.spinner_frame = 3;
+        real_running.record_usage(
+            Usage {
+                input_tokens: 0,
+                output_tokens: 120,
+            },
+            Duration::from_secs(2),
+        );
+        text.push_str("real_running: ");
+        text.push_str(&activity_line(&render_to_styled(&real_running, &theme)));
+        text.push('\n');
+
+        let mut idle = AppState::new();
+        idle.record_usage(
+            Usage {
+                input_tokens: 10,
+                output_tokens: 120,
+            },
+            Duration::from_secs(2),
+        );
+        idle.apply(AgentEvent::TurnComplete);
+        text.push_str("idle_after_turn: ");
+        text.push_str(&activity_line(&render_to_styled(&idle, &theme)));
+        text.push('\n');
+
+        println!("\n--- activity token rates ---\n{text}--- end activity token rates ---");
+        insta::assert_snapshot!("tui_activity_token_rates", text);
     }
 }

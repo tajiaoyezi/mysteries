@@ -25,6 +25,10 @@ pub enum AgentEvent {
     Interrupted,
     TurnComplete,
     Notice(String),
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
     Error(String),
 }
 
@@ -91,6 +95,13 @@ impl AgentObserver for ChannelObserver {
         let _ = self.tx.send(AgentEvent::ToolCallFinished {
             id: id.to_string(),
             outcome: outcome.clone(),
+        });
+    }
+
+    fn on_usage(&self, usage: &crate::provider::Usage) {
+        let _ = self.tx.send(AgentEvent::Usage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
         });
     }
 }

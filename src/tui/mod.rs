@@ -5,12 +5,14 @@ use crate::agent::{Agent, AgentStatus, Compacting};
 use crate::cli::{CliError, CliPaths};
 use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSource};
 use crate::error::AgentError;
+use crate::provider::Usage;
 use crate::tool::ToolContext;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{Duration, MissedTickBehavior};
 
@@ -73,6 +75,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let debug_events = debug_events_enabled();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut calling_model_started_at: Option<Instant> = None;
 
     terminal
         .terminal_mut()
@@ -113,7 +116,9 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
             }
             event = ui_rx.recv() => {
                 match event {
-                    Some(event) => state.apply(event),
+                    Some(event) => {
+                        apply_ui_event(&mut state, event, &mut calling_model_started_at);
+                    }
                     None => break,
                 }
             }
@@ -132,6 +137,44 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let _ = agent_handle.await;
 
     Ok(())
+}
+
+fn apply_ui_event(
+    state: &mut app::AppState,
+    event: channel::AgentEvent,
+    calling_model_started_at: &mut Option<Instant>,
+) {
+    match &event {
+        channel::AgentEvent::StatusChanged(AgentStatus::CallingModel) => {
+            *calling_model_started_at = Some(Instant::now());
+            state.reset_streaming_chars_for_call();
+        }
+        channel::AgentEvent::TextDelta(text) => {
+            let elapsed = calling_model_started_at
+                .as_ref()
+                .map(|start| start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            state.record_streaming_chars(text.chars().count() as u32, elapsed);
+        }
+        channel::AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+        } => {
+            let elapsed = calling_model_started_at
+                .take()
+                .map(|start| start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            state.record_usage(
+                Usage {
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                },
+                elapsed,
+            );
+        }
+        _ => {}
+    }
+    state.apply(event);
 }
 
 fn debug_events_enabled() -> bool {

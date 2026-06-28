@@ -1,0 +1,7 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+streaming_approx: ‹accent.primary›⠸ 调用模型…‹/›‹text.muted› · esc 中断 · ~50 t/s‹/›
+real_running: ‹accent.primary›⠸ 调用模型…‹/›‹text.muted› · esc 中断 · ↓ 120 tok · 60 t/s‹/›
+idle_after_turn: ‹text.muted›↓ 120 tok · 60 t/s‹/›

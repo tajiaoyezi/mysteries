@@ -1,12 +1,14 @@
 use crate::agent::message::Message;
 use crate::agent::AgentStatus;
 use crate::permission::PermissionDecision;
+use crate::provider::Usage;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
 use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -134,6 +136,19 @@ fn diff_lines(value: Option<&Value>, kind: DiffKind) -> Vec<DiffLine> {
         .unwrap_or_default()
 }
 
+pub const ESTIMATED_CHARS_PER_TOKEN: u32 = 4;
+
+pub fn estimate_tokens_from_chars(chars: u32) -> u32 {
+    chars / ESTIMATED_CHARS_PER_TOKEN
+}
+
+pub fn estimate_streaming_rate_tps(chars: u32, elapsed: Duration) -> Option<f64> {
+    if elapsed.is_zero() {
+        return None;
+    }
+    Some(estimate_tokens_from_chars(chars) as f64 / elapsed.as_secs_f64())
+}
+
 pub struct AppState {
     pub session: SessionSnapshot,
     pub agent_history: Arc<Mutex<Vec<Message>>>,
@@ -148,6 +163,13 @@ pub struct AppState {
     pub spinner_frame: usize,
     pub should_exit: bool,
     follows_bottom: bool,
+    turn_output_tokens: u32,
+    last_rate_tps: Option<f64>,
+    streaming_chars_this_call: u32,
+    last_rate_is_approximate: bool,
+    idle_output_tokens: u32,
+    idle_rate_tps: Option<f64>,
+    idle_rate_is_approximate: bool,
 }
 
 impl AppState {
@@ -182,7 +204,71 @@ impl AppState {
             spinner_frame: 0,
             should_exit: false,
             follows_bottom: true,
+            turn_output_tokens: 0,
+            last_rate_tps: None,
+            streaming_chars_this_call: 0,
+            last_rate_is_approximate: false,
+            idle_output_tokens: 0,
+            idle_rate_tps: None,
+            idle_rate_is_approximate: false,
         }
+    }
+
+    pub fn output_tokens_this_turn(&self) -> u32 {
+        self.turn_output_tokens
+    }
+
+    pub fn last_rate_tps(&self) -> Option<f64> {
+        self.last_rate_tps
+    }
+
+    pub fn record_usage(&mut self, usage: Usage, elapsed: Duration) {
+        self.turn_output_tokens += usage.output_tokens;
+        self.last_rate_tps = if elapsed.is_zero() {
+            None
+        } else {
+            Some(usage.output_tokens as f64 / elapsed.as_secs_f64())
+        };
+        self.last_rate_is_approximate = false;
+    }
+
+    pub fn record_streaming_chars(&mut self, chars: u32, elapsed: Duration) {
+        self.streaming_chars_this_call += chars;
+        self.last_rate_tps = estimate_streaming_rate_tps(self.streaming_chars_this_call, elapsed);
+        self.last_rate_is_approximate = true;
+    }
+
+    pub fn reset_streaming_chars_for_call(&mut self) {
+        self.streaming_chars_this_call = 0;
+    }
+
+    pub fn idle_output_tokens(&self) -> u32 {
+        self.idle_output_tokens
+    }
+
+    pub fn idle_rate_tps(&self) -> Option<f64> {
+        self.idle_rate_tps
+    }
+
+    pub fn idle_rate_is_approximate(&self) -> bool {
+        self.idle_rate_is_approximate
+    }
+
+    pub fn last_rate_is_approximate(&self) -> bool {
+        self.last_rate_is_approximate
+    }
+
+    fn reset_turn_token_usage(&mut self) {
+        self.turn_output_tokens = 0;
+        self.last_rate_tps = None;
+        self.last_rate_is_approximate = false;
+        self.streaming_chars_this_call = 0;
+    }
+
+    fn save_idle_token_summary(&mut self) {
+        self.idle_output_tokens = self.turn_output_tokens;
+        self.idle_rate_tps = self.last_rate_tps;
+        self.idle_rate_is_approximate = self.last_rate_is_approximate;
     }
 
     pub fn status_snapshot(&self) -> StatusSnapshot {
@@ -416,6 +502,8 @@ impl AppState {
                 self.pending_permission = None;
                 self.iteration = 0;
                 self.phase = Phase::Ready;
+                self.save_idle_token_summary();
+                self.reset_turn_token_usage();
             }
             AgentEvent::Notice(message) => {
                 self.transcript.push(TranscriptBlock::Notice(message));
@@ -433,6 +521,10 @@ impl AppState {
                 self.phase = Phase::Ready;
                 self.transcript.push(TranscriptBlock::Error(message));
             }
+            AgentEvent::Usage {
+                input_tokens: _,
+                output_tokens: _,
+            } => {}
         }
     }
 
@@ -508,6 +600,7 @@ impl AppState {
                     self.execute_command(command, input_tx);
                     return;
                 }
+                self.reset_turn_token_usage();
                 self.iteration = 0;
                 self.phase = Phase::Busy;
                 self.transcript.push(TranscriptBlock::User(prompt.clone()));
@@ -603,16 +696,19 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_diff, AppState, DiffKind, DiffLine, Phase, SessionSnapshot, StatusSnapshot,
-        ToolCard, ToolCardStatus, TranscriptBlock,
+        compute_diff, estimate_streaming_rate_tps, estimate_tokens_from_chars, AppState, DiffKind,
+        DiffLine, Phase, SessionSnapshot, StatusSnapshot, ToolCard, ToolCardStatus,
+        TranscriptBlock,
     };
     use crate::agent::AgentStatus;
     use crate::permission::PermissionDecision;
+    use crate::provider::Usage;
     use crate::tool::ToolOutcome;
     use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use serde_json::json;
     use std::path::PathBuf;
+    use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1398,5 +1494,120 @@ mod tests {
         deny_state.on_key(key(KeyCode::Esc), &input_tx);
 
         assert_eq!(deny_rx.try_recv().unwrap(), PermissionDecision::Deny);
+    }
+
+    #[test]
+    fn record_usage_accumulates_output_tokens_and_computes_rate() {
+        let mut state = AppState::new();
+
+        state.record_usage(
+            Usage {
+                input_tokens: 10,
+                output_tokens: 120,
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(state.output_tokens_this_turn(), 120);
+        assert_eq!(state.last_rate_tps(), Some(60.0));
+
+        state.record_usage(
+            Usage {
+                input_tokens: 5,
+                output_tokens: 60,
+            },
+            Duration::from_secs(1),
+        );
+        assert_eq!(state.output_tokens_this_turn(), 180);
+        assert_eq!(state.last_rate_tps(), Some(60.0));
+    }
+
+    #[test]
+    fn record_usage_zero_elapsed_has_no_rate_without_panic() {
+        let mut state = AppState::new();
+
+        state.record_usage(
+            Usage {
+                input_tokens: 0,
+                output_tokens: 50,
+            },
+            Duration::ZERO,
+        );
+
+        assert_eq!(state.output_tokens_this_turn(), 50);
+        assert_eq!(state.last_rate_tps(), None);
+    }
+
+    #[test]
+    fn turn_complete_resets_output_token_accumulation() {
+        let mut state = AppState::new();
+        state.record_usage(
+            Usage {
+                input_tokens: 0,
+                output_tokens: 40,
+            },
+            Duration::from_secs(1),
+        );
+        assert_eq!(state.output_tokens_this_turn(), 40);
+        assert_eq!(state.last_rate_tps(), Some(40.0));
+
+        state.apply(AgentEvent::TurnComplete);
+
+        assert_eq!(state.output_tokens_this_turn(), 0);
+        assert_eq!(state.last_rate_tps(), None);
+    }
+
+    #[test]
+    fn new_prompt_resets_output_token_accumulation() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.record_usage(
+            Usage {
+                input_tokens: 0,
+                output_tokens: 40,
+            },
+            Duration::from_secs(1),
+        );
+        assert_eq!(state.output_tokens_this_turn(), 40);
+        state.input = "hello".to_string();
+
+        state.on_key(key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(state.output_tokens_this_turn(), 0);
+        assert_eq!(state.last_rate_tps(), None);
+    }
+
+    #[test]
+    fn estimate_tokens_from_chars_uses_quarter_char_ratio() {
+        assert_eq!(estimate_tokens_from_chars(400), 100);
+    }
+
+    #[test]
+    fn estimate_streaming_rate_tps_uses_chars_per_token_ratio() {
+        let rate = estimate_streaming_rate_tps(400, Duration::from_secs(2)).unwrap();
+        assert!((rate - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_streaming_rate_tps_zero_elapsed_returns_none() {
+        assert_eq!(estimate_streaming_rate_tps(100, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn record_streaming_chars_sets_approximate_rate_before_real_usage_corrects() {
+        let mut state = AppState::new();
+        state.record_streaming_chars(400, Duration::from_secs(2));
+        assert!(state.last_rate_is_approximate());
+        assert_eq!(state.last_rate_tps(), Some(50.0));
+
+        state.record_usage(
+            Usage {
+                input_tokens: 0,
+                output_tokens: 120,
+            },
+            Duration::from_secs(2),
+        );
+        assert!(!state.last_rate_is_approximate());
+        assert_eq!(state.last_rate_tps(), Some(60.0));
+        assert_eq!(state.output_tokens_this_turn(), 120);
     }
 }

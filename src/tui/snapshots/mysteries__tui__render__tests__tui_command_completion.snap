@@ -21,8 +21,8 @@ expression: text
 ‹border.strong bg=bg.surface›┌──────────────────────────────────────────────────┐‹/›
 ‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold +reversed›/compact  ‹/›‹text.body bg=bg.surface +reversed›压缩当前上下文‹/›‹text.primary bg=bg.surface›                          ‹/›‹border.strong bg=bg.surface›│‹/›
 ‹border.strong bg=bg.surface›└──────────────────────────────────────────────────┘‹/›
-
+‹text.muted›◇ 就绪‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.primary›/co                                                               ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
-‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                         mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›

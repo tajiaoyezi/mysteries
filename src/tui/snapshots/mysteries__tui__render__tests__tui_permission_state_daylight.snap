@@ -20,9 +20,9 @@ expression: text
 ‹warning.fg bg=warning.bg›│‹/›‹error.fg bg=warning.bg›−     pub max_iterations: u32,‹/›‹text.title bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
 ‹warning.fg bg=warning.bg›│‹/›‹success.fg bg=warning.bg›+     pub timeout_secs: u64,‹/›‹text.title bg=warning.bg›                                                  ‹/›‹warning.fg bg=warning.bg›│‹/›
 ‹warning.fg bg=warning.bg›│[y · 允许]‹/›‹text.body bg=warning.bg›   ‹/›‹error.fg bg=warning.bg›[n · 拒绝]‹/›‹text.title bg=warning.bg›                                                       ‹/›‹warning.fg bg=warning.bg›│‹/›
-‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›提示:Enter = 允许 · Esc = 拒绝‹/›‹text.title bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
 ‹warning.fg bg=warning.bg›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹warning.fg›▲ 等待授权…‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.title›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
-‹text.secondary›status: ‹/›‹warning.fg›▲ 等待授权…‹/›‹text.muted›                    mock · mock-model · iter 0/4 · 3 msgs · .‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 3 msgs · .‹/›

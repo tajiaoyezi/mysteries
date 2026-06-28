@@ -60,6 +60,8 @@ pub trait AgentObserver: Send + Sync {
     }
 
     fn on_tool_call_finished(&self, _id: &str, _outcome: &crate::tool::ToolOutcome) {}
+
+    fn on_usage(&self, _usage: &Usage) {}
 }
 
 pub struct NoopObserver;
@@ -137,6 +139,9 @@ impl Agent {
             let text = response.text;
             let tool_calls = response.tool_calls;
             last_usage = response.usage;
+            if let Some(ref usage) = last_usage {
+                observer.on_usage(usage);
+            }
 
             history.push(Message::Assistant {
                 text: text.clone(),
@@ -258,6 +263,7 @@ mod tests {
     #[derive(Debug, PartialEq)]
     enum ObservedEvent {
         Status(AgentStatus),
+        Usage(Usage),
         ToolCallStarted {
             id: String,
             name: String,
@@ -309,6 +315,13 @@ mod tests {
                     id: id.to_string(),
                     outcome: outcome.clone(),
                 });
+        }
+
+        fn on_usage(&self, usage: &Usage) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(ObservedEvent::Usage(usage.clone()));
         }
     }
 
@@ -850,6 +863,51 @@ mod tests {
                 ObservedEvent::Status(AgentStatus::Idle),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn run_observed_emits_on_usage_when_model_response_has_usage() {
+        let first_usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response_with_usage(
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({ "input": "from tool" }),
+                }],
+                first_usage.clone(),
+            ),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry_with_echo(),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let mut history = vec![Message::User("hello".to_string())];
+
+        agent
+            .run_observed(&mut history, &ctx(), &sink, &observer)
+            .await
+            .unwrap();
+
+        let usage_events = observer
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                ObservedEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(usage_events, vec![first_usage]);
     }
 
     #[tokio::test]
