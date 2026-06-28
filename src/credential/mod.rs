@@ -122,18 +122,58 @@ pub fn write_credential(
         }
     }
 
-    if let Err(err) = fs::write(path, updated.as_bytes()) {
+    write_credential_file(path, updated.as_bytes())
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.tmp", path.display()))
+}
+
+fn write_credential_file(path: &Path, content: &[u8]) -> Result<(), CredentialError> {
+    let temp_path = temp_path_for(path);
+
+    if let Err(err) = write_temp_file(&temp_path, content) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
         return Err(CredentialError::Write(format!(
-            "write {}: {}",
+            "rename {}: {}",
             path.display(),
             err.kind()
         )));
     }
 
-    #[cfg(unix)]
-    restrict_permissions(path)?;
-
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_temp_file(temp_path: &Path, content: &[u8]) -> Result<(), CredentialError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(temp_path)
+        .map_err(|err| {
+            CredentialError::Write(format!("open {}: {}", temp_path.display(), err.kind()))
+        })?;
+
+    file.write_all(content).map_err(|err| {
+        CredentialError::Write(format!("write {}: {}", temp_path.display(), err.kind()))
+    })
+}
+
+#[cfg(not(unix))]
+fn write_temp_file(temp_path: &Path, content: &[u8]) -> Result<(), CredentialError> {
+    fs::write(temp_path, content).map_err(|err| {
+        CredentialError::Write(format!("write {}: {}", temp_path.display(), err.kind()))
+    })
 }
 
 fn upsert_credential_line(content: &str, provider: &str, key: &str) -> String {
@@ -163,14 +203,6 @@ fn upsert_credential_line(content: &str, provider: &str, key: &str) -> String {
         result.push('\n');
     }
     result
-}
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), CredentialError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|err| CredentialError::Write(format!("chmod {}: {}", path.display(), err.kind())))
 }
 
 pub struct CredentialChain(Vec<Box<dyn CredentialSource>>);
@@ -426,5 +458,25 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_credential_tightens_permissions_when_overwriting_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+        fs::write(&path, "anthropic = sk-a\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_credential(&path, "openai", &SecretString::from("sk-o".to_string())).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let source = FileCredentialSource::new(&path);
+        assert_eq!(source.resolve("openai").unwrap().expose_secret(), "sk-o");
+        assert_eq!(source.resolve("anthropic").unwrap().expose_secret(), "sk-a");
     }
 }
