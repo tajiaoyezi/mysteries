@@ -18,11 +18,11 @@ expression: text
 ‹text.primary›                   ‹/›‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›
 ‹text.primary›                   ‹/›‹accent.primary›〔/status〕‹/›‹text.primary› 当前会话快照‹/›
 ‹text.primary›                   ‹/›‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
-
-
-
+‹border.strong bg=bg.surface›┌──────────────────────────────────────────────────┐‹/›
+‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold +reversed›/compact  ‹/›‹text.body bg=bg.surface +reversed›压缩当前上下文‹/›‹text.primary bg=bg.surface›                          ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›└──────────────────────────────────────────────────┘‹/›
 
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
-‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
+‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.primary›/co                                                               ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                         mock · mock-model · iter 0/4 · 0 msgs · .‹/›

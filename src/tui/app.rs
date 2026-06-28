@@ -2,7 +2,7 @@ use crate::agent::message::Message;
 use crate::agent::AgentStatus;
 use crate::permission::PermissionDecision;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
-use crate::tui::command::{parse_command, Command};
+use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -90,6 +90,12 @@ pub struct ToolCard {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandCompletion {
+    pub candidates: Vec<CommandMetadata>,
+    pub selected: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffKind {
     Add,
     Del,
@@ -134,6 +140,7 @@ pub struct AppState {
     pub iteration: u32,
     pub transcript: Vec<TranscriptBlock>,
     pub tools_expanded: bool,
+    pub command_completion: Option<CommandCompletion>,
     pub input: String,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
@@ -167,6 +174,7 @@ impl AppState {
             iteration: 0,
             transcript: Vec::new(),
             tools_expanded: false,
+            command_completion: None,
             input: String::new(),
             phase: Phase::Ready,
             pending_permission: None,
@@ -261,6 +269,87 @@ impl AppState {
 
     pub fn toggle_tools_expanded(&mut self) {
         self.tools_expanded = !self.tools_expanded;
+    }
+
+    fn refresh_command_completion(&mut self) {
+        let previous = self
+            .command_completion
+            .as_ref()
+            .and_then(|completion| completion.candidates.get(completion.selected))
+            .map(|command| command.name);
+
+        let Some(mut candidates) = command_completion_candidates(&self.input) else {
+            self.command_completion = None;
+            return;
+        };
+
+        let selected = previous
+            .and_then(|name| candidates.iter().position(|command| command.name == name))
+            .unwrap_or(0);
+
+        self.command_completion = Some(CommandCompletion {
+            candidates: std::mem::take(&mut candidates),
+            selected,
+        });
+    }
+
+    fn close_command_completion(&mut self) {
+        self.command_completion = None;
+    }
+
+    fn move_command_completion_selection(&mut self, delta: isize) {
+        let Some(completion) = self.command_completion.as_mut() else {
+            return;
+        };
+        if completion.candidates.is_empty() {
+            completion.selected = 0;
+            return;
+        }
+
+        let len = completion.candidates.len();
+        completion.selected = if delta.is_negative() {
+            completion.selected.checked_sub(1).unwrap_or(len - 1)
+        } else {
+            (completion.selected + 1) % len
+        };
+    }
+
+    fn complete_selected_command(&mut self) {
+        let Some(completion) = self.command_completion.as_ref() else {
+            return;
+        };
+        let Some(command) = completion.candidates.get(completion.selected) else {
+            return;
+        };
+
+        self.input = command.name.to_string();
+        self.close_command_completion();
+    }
+
+    fn handle_command_completion_key(&mut self, key: KeyEvent) -> bool {
+        if self.command_completion.is_none() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.move_command_completion_selection(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.move_command_completion_selection(1);
+                true
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                self.complete_selected_command();
+                true
+            }
+            KeyCode::Esc => {
+                self.close_command_completion();
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn apply(&mut self, event: AgentEvent) {
@@ -388,6 +477,10 @@ impl AppState {
             return;
         }
 
+        if self.handle_command_completion_key(key) {
+            return;
+        }
+
         if key.code == KeyCode::Esc && self.phase.is_running() {
             if let Some(tx) = interrupt_tx {
                 let _ = tx.send(UserInput::Interrupt);
@@ -396,11 +489,16 @@ impl AppState {
         }
 
         match key.code {
-            KeyCode::Char(ch) => self.input.push(ch),
+            KeyCode::Char(ch) => {
+                self.input.push(ch);
+                self.refresh_command_completion();
+            }
             KeyCode::Backspace => {
                 self.input.pop();
+                self.refresh_command_completion();
             }
             KeyCode::Enter => {
+                self.close_command_completion();
                 let prompt = self.input.trim().to_string();
                 if prompt.is_empty() {
                     return;
@@ -461,6 +559,26 @@ impl AppState {
             let _ = request.responder.send(decision);
             self.phase = Phase::Busy;
         }
+    }
+}
+
+fn command_completion_candidates(input: &str) -> Option<Vec<CommandMetadata>> {
+    if !input.starts_with('/') {
+        return None;
+    }
+    if input.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let candidates = command_metadata()
+        .iter()
+        .copied()
+        .filter(|command| command.name.starts_with(input))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        None
+    } else {
+        Some(candidates)
     }
 }
 
@@ -1125,6 +1243,74 @@ mod tests {
         assert_eq!(interrupt_rx.try_recv().unwrap(), UserInput::Interrupt);
         assert_eq!(state.phase, Phase::CallingModel);
         assert!(state.tools_expanded);
+    }
+
+    fn completion_names(state: &AppState) -> Vec<&'static str> {
+        state
+            .command_completion
+            .as_ref()
+            .expect("completion should be visible")
+            .candidates
+            .iter()
+            .map(|command| command.name)
+            .collect()
+    }
+
+    fn selected_completion_name(state: &AppState) -> &'static str {
+        let completion = state
+            .command_completion
+            .as_ref()
+            .expect("completion should be visible");
+        completion.candidates[completion.selected].name
+    }
+
+    #[test]
+    fn slash_completion_filters_candidates_and_completes_selection() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.on_key(key(KeyCode::Char('/')), &tx);
+        assert_eq!(
+            completion_names(&state),
+            vec!["/help", "/clear", "/model", "/status", "/exit", "/login", "/logout", "/compact"]
+        );
+        assert_eq!(selected_completion_name(&state), "/help");
+
+        state.on_key(key(KeyCode::Char('c')), &tx);
+        assert_eq!(completion_names(&state), vec!["/clear", "/compact"]);
+        assert_eq!(selected_completion_name(&state), "/clear");
+
+        state.on_key(key(KeyCode::Down), &tx);
+        assert_eq!(selected_completion_name(&state), "/compact");
+
+        state.on_key(key(KeyCode::Up), &tx);
+        assert_eq!(selected_completion_name(&state), "/clear");
+
+        state.on_key(key(KeyCode::Tab), &tx);
+        assert_eq!(state.input, "/clear");
+        assert!(state.command_completion.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_completion_hides_for_arguments_plain_prompt_and_escape() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.input = "/model ".to_string();
+        state.on_key(key(KeyCode::Char('g')), &tx);
+        assert!(state.command_completion.is_none());
+
+        state.input = "hello".to_string();
+        state.on_key(key(KeyCode::Char('!')), &tx);
+        assert!(state.command_completion.is_none());
+
+        state.input.clear();
+        state.on_key(key(KeyCode::Char('/')), &tx);
+        assert!(state.command_completion.is_some());
+        state.on_key(key(KeyCode::Esc), &tx);
+        assert_eq!(state.input, "/");
+        assert!(state.command_completion.is_none());
     }
 
     #[test]

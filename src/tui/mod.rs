@@ -6,9 +6,7 @@ use crate::cli::{CliError, CliPaths};
 use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSource};
 use crate::error::AgentError;
 use crate::tool::ToolContext;
-use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -24,8 +22,6 @@ pub mod terminal;
 pub mod theme;
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
-const MOUSE_SCROLL_LINES: usize = 3;
-
 pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let config = crate::app::load_config(&paths.user_config, &paths.project_config)?;
     let credentials = CredentialChain::new(vec![
@@ -106,9 +102,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                                     }
                                 }
                             }
-                            Event::Mouse(mouse) => {
-                                handle_scroll_mouse(&mut terminal, &mut state, mouse, &theme)?;
-                            }
+                            Event::Mouse(_) => {}
                             Event::Resize(_, _) => {}
                             Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
                         }
@@ -201,21 +195,6 @@ fn scroll_action_for_key(key: KeyEvent) -> Option<fn(&mut app::AppState, usize, 
     }
 }
 
-fn handle_scroll_mouse(
-    terminal: &mut terminal::TerminalGuard,
-    state: &mut app::AppState,
-    mouse: MouseEvent,
-    theme: &theme::Theme,
-) -> Result<bool, CliError> {
-    let scroll = match mouse.kind {
-        MouseEventKind::ScrollUp => scroll_up_lines,
-        MouseEventKind::ScrollDown => scroll_down_lines,
-        _ => return Ok(false),
-    };
-    apply_scroll(terminal, state, theme, scroll)?;
-    Ok(true)
-}
-
 fn apply_scroll(
     terminal: &mut terminal::TerminalGuard,
     state: &mut app::AppState,
@@ -228,14 +207,6 @@ fn apply_scroll(
     let viewport_lines = render::transcript_viewport_height(area, state);
     scroll(state, total_lines, viewport_lines);
     Ok(())
-}
-
-fn scroll_up_lines(state: &mut app::AppState, total_lines: usize, viewport_lines: usize) {
-    state.scroll_up(total_lines, viewport_lines, MOUSE_SCROLL_LINES);
-}
-
-fn scroll_down_lines(state: &mut app::AppState, total_lines: usize, viewport_lines: usize) {
-    state.scroll_down(total_lines, viewport_lines, MOUSE_SCROLL_LINES);
 }
 
 fn scroll_up_one_line(state: &mut app::AppState, total_lines: usize, viewport_lines: usize) {
@@ -637,50 +608,6 @@ mod tests {
             state.visible_scroll_offset(50, 5),
             45,
             "End should restore bottom following without relying on mouse events"
-        );
-    }
-
-    #[test]
-    fn repeated_line_keys_match_mouse_scroll_line_primitives() {
-        let mut keyboard = super::app::AppState::new();
-        let mut mouse = super::app::AppState::new();
-
-        for _ in 0..super::MOUSE_SCROLL_LINES {
-            assert!(apply_scroll_key_for_test(
-                &mut keyboard,
-                key(KeyCode::Up),
-                40,
-                5
-            ));
-        }
-        super::scroll_up_lines(&mut mouse, 40, 5);
-
-        assert_eq!(
-            keyboard.visible_scroll_offset(40, 5),
-            mouse.visible_scroll_offset(40, 5)
-        );
-        assert_eq!(
-            keyboard.visible_scroll_offset(50, 5),
-            mouse.visible_scroll_offset(50, 5)
-        );
-
-        for _ in 0..super::MOUSE_SCROLL_LINES {
-            assert!(apply_scroll_key_for_test(
-                &mut keyboard,
-                key(KeyCode::Down),
-                40,
-                5
-            ));
-        }
-        super::scroll_down_lines(&mut mouse, 40, 5);
-
-        assert_eq!(
-            keyboard.visible_scroll_offset(40, 5),
-            mouse.visible_scroll_offset(40, 5)
-        );
-        assert_eq!(
-            keyboard.visible_scroll_offset(50, 5),
-            mouse.visible_scroll_offset(50, 5)
         );
     }
 

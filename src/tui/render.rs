@@ -25,8 +25,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     if state.pending_permission.is_some() {
         render_permission(frame, rows[2], state, theme);
     }
-    render_status(frame, rows[4], state, theme);
-    render_input(frame, rows[5], state, theme);
+    render_input(frame, rows[4], state, theme);
+    render_command_completion(frame, rows[4], state, theme);
+    render_status(frame, rows[5], state, theme);
 }
 
 pub(crate) fn transcript_line_count(state: &AppState, theme: &Theme, width: usize) -> usize {
@@ -45,8 +46,8 @@ fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
             Constraint::Min(8),
             Constraint::Length(permission_height(state)),
             Constraint::Length(status_top_gap_height(state)),
-            Constraint::Length(1),
             Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(area)
 }
@@ -984,6 +985,65 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
     frame.set_cursor_position(input_cursor_position(area, &state.input));
 }
 
+fn render_command_completion(
+    frame: &mut Frame<'_>,
+    input_area: Rect,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let Some(completion) = &state.command_completion else {
+        return;
+    };
+    if completion.candidates.is_empty() {
+        return;
+    }
+
+    let list_height = completion.candidates.len().min(6) as u16 + 2;
+    let width = input_area.width.min(52);
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(list_height + 1),
+        width,
+        height: list_height,
+    };
+
+    let lines = completion
+        .candidates
+        .iter()
+        .take(list_height.saturating_sub(2) as usize)
+        .enumerate()
+        .map(|(index, command)| {
+            let base = Style::default().bg(theme.bg_surface);
+            let style = if index == completion.selected {
+                base.add_modifier(Modifier::REVERSED)
+            } else {
+                base
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<10}", command.name),
+                    style.fg(theme.accent_primary).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(command.description.to_string(), style.fg(theme.text_body)),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(
+                    Style::default()
+                        .fg(theme.border_strong)
+                        .bg(theme.bg_surface),
+                )
+                .style(Style::default().fg(theme.text_primary).bg(theme.bg_surface)),
+        )
+        .style(Style::default().fg(theme.text_primary).bg(theme.bg_surface));
+    frame.render_widget(paragraph, area);
+}
+
 fn input_cursor_position(area: Rect, input: &str) -> Position {
     const INPUT_PROMPT: &str = "mysteries ▸ ";
 
@@ -1006,6 +1066,7 @@ mod tests {
     };
     use crate::tui::channel::{AgentEvent, PermissionRequest};
     use crate::tui::theme::Theme;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Position;
@@ -1013,7 +1074,7 @@ mod tests {
     use ratatui::Terminal;
     use serde_json::json;
     use std::path::PathBuf;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     struct StyleKey {
@@ -1198,7 +1259,7 @@ mod tests {
 
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(17, 22));
+            .assert_cursor_position(Position::new(17, 21));
     }
 
     fn tool_card(
@@ -1251,6 +1312,22 @@ mod tests {
         assert_ne!(text, midnight_text);
         println!("\n--- welcome daylight frame ---\n{text}\n--- end welcome daylight frame ---");
         insta::assert_snapshot!("tui_welcome_state_daylight", text);
+    }
+
+    #[test]
+    fn command_completion_snapshot() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        for ch in ['/', 'c', 'o'] {
+            state.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+        }
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        assert!(text.contains("/compact"));
+        println!(
+            "\n--- command completion frame ---\n{text}\n--- end command completion frame ---"
+        );
+        insta::assert_snapshot!("tui_command_completion", text);
     }
 
     #[test]

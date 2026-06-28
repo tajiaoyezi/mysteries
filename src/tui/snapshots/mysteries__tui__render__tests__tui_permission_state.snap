@@ -22,7 +22,7 @@ expression: text
 ‹warning.fg bg=warning.bg›│[y · 允许]‹/›‹text.body bg=warning.bg›   ‹/›‹error.fg bg=warning.bg›[n · 拒绝]‹/›‹text.primary bg=warning.bg›                                                       ‹/›‹warning.fg bg=warning.bg›│‹/›
 ‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›提示:Enter = 允许 · Esc = 拒绝‹/›‹text.primary bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
 ‹warning.fg bg=warning.bg›└──────────────────────────────────────────────────────────────────────────────┘‹/›
-‹text.secondary›status: ‹/›‹warning.fg›▲ 等待授权…‹/›‹text.muted›                    mock · mock-model · iter 0/4 · 3 msgs · .‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.secondary›status: ‹/›‹warning.fg›▲ 等待授权…‹/›‹text.muted›                    mock · mock-model · iter 0/4 · 3 msgs · .‹/›
