@@ -6,8 +6,6 @@ pub enum Command {
     Status,
     Exit,
     Compact,
-    Login,
-    Logout,
     Unknown(String),
 }
 
@@ -18,8 +16,6 @@ enum BuiltinCommand {
     Model,
     Status,
     Exit,
-    Login,
-    Logout,
     Compact,
 }
 
@@ -31,7 +27,7 @@ pub struct CommandMetadata {
     command: BuiltinCommand,
 }
 
-const COMMANDS: [CommandMetadata; 8] = [
+const COMMANDS: [CommandMetadata; 6] = [
     CommandMetadata {
         name: "/help",
         description: "查看内置命令",
@@ -61,18 +57,6 @@ const COMMANDS: [CommandMetadata; 8] = [
         description: "退出 TUI",
         usage: "/exit",
         command: BuiltinCommand::Exit,
-    },
-    CommandMetadata {
-        name: "/login",
-        description: "凭据配置提示",
-        usage: "/login",
-        command: BuiltinCommand::Login,
-    },
-    CommandMetadata {
-        name: "/logout",
-        description: "登录态清理提示",
-        usage: "/logout",
-        command: BuiltinCommand::Logout,
     },
     CommandMetadata {
         name: "/compact",
@@ -108,8 +92,6 @@ pub fn parse_command(input: &str) -> Option<Command> {
         BuiltinCommand::Model => Command::Model(Some(args.to_string())),
         BuiltinCommand::Status => Command::Status,
         BuiltinCommand::Exit => Command::Exit,
-        BuiltinCommand::Login => Command::Login,
-        BuiltinCommand::Logout => Command::Logout,
         BuiltinCommand::Compact => Command::Compact,
     };
 
@@ -133,8 +115,8 @@ mod tests {
             ("/status", Some(Command::Status)),
             ("/compact", Some(Command::Compact)),
             ("/exit", Some(Command::Exit)),
-            ("/login", Some(Command::Login)),
-            ("/logout", Some(Command::Logout)),
+            ("/login", Some(Command::Unknown("login".to_string()))),
+            ("/logout", Some(Command::Unknown("logout".to_string()))),
             ("/xyz", Some(Command::Unknown("xyz".to_string()))),
             ("write code", None),
         ];
@@ -146,9 +128,7 @@ mod tests {
 
     #[test]
     fn command_metadata_covers_all_builtin_commands_and_matches_parser() {
-        let expected = [
-            "/help", "/clear", "/model", "/status", "/exit", "/login", "/logout", "/compact",
-        ];
+        let expected = ["/help", "/clear", "/model", "/status", "/exit", "/compact"];
         let metadata = command_metadata();
         let names = metadata
             .iter()

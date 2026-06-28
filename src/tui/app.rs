@@ -622,18 +622,12 @@ impl AppState {
                 .transcript
                 .push(TranscriptBlock::Status(self.status_snapshot())),
             Command::Exit => self.should_exit = true,
-            Command::Login => self.transcript.push(TranscriptBlock::Notice(
-                "凭据占位:请通过 config / 环境变量配置 API key。".to_string(),
-            )),
-            Command::Logout => self.transcript.push(TranscriptBlock::Notice(
-                "凭据占位:当前版本未保存登录态,无需 logout。".to_string(),
-            )),
             Command::Unknown(name) => self
                 .transcript
                 .push(TranscriptBlock::Notice(format!("未知命令: /{name}"))),
             Command::Model(None) => {
                 self.transcript.push(TranscriptBlock::Notice(format!(
-                    "当前 model: {}",
+                    "当前 model: {} — 输入 /model <name> 切换",
                     self.session.model
                 )));
             }
@@ -933,11 +927,11 @@ mod tests {
 
         assert!(matches!(
             &state.transcript[0],
-            TranscriptBlock::Notice(text) if text.contains("凭据")
+            TranscriptBlock::Notice(text) if text.contains("未知命令") && text.contains("login")
         ));
         assert!(matches!(
             &state.transcript[1],
-            TranscriptBlock::Notice(text) if text.contains("凭据")
+            TranscriptBlock::Notice(text) if text.contains("未知命令") && text.contains("logout")
         ));
         assert!(matches!(
             &state.transcript[2],
@@ -1368,7 +1362,7 @@ mod tests {
         state.on_key(key(KeyCode::Char('/')), &tx);
         assert_eq!(
             completion_names(&state),
-            vec!["/help", "/clear", "/model", "/status", "/exit", "/login", "/logout", "/compact"]
+            vec!["/help", "/clear", "/model", "/status", "/exit", "/compact"]
         );
         assert_eq!(selected_completion_name(&state), "/help");
 

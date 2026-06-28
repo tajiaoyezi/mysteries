@@ -371,7 +371,6 @@ fn help_block_lines(theme: &Theme, width: usize) -> Vec<Line<'static>> {
         ("/model <name>", "切换后续请求 model"),
         ("/status", "当前会话快照"),
         ("/exit", "退出 TUI"),
-        ("/login /logout", "凭据占位"),
     ];
     let border_style = Style::default().fg(theme.border_subtle).bg(theme.bg_base);
     let title_style = Style::default()
@@ -1395,7 +1394,7 @@ mod tests {
         state.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), &tx);
         let text = render_to_styled(&state, &Theme::midnight());
 
-        for command in ["/help", "/logout", "/compact"] {
+        for command in ["/help", "/compact"] {
             assert!(
                 text.contains(command),
                 "completion popup should list {command}"
