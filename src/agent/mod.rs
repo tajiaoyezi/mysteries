@@ -1,4 +1,7 @@
+pub mod context;
 pub mod message;
+
+pub use context::{ContextError, ContextStrategy, Passthrough};
 
 use crate::agent::message::Message;
 use crate::error::{AgentError, ProviderError};
@@ -65,6 +68,7 @@ pub struct Agent {
     decider: Box<dyn PermissionDecider>,
     model: String,
     max_iterations: u32,
+    strategy: Box<dyn ContextStrategy>,
 }
 
 impl Agent {
@@ -81,11 +85,16 @@ impl Agent {
             decider,
             model,
             max_iterations,
+            strategy: Box::new(Passthrough),
         }
     }
 
     pub fn set_model(&mut self, model: String) {
         self.model = model;
+    }
+
+    pub fn set_strategy(&mut self, strategy: Box<dyn ContextStrategy>) {
+        self.strategy = strategy;
     }
 
     pub async fn run(
@@ -106,12 +115,13 @@ impl Agent {
     ) -> Result<String, AgentError> {
         for _ in 0..self.max_iterations {
             observer.on_status(AgentStatus::CallingModel);
+            let msgs = self.strategy.prepare(history).await?;
             let response = self
                 .provider
                 .complete(
                     ModelRequest {
                         model: self.model.clone(),
-                        messages: history.clone(),
+                        messages: msgs,
                         tools: self.registry.schemas(),
                         max_tokens: None,
                     },
@@ -183,12 +193,13 @@ impl Agent {
             }
         }
 
+        let msgs = self.strategy.prepare(history).await?;
         let response = self
             .provider
             .complete(
                 ModelRequest {
                     model: self.model.clone(),
-                    messages: history.clone(),
+                    messages: msgs,
                     tools: Vec::new(),
                     max_tokens: None,
                 },
@@ -210,6 +221,12 @@ impl Agent {
         }
 
         Ok(text)
+    }
+}
+
+impl From<ContextError> for AgentError {
+    fn from(err: ContextError) -> Self {
+        AgentError::Provider(ProviderError::Transport(err.to_string()))
     }
 }
 
