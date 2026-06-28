@@ -9,7 +9,7 @@ expression: text
 ‹border.subtle›│ ‹/›‹text.body›pub struct Config {‹/›
 ‹border.subtle›│ ‹/›‹text.body›    pub timeout_secs: u64,‹/›
 ‹border.subtle›│ ‹/›‹text.body›}‹/›
-‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
+‹border.subtle›└───────────────────────────────────────────────────────────────────────────────‹/›
 
 
 

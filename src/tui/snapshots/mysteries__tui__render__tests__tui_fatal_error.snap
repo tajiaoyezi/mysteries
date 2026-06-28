@@ -7,9 +7,9 @@ expression: text
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 ‹accent.primary›> ‹/›‹text.primary›换 anthropic provider 再跑一次‹/›
 
-‹error.border bg=error.bg›┌─ ‹/›‹error.fg bg=error.bg +bold›致命错误‹/›‹error.border bg=error.bg› ───────────────────────────────────────────────────────────────‹/›
+‹error.border bg=error.bg›┌─ ‹/›‹error.fg bg=error.bg +bold›致命错误‹/›‹error.border bg=error.bg› ────────────────────────────────────────────────────────────────────‹/›
 ‹error.border bg=error.bg›│ ‹/›‹error.fg bg=error.bg›鉴权失败:未找到 OPENAI_API_KEY。Agent Loop 已终止。‹/›
-‹error.border bg=error.bg›└──────────────────────────────────────────────────────────────────────────────‹/›
+‹error.border bg=error.bg›└───────────────────────────────────────────────────────────────────────────────‹/›
 
 
 

@@ -6,7 +6,7 @@ use crate::tui::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 const STATUS_TOP_GAP_LINES: u16 = 2;
@@ -93,8 +93,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
     let lines = visible_transcript_lines(state, theme, area.width as usize, area.height as usize);
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::NONE))
-        .style(Style::default().fg(theme.text_primary).bg(theme.bg_base))
-        .wrap(Wrap { trim: false });
+        .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
     frame.render_widget(paragraph, area);
 }
 
@@ -244,19 +243,19 @@ fn transcript_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'
                 ));
             }
             TranscriptBlock::Error(text) => {
-                lines.extend(error_block_lines(text, theme));
+                lines.extend(error_block_lines(text, theme, width));
             }
             TranscriptBlock::Help => {
-                lines.extend(help_block_lines(theme));
+                lines.extend(help_block_lines(theme, width));
             }
             TranscriptBlock::Status(snapshot) => {
-                lines.extend(status_block_lines(snapshot, theme));
+                lines.extend(status_block_lines(snapshot, theme, width));
             }
             TranscriptBlock::Notice(text) => {
-                lines.extend(notice_block_lines(text, theme));
+                lines.extend(notice_block_lines(text, theme, width));
             }
             TranscriptBlock::Tool(card) => {
-                lines.extend(tool_card_lines(card, state, theme));
+                lines.extend(tool_card_lines(card, state, theme, width));
             }
         }
         lines.push(Line::from(""));
@@ -329,7 +328,29 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     lines
 }
 
-fn help_block_lines(theme: &Theme) -> Vec<Line<'static>> {
+fn block_top_border(
+    title: &str,
+    width: usize,
+    title_style: Style,
+    border_style: Style,
+) -> Line<'static> {
+    let before_dashes_width = display_width(&format!("┌─ {title}"));
+    let dash_count = width.saturating_sub(before_dashes_width + 1);
+    Line::from(vec![
+        Span::styled("┌─ ", border_style),
+        Span::styled(title.to_string(), title_style),
+        Span::styled(format!(" {}", "─".repeat(dash_count)), border_style),
+    ])
+}
+
+fn block_bottom_border(width: usize, style: Style) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("└{}", "─".repeat(width.saturating_sub(1))),
+        style,
+    ))
+}
+
+fn help_block_lines(theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let commands = [
         ("/help", "查看内置命令"),
         ("/clear", "清空当前 transcript"),
@@ -339,23 +360,12 @@ fn help_block_lines(theme: &Theme) -> Vec<Line<'static>> {
         ("/exit", "退出 TUI"),
         ("/login /logout", "凭据占位"),
     ];
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "┌─ ",
-            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
-        ),
-        Span::styled(
-            "帮助",
-            Style::default()
-                .fg(theme.info_fg)
-                .bg(theme.bg_base)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " ───────────────────────────────────────────────────────────────",
-            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
-        ),
-    ])];
+    let border_style = Style::default().fg(theme.border_subtle).bg(theme.bg_base);
+    let title_style = Style::default()
+        .fg(theme.info_fg)
+        .bg(theme.bg_base)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = vec![block_top_border("帮助", width, title_style, border_style)];
 
     for row in commands.chunks(2) {
         let mut spans = vec![Span::styled(
@@ -384,32 +394,22 @@ fn help_block_lines(theme: &Theme) -> Vec<Line<'static>> {
         lines.push(Line::from(spans));
     }
 
-    lines.push(Line::from(Span::styled(
-        "└──────────────────────────────────────────────────────────────────────────────",
-        Style::default().fg(theme.border_subtle).bg(theme.bg_base),
-    )));
+    lines.push(block_bottom_border(width, border_style));
     lines
 }
 
-fn status_block_lines(snapshot: &StatusSnapshot, theme: &Theme) -> Vec<Line<'static>> {
+fn status_block_lines(
+    snapshot: &StatusSnapshot,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let border_style = Style::default().fg(theme.border_subtle).bg(theme.bg_base);
+    let title_style = Style::default()
+        .fg(theme.info_fg)
+        .bg(theme.bg_base)
+        .add_modifier(Modifier::BOLD);
     vec![
-        Line::from(vec![
-            Span::styled(
-                "┌─ ",
-                Style::default().fg(theme.border_subtle).bg(theme.bg_base),
-            ),
-            Span::styled(
-                "会话快照",
-                Style::default()
-                    .fg(theme.info_fg)
-                    .bg(theme.bg_base)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " ───────────────────────────────────────────────────────────",
-                Style::default().fg(theme.border_subtle).bg(theme.bg_base),
-            ),
-        ]),
+        block_top_border("会话快照", width, title_style, border_style),
         status_field_line(
             "provider",
             &snapshot.provider,
@@ -431,10 +431,7 @@ fn status_block_lines(snapshot: &StatusSnapshot, theme: &Theme) -> Vec<Line<'sta
             &snapshot.tools.to_string(),
             theme,
         ),
-        Line::from(Span::styled(
-            "└──────────────────────────────────────────────────────────────────────────────",
-            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
-        )),
+        block_bottom_border(width, border_style),
     ]
 }
 
@@ -469,53 +466,76 @@ fn status_field_line(
     ])
 }
 
-fn notice_block_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
-    vec![Line::from(vec![
-        Span::styled("◇ ", Style::default().fg(theme.info_fg).bg(theme.bg_base)),
-        Span::styled(
-            text.to_string(),
-            Style::default().fg(theme.text_body).bg(theme.bg_base),
-        ),
-    ])]
+fn notice_block_lines(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let marker = "◇ ";
+    let marker_style = Style::default().fg(theme.info_fg).bg(theme.bg_base);
+    let text_style = Style::default().fg(theme.text_body).bg(theme.bg_base);
+    let content_width = width.saturating_sub(display_width(marker)).max(1);
+    let wrapped = wrap_text(text, content_width);
+    let wrapped = if wrapped.is_empty() {
+        vec![String::new()]
+    } else {
+        wrapped
+    };
+
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            if index == 0 {
+                Line::from(vec![
+                    Span::styled(marker, marker_style),
+                    Span::styled(chunk, text_style),
+                ])
+            } else {
+                let indent = " ".repeat(display_width(marker));
+                Line::from(vec![
+                    Span::styled(indent, text_style),
+                    Span::styled(chunk, text_style),
+                ])
+            }
+        })
+        .collect()
 }
 
-fn error_block_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled(
-                "┌─ ",
-                Style::default().fg(theme.error_border).bg(theme.error_bg),
-            ),
-            Span::styled(
-                "致命错误",
-                Style::default()
-                    .fg(theme.error_fg)
-                    .bg(theme.error_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " ───────────────────────────────────────────────────────────────",
-                Style::default().fg(theme.error_border).bg(theme.error_bg),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "│ ",
-                Style::default().fg(theme.error_border).bg(theme.error_bg),
-            ),
-            Span::styled(
-                text.to_string(),
-                Style::default().fg(theme.error_fg).bg(theme.error_bg),
-            ),
-        ]),
-        Line::from(Span::styled(
-            "└──────────────────────────────────────────────────────────────────────────────",
-            Style::default().fg(theme.error_border).bg(theme.error_bg),
-        )),
-    ]
+fn error_block_lines(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let border_style = Style::default().fg(theme.error_border).bg(theme.error_bg);
+    let title_style = Style::default()
+        .fg(theme.error_fg)
+        .bg(theme.error_bg)
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(theme.error_fg).bg(theme.error_bg);
+    let body_prefix = "│ ";
+    let content_width = width.saturating_sub(display_width(body_prefix)).max(1);
+    let wrapped = wrap_text(text, content_width);
+    let wrapped = if wrapped.is_empty() {
+        vec![String::new()]
+    } else {
+        wrapped
+    };
+
+    let mut lines = vec![block_top_border(
+        "致命错误",
+        width,
+        title_style,
+        border_style,
+    )];
+    for chunk in wrapped {
+        lines.push(Line::from(vec![
+            Span::styled(body_prefix, border_style),
+            Span::styled(chunk, body_style),
+        ]));
+    }
+    lines.push(block_bottom_border(width, border_style));
+    lines
 }
 
-fn tool_card_lines(card: &ToolCard, state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+fn tool_card_lines(
+    card: &ToolCard,
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
     let args = if state.tools_expanded {
         card.args.to_string()
     } else {
@@ -523,7 +543,7 @@ fn tool_card_lines(card: &ToolCard, state: &AppState, theme: &Theme) -> Vec<Line
     };
     let mut head = tool_card_head(card, state, theme, args);
     if !state.tools_expanded {
-        head.extend(collapsed_tool_summary(card, theme));
+        head.extend(collapsed_tool_summary(card, theme, width));
         return vec![Line::from(head)];
     }
 
@@ -532,8 +552,8 @@ fn tool_card_lines(card: &ToolCard, state: &AppState, theme: &Theme) -> Vec<Line
     match &card.output {
         Some(output) if output.is_empty() => lines.push(tool_output_line("", theme)),
         Some(output) => {
-            for line in visible_tool_output_lines(card, output) {
-                lines.push(tool_output_line(line, theme));
+            for line in visible_tool_output_lines(card, output, width) {
+                lines.push(tool_output_line(&line, theme));
             }
         }
         None => lines.push(tool_output_line("运行中…", theme)),
@@ -570,10 +590,10 @@ fn tool_card_lines(card: &ToolCard, state: &AppState, theme: &Theme) -> Vec<Line
         ]));
     }
 
-    lines.push(Line::from(Span::styled(
-        "└──────────────────────────────────────────────────────────────────────────────",
+    lines.push(block_bottom_border(
+        width,
         Style::default().fg(theme.border_subtle).bg(theme.bg_base),
-    )));
+    ));
     lines
 }
 
@@ -616,7 +636,7 @@ fn tool_card_head(
     head
 }
 
-fn collapsed_tool_summary(card: &ToolCard, theme: &Theme) -> Vec<Span<'static>> {
+fn collapsed_tool_summary(card: &ToolCard, theme: &Theme, width: usize) -> Vec<Span<'static>> {
     if matches!(card.status, ToolCardStatus::Running) {
         return vec![Span::styled(
             " · 运行中…",
@@ -638,7 +658,7 @@ fn collapsed_tool_summary(card: &ToolCard, theme: &Theme) -> Vec<Span<'static>> 
 
     match &card.output {
         Some(output) if !output.is_empty() => {
-            let line_count = visible_tool_output_lines(card, output).len();
+            let line_count = visible_tool_output_lines(card, output, width).len();
             vec![Span::styled(
                 format!(" · {line_count} 行 ⌄"),
                 Style::default().fg(theme.text_secondary).bg(theme.bg_base),
@@ -692,7 +712,8 @@ fn tool_output_line(text: &str, theme: &Theme) -> Line<'static> {
     ])
 }
 
-fn visible_tool_output_lines<'a>(card: &ToolCard, output: &'a str) -> Vec<&'a str> {
+fn visible_tool_output_lines(card: &ToolCard, output: &str, width: usize) -> Vec<String> {
+    let content_width = width.saturating_sub(display_width("│ ")).max(1);
     let mut lines = output.lines().collect::<Vec<_>>();
     if let Some(exit) = card.exit {
         let expected_exit = format!("exit: {exit}");
@@ -700,7 +721,17 @@ fn visible_tool_output_lines<'a>(card: &ToolCard, output: &'a str) -> Vec<&'a st
             lines.remove(0);
         }
     }
-    lines
+
+    let mut wrapped = Vec::new();
+    for line in lines {
+        let chunks = wrap_text(line, content_width);
+        if chunks.is_empty() {
+            wrapped.push(String::new());
+        } else {
+            wrapped.extend(chunks);
+        }
+    }
+    wrapped
 }
 
 fn render_permission(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
@@ -1477,6 +1508,126 @@ mod tests {
             "鉴权失败:未找到 OPENAI_API_KEY。Agent Loop 已终止。".to_string(),
         ));
         state
+    }
+
+    #[test]
+    fn follows_bottom_shows_latest_content_despite_wide_error_border() {
+        const NEEDLE: &str = "NEEDLE_LAST_LINE";
+        const WIDTH: u16 = 40;
+        const HEIGHT: u16 = 24;
+
+        let mut state = AppState::new();
+        for index in 0..12 {
+            state.transcript.push(TranscriptBlock::User(format!(
+                "filler {index:02}: 压栈使预换行后总逻辑行数超过 transcript 视口高度"
+            )));
+        }
+        state.transcript.push(TranscriptBlock::Error(
+            "鉴权失败:未找到 API_KEY。Agent Loop 已终止。".to_string(),
+        ));
+        state
+            .transcript
+            .push(TranscriptBlock::Assistant(NEEDLE.to_string()));
+
+        let theme = Theme::midnight();
+        let area = ratatui::layout::Rect::new(0, 0, WIDTH, HEIGHT);
+        let viewport_lines = super::transcript_viewport_height(area, &state);
+        let total_lines = transcript_line_count(&state, &theme, WIDTH as usize);
+        assert!(
+            total_lines > viewport_lines,
+            "复现前提:总逻辑行({total_lines})应大于视口高度({viewport_lines})"
+        );
+
+        let text = render_to_plain_with_size(&state, &theme, WIDTH, HEIGHT);
+        assert!(
+            text.contains(NEEDLE),
+            "follows_bottom 时最新内容应在视口内可见,但渲染输出未包含针标串 {NEEDLE:?}\n--- rendered ---\n{text}\n--- end ---"
+        );
+    }
+
+    fn line_plain(line: &ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn assert_transcript_lines_fit_width(lines: &[ratatui::text::Line<'_>], width: usize) {
+        for line in lines {
+            let plain = line_plain(line);
+            if plain.is_empty() {
+                continue;
+            }
+            assert!(
+                super::display_width(&plain) <= width,
+                "逻辑行宽度 {} 超过视口宽度 {width}: {plain:?}",
+                super::display_width(&plain)
+            );
+        }
+    }
+
+    #[test]
+    fn error_border_adapts_to_width_and_occupies_one_screen_line() {
+        const WIDTH: usize = 40;
+        let mut state = AppState::new();
+        state.transcript.push(TranscriptBlock::Error(
+            "鉴权失败:未找到 API_KEY。".to_string(),
+        ));
+        let theme = Theme::midnight();
+        let lines = super::transcript_content_lines(&state, &theme, WIDTH);
+
+        let border_lines: Vec<_> = lines
+            .iter()
+            .map(line_plain)
+            .filter(|plain| plain.starts_with('┌') || plain.starts_with('└'))
+            .collect();
+        assert_eq!(border_lines.len(), 2, "Error 块应有顶/底各一条边框行");
+        for border in border_lines {
+            assert_eq!(
+                super::display_width(&border),
+                WIDTH,
+                "边框行应铺满视口宽度: {border:?}"
+            );
+        }
+        assert_transcript_lines_fit_width(&lines, WIDTH);
+    }
+
+    #[test]
+    fn expanded_tool_output_wraps_long_lines_before_viewport_slice() {
+        const WIDTH: usize = 40;
+        let long_line = "W".repeat(100);
+        let mut state = AppState::new();
+        state.tools_expanded = true;
+        state.transcript.push(TranscriptBlock::Tool(ToolCard {
+            id: "read-file-1".to_string(),
+            name: "read_file".to_string(),
+            args: json!({ "path": "note.txt" }),
+            readonly: true,
+            status: ToolCardStatus::Done,
+            output: Some(format!("{long_line}\nsecond line")),
+            truncated: false,
+            exit: None,
+        }));
+        let theme = Theme::midnight();
+        let lines = super::transcript_content_lines(&state, &theme, WIDTH);
+
+        let output_lines: Vec<_> = lines
+            .iter()
+            .map(line_plain)
+            .filter(|plain| plain.starts_with('│') && !plain.contains("exit "))
+            .collect();
+        assert!(
+            output_lines.len() >= 3,
+            "100 字符长行在 width={WIDTH} 下应预换行为多行,实际: {output_lines:?}"
+        );
+        assert!(output_lines.iter().any(|line| line.contains("second line")));
+        for line in &output_lines {
+            assert!(
+                super::display_width(line) <= WIDTH,
+                "工具输出行宽度 {} 超过视口: {line:?}",
+                super::display_width(line)
+            );
+        }
     }
 
     #[test]

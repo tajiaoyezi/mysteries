@@ -7,11 +7,11 @@ expression: text
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 ‹accent.primary›> ‹/›‹text.primary›给我看一下当前会话状态‹/›
 
-‹border.subtle›┌─ ‹/›‹info.fg +bold›会话快照‹/›‹border.subtle› ───────────────────────────────────────────────────────────‹/›
+‹border.subtle›┌─ ‹/›‹info.fg +bold›会话快照‹/›‹border.subtle› ────────────────────────────────────────────────────────────────────‹/›
 ‹border.subtle›│ ‹/›‹text.secondary›provider: ‹/›‹text.primary›anthropic               ‹/›‹text.secondary›model: ‹/›‹text.primary›claude-test‹/›
 ‹border.subtle›│ ‹/›‹text.secondary›iter: ‹/›‹text.primary›2/8                     ‹/›‹text.secondary›msgs: ‹/›‹text.primary›1‹/›
 ‹border.subtle›│ ‹/›‹text.secondary›cwd: ‹/›‹text.primary›workspace               ‹/›‹text.secondary›tools: ‹/›‹text.primary›7‹/›
-‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
+‹border.subtle›└───────────────────────────────────────────────────────────────────────────────‹/›
 
 
 
