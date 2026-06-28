@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use thiserror::Error;
 
-pub const DEFAULT_MAX_ITERATIONS: u32 = 8;
+pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,10 +114,7 @@ pub fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        merge, parse, resolve, AuthType, ConfigError, ProviderKind, DEFAULT_MAX_ITERATIONS,
-        DEFAULT_TIMEOUT_SECS,
-    };
+    use super::{merge, parse, resolve, AuthType, ConfigError, ProviderKind, DEFAULT_TIMEOUT_SECS};
 
     #[test]
     fn parse_partial_toml_sets_some_and_missing_fields_to_none() {
@@ -229,7 +226,7 @@ auth_type = "api_key"
         assert_eq!(config.model, "gpt-4o-mini");
         assert_eq!(config.provider.kind, ProviderKind::OpenAi);
         assert_eq!(config.provider.auth_type, AuthType::ApiKey);
-        assert_eq!(config.max_iterations, DEFAULT_MAX_ITERATIONS);
+        assert_eq!(config.max_iterations, 50);
         assert_eq!(config.timeout_secs, 45);
     }
 

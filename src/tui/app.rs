@@ -2,7 +2,7 @@ use crate::agent::AgentStatus;
 use crate::permission::PermissionDecision;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
 use crate::tui::command::{parse_command, Command};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use serde_json::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -19,10 +19,17 @@ pub enum Phase {
     WaitingForPermission,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl Phase {
+    pub fn is_running(&self) -> bool {
+        !matches!(self, Phase::Ready)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum TranscriptBlock {
     User(String),
     Assistant(String),
+    Tool(ToolCard),
     Error(String),
     Help,
     Status(StatusSnapshot),
@@ -123,7 +130,6 @@ pub struct AppState {
     pub session: SessionSnapshot,
     pub iteration: u32,
     pub transcript: Vec<TranscriptBlock>,
-    pub tool_cards: Vec<ToolCard>,
     pub input: String,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
@@ -143,7 +149,6 @@ impl AppState {
             session,
             iteration: 0,
             transcript: Vec::new(),
-            tool_cards: Vec::new(),
             input: String::new(),
             phase: Phase::Ready,
             pending_permission: None,
@@ -203,6 +208,22 @@ impl AppState {
         self.follows_bottom = next == bottom;
     }
 
+    pub fn scroll_up(&mut self, total_lines: usize, viewport_lines: usize, lines: usize) {
+        let current = self.visible_scroll_offset(total_lines, viewport_lines);
+        self.scroll_offset = current.saturating_sub(lines);
+        self.follows_bottom = false;
+    }
+
+    pub fn scroll_down(&mut self, total_lines: usize, viewport_lines: usize, lines: usize) {
+        let bottom = bottom_offset(total_lines, viewport_lines);
+        let next = self
+            .visible_scroll_offset(total_lines, viewport_lines)
+            .saturating_add(lines)
+            .min(bottom);
+        self.scroll_offset = next;
+        self.follows_bottom = next == bottom;
+    }
+
     pub fn advance_spinner(&mut self) {
         self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
     }
@@ -228,7 +249,7 @@ impl AppState {
                 args,
                 readonly,
             } => {
-                self.tool_cards.push(ToolCard {
+                self.transcript.push(TranscriptBlock::Tool(ToolCard {
                     id,
                     name,
                     args,
@@ -237,7 +258,7 @@ impl AppState {
                     output: None,
                     truncated: false,
                     exit: None,
-                });
+                }));
             }
             AgentEvent::ToolCallFinished { id, outcome } => {
                 let status = if outcome.is_error {
@@ -245,27 +266,15 @@ impl AppState {
                 } else {
                     ToolCardStatus::Done
                 };
-                let card = self.tool_cards.iter_mut().find(|card| card.id == id);
 
-                match card {
-                    Some(card) => {
-                        card.status = status;
-                        card.output = Some(outcome.content);
-                        card.truncated = outcome.truncated;
-                        card.exit = outcome.exit;
-                    }
-                    None => {
-                        self.tool_cards.push(ToolCard {
-                            id: id.clone(),
-                            name: id,
-                            args: Value::Null,
-                            readonly: false,
-                            status,
-                            output: Some(outcome.content),
-                            truncated: outcome.truncated,
-                            exit: outcome.exit,
-                        });
-                    }
+                if let Some(card) = self.transcript.iter_mut().find_map(|block| match block {
+                    TranscriptBlock::Tool(card) if card.id == id => Some(card),
+                    _ => None,
+                }) {
+                    card.status = status;
+                    card.output = Some(outcome.content);
+                    card.truncated = outcome.truncated;
+                    card.exit = outcome.exit;
                 }
             }
             AgentEvent::StatusChanged(status) => {
@@ -288,6 +297,13 @@ impl AppState {
                 self.iteration = 0;
                 self.phase = Phase::Ready;
             }
+            AgentEvent::Interrupted => {
+                self.pending_permission = None;
+                self.iteration = 0;
+                self.phase = Phase::Ready;
+                self.transcript
+                    .push(TranscriptBlock::Notice("⊘ 已中断本轮".to_string()));
+            }
             AgentEvent::Error(message) => {
                 self.pending_permission = None;
                 self.iteration = 0;
@@ -298,6 +314,28 @@ impl AppState {
     }
 
     pub fn on_key(&mut self, key: KeyEvent, input_tx: &mpsc::UnboundedSender<UserInput>) {
+        self.on_key_inner(key, input_tx, None);
+    }
+
+    pub fn on_key_with_interrupt(
+        &mut self,
+        key: KeyEvent,
+        input_tx: &mpsc::UnboundedSender<UserInput>,
+        interrupt_tx: &mpsc::UnboundedSender<UserInput>,
+    ) {
+        self.on_key_inner(key, input_tx, Some(interrupt_tx));
+    }
+
+    fn on_key_inner(
+        &mut self,
+        key: KeyEvent,
+        input_tx: &mpsc::UnboundedSender<UserInput>,
+        interrupt_tx: Option<&mpsc::UnboundedSender<UserInput>>,
+    ) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
         if self.pending_permission.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -307,6 +345,13 @@ impl AppState {
                     self.answer_pending_permission(PermissionDecision::Deny);
                 }
                 _ => {}
+            }
+            return;
+        }
+
+        if key.code == KeyCode::Esc && self.phase.is_running() {
+            if let Some(tx) = interrupt_tx {
+                let _ = tx.send(UserInput::Interrupt);
             }
             return;
         }
@@ -405,13 +450,17 @@ mod tests {
     use crate::permission::PermissionDecision;
     use crate::tool::ToolOutcome;
     use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use serde_json::json;
     use std::path::PathBuf;
     use tokio::sync::{mpsc, oneshot};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn key_with_kind(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
     }
 
     fn diff_line(kind: DiffKind, text: &str) -> DiffLine {
@@ -490,6 +539,22 @@ mod tests {
         }
         assert_eq!(state.visible_scroll_offset(30, 5), 25);
         assert_eq!(state.visible_scroll_offset(40, 5), 35);
+    }
+
+    #[test]
+    fn line_scroll_moves_in_small_steps_and_refollows_at_bottom() {
+        let mut state = AppState::new();
+
+        state.scroll_up(30, 5, 3);
+        assert_eq!(state.visible_scroll_offset(30, 5), 22);
+        assert_eq!(state.visible_scroll_offset(40, 5), 22);
+
+        state.scroll_down(40, 5, 2);
+        assert_eq!(state.visible_scroll_offset(40, 5), 24);
+
+        state.scroll_down(40, 5, 20);
+        assert_eq!(state.visible_scroll_offset(40, 5), 35);
+        assert_eq!(state.visible_scroll_offset(50, 5), 45);
     }
 
     #[test]
@@ -601,6 +666,16 @@ mod tests {
         state
             .transcript
             .push(TranscriptBlock::User("u1".to_string()));
+        state.transcript.push(TranscriptBlock::Tool(ToolCard {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            args: json!({ "path": "note.txt" }),
+            readonly: true,
+            status: ToolCardStatus::Done,
+            output: Some("tool output".to_string()),
+            truncated: false,
+            exit: None,
+        }));
         state.transcript.push(TranscriptBlock::Help);
         state
             .transcript
@@ -638,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_tool_call_started_adds_running_tool_card() {
+    fn apply_tool_call_started_adds_running_tool_block() {
         let mut state = AppState::new();
 
         state.apply(AgentEvent::ToolCallStarted {
@@ -649,8 +724,8 @@ mod tests {
         });
 
         assert_eq!(
-            state.tool_cards,
-            vec![ToolCard {
+            state.transcript,
+            vec![TranscriptBlock::Tool(ToolCard {
                 id: "call-1".to_string(),
                 name: "read_file".to_string(),
                 args: json!({ "path": "note.txt" }),
@@ -659,12 +734,52 @@ mod tests {
                 output: None,
                 truncated: false,
                 exit: None,
-            }]
+            })]
         );
     }
 
     #[test]
-    fn apply_tool_call_finished_updates_card_to_done_or_error() {
+    fn tool_events_are_inserted_into_transcript_timeline() {
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(TranscriptBlock::User("inspect config".to_string()));
+
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            args: json!({ "path": "src/config.rs" }),
+            readonly: true,
+        });
+
+        assert_eq!(state.transcript.len(), 2);
+        assert!(matches!(
+            &state.transcript[1],
+            TranscriptBlock::Tool(card)
+                if card.id == "call-1" && card.status == ToolCardStatus::Running
+        ));
+
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "call-1".to_string(),
+            outcome: ToolOutcome {
+                content: "config contents".to_string(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            },
+        });
+
+        assert_eq!(state.transcript.len(), 2);
+        assert!(matches!(
+            &state.transcript[1],
+            TranscriptBlock::Tool(card)
+                if card.status == ToolCardStatus::Done
+                    && card.output.as_deref() == Some("config contents")
+        ));
+    }
+
+    #[test]
+    fn apply_tool_call_finished_updates_tool_block_to_done_or_error() {
         let mut state = AppState::new();
         state.apply(AgentEvent::ToolCallStarted {
             id: "call-1".to_string(),
@@ -682,11 +797,11 @@ mod tests {
             },
         });
 
-        assert_eq!(state.tool_cards[0].status, ToolCardStatus::Done);
-        assert_eq!(
-            state.tool_cards[0].output.as_deref(),
-            Some("wrote note.txt")
-        );
+        let TranscriptBlock::Tool(card) = &state.transcript[0] else {
+            panic!("expected tool block");
+        };
+        assert_eq!(card.status, ToolCardStatus::Done);
+        assert_eq!(card.output.as_deref(), Some("wrote note.txt"));
 
         state.apply(AgentEvent::ToolCallStarted {
             id: "call-2".to_string(),
@@ -704,12 +819,38 @@ mod tests {
             },
         });
 
-        assert_eq!(state.tool_cards[1].status, ToolCardStatus::Error);
+        let TranscriptBlock::Tool(card) = &state.transcript[1] else {
+            panic!("expected tool block");
+        };
+        assert_eq!(card.status, ToolCardStatus::Error);
         assert_eq!(
-            state.tool_cards[1].output.as_deref(),
+            card.output.as_deref(),
             Some("command failed: permission denied")
         );
-        assert!(state.tool_cards[1].truncated);
+        assert!(card.truncated);
+    }
+
+    #[test]
+    fn apply_tool_call_finished_without_matching_started_tool_is_ignored() {
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(TranscriptBlock::User("keep me".to_string()));
+
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "missing".to_string(),
+            outcome: ToolOutcome {
+                content: "ignored".to_string(),
+                is_error: false,
+                truncated: false,
+                exit: Some(0),
+            },
+        });
+
+        assert_eq!(
+            state.transcript,
+            vec![TranscriptBlock::User("keep me".to_string())]
+        );
     }
 
     #[test]
@@ -772,6 +913,48 @@ mod tests {
         );
         assert_eq!(state.phase, Phase::Busy);
         assert_eq!(rx.try_recv().unwrap(), UserInput::Prompt("h!".to_string()));
+    }
+
+    #[test]
+    fn on_key_ignores_non_press_events_to_avoid_duplicate_input() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.on_key(key_with_kind(KeyCode::Char('a'), KeyEventKind::Press), &tx);
+        state.on_key(
+            key_with_kind(KeyCode::Char('a'), KeyEventKind::Release),
+            &tx,
+        );
+        state.on_key(key_with_kind(KeyCode::Char('a'), KeyEventKind::Repeat), &tx);
+
+        assert_eq!(state.input, "a");
+    }
+
+    #[test]
+    fn on_key_escape_interrupts_running_turn_on_dedicated_channel_only_for_press() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.phase = Phase::CallingModel;
+
+        state.on_key_with_interrupt(key(KeyCode::Esc), &input_tx, &interrupt_tx);
+
+        assert_eq!(interrupt_rx.try_recv().unwrap(), UserInput::Interrupt);
+        assert!(input_rx.try_recv().is_err());
+        assert_eq!(state.phase, Phase::CallingModel);
+
+        state.on_key_with_interrupt(
+            key_with_kind(KeyCode::Esc, KeyEventKind::Release),
+            &input_tx,
+            &interrupt_tx,
+        );
+        state.on_key_with_interrupt(
+            key_with_kind(KeyCode::Esc, KeyEventKind::Repeat),
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        assert!(interrupt_rx.try_recv().is_err());
     }
 
     #[test]

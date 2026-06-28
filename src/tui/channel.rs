@@ -22,6 +22,7 @@ pub enum AgentEvent {
     },
     StatusChanged(AgentStatus),
     PermissionRequired(PermissionRequest),
+    Interrupted,
     TurnComplete,
     Error(String),
 }
@@ -30,6 +31,7 @@ pub enum AgentEvent {
 pub enum UserInput {
     Prompt(String),
     SetModel(String),
+    Interrupt,
 }
 
 #[derive(Debug)]

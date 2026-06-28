@@ -6,7 +6,7 @@ use crate::permission::{gate, PermissionDecider, PermissionDecision};
 use crate::provider::{DeltaSink, ModelRequest, Provider};
 use crate::tool::{PermissionLevel, ToolContext, ToolOutcome, ToolRegistry};
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant. Do not claim to be Claude, ChatGPT, OpenAI, Anthropic, or any specific upstream model. If asked about your model identity, say you are running inside Mysteries and the configured model name is shown in the status line.";
 const DEFAULT_MODEL: &str = "mock-model";
 
 pub async fn run_single_turn(
@@ -183,15 +183,39 @@ impl Agent {
             }
         }
 
-        Err(AgentError::MaxIterations {
-            limit: self.max_iterations,
-        })
+        let response = self
+            .provider
+            .complete(
+                ModelRequest {
+                    model: self.model.clone(),
+                    messages: history.clone(),
+                    tools: Vec::new(),
+                    max_tokens: None,
+                },
+                sink,
+            )
+            .await?;
+        let text = response.text;
+        let tool_calls = response.tool_calls;
+
+        history.push(Message::Assistant {
+            text: text.clone(),
+            tool_calls,
+        });
+
+        if text.is_empty() {
+            return Err(AgentError::MaxIterations {
+                limit: self.max_iterations,
+            });
+        }
+
+        Ok(text)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{run_single_turn, Agent, AgentObserver, AgentStatus};
+    use super::{run_single_turn, Agent, AgentObserver, AgentStatus, DEFAULT_SYSTEM_PROMPT};
     use crate::agent::message::Message;
     use crate::error::{AgentError, ProviderError};
     use crate::permission::{PermissionDecider, PermissionDecision};
@@ -294,6 +318,15 @@ mod tests {
             tool_calls,
             finish_reason: FinishReason::ToolCalls,
         }
+    }
+
+    #[test]
+    fn default_system_prompt_constrains_model_identity_claims() {
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("Do not claim to be Claude"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("ChatGPT"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("OpenAI"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("Anthropic"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("configured model name is shown in the status line"));
     }
 
     struct NoopSink;
@@ -834,7 +867,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_loop_returns_max_iterations_when_limit_is_hit() {
+    async fn agent_loop_forces_final_text_with_tools_disabled_after_iteration_limit() {
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "echo".to_string(),
+                arguments: json!({ "input": "first" }),
+            }]),
+            tool_response(vec![ToolCall {
+                id: "call-2".to_string(),
+                name: "echo".to_string(),
+                arguments: json!({ "input": "second" }),
+            }]),
+            response("forced final"),
+        ]));
+        let agent = Agent::new(
+            Box::new(provider.clone()),
+            registry_with_echo(),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            2,
+        );
+        let sink = NoopSink;
+        let mut history = vec![Message::User("hello".to_string())];
+
+        let text = agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        assert_eq!(text, "forced final");
+        assert_eq!(
+            history.last(),
+            Some(&Message::Assistant {
+                text: "forced final".to_string(),
+                tool_calls: Vec::new(),
+            })
+        );
+
+        let recorded = provider.recorded_requests();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0].tools.len(), 1);
+        assert_eq!(recorded[1].tools.len(), 1);
+        assert!(recorded[2].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_loop_returns_max_iterations_when_forced_final_text_is_empty() {
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "echo".to_string(),
+                arguments: json!({ "input": "again" }),
+            }]),
+            response(""),
+        ]));
+        let agent = Agent::new(
+            Box::new(provider),
+            registry_with_echo(),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            1,
+        );
+        let sink = NoopSink;
+        let mut history = vec![Message::User("hello".to_string())];
+
+        let err = agent.run(&mut history, &ctx(), &sink).await.unwrap_err();
+
+        assert_eq!(err, AgentError::MaxIterations { limit: 1 });
+    }
+
+    #[tokio::test]
+    async fn agent_loop_returns_provider_error_when_forced_final_call_fails() {
         let provider = Arc::new(MockProvider::new(vec![tool_response(vec![ToolCall {
             id: "call-1".to_string(),
             name: "echo".to_string(),
@@ -852,7 +953,10 @@ mod tests {
 
         let err = agent.run(&mut history, &ctx(), &sink).await.unwrap_err();
 
-        assert_eq!(err, AgentError::MaxIterations { limit: 1 });
+        assert!(matches!(
+            err,
+            AgentError::Provider(ProviderError::Transport(_))
+        ));
     }
 
     #[tokio::test]

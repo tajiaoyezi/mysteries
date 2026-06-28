@@ -5,24 +5,24 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹accent.primary›> ‹/›‹text.primary›line 14‹/›
+‹accent.primary›> ‹/›‹text.primary›总结这个项目‹/›
 
-‹accent.primary›> ‹/›‹text.primary›line 15‹/›
+‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› {"path":"note.txt"}‹/›‹text.secondary›  只读 · 自动运行‹/›
+‹border.subtle›│ ‹/›‹text.body›# Mysteries‹/›
+‹border.subtle›│ ‹/›‹text.body›A terminal coding assistant.‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
 
-‹accent.primary›> ‹/›‹text.primary›line 16‹/›
-
-‹accent.primary›> ‹/›‹text.primary›line 17‹/›
-
-‹accent.primary›> ‹/›‹text.primary›line 18‹/›
-
-‹accent.primary›> ‹/›‹text.primary›line 19‹/›
-
-‹accent.primary›> ‹/›‹text.primary›line 20‹/›
-
-‹accent.primary›> ‹/›‹text.primary›line 21‹/›
+‹info.fg›◆ ‹/›‹text.body›这是一个 Rust 编写的终端编码助手。‹/›
 
 
-‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                        mock · mock-model · iter 0/4 · 30 msgs · .‹/›
+
+
+
+
+
+
+
+‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                         mock · mock-model · iter 0/4 · 2 msgs · .‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›

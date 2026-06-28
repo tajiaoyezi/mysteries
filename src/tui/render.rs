@@ -3,11 +3,13 @@ use crate::tui::app::{
     TranscriptBlock,
 };
 use crate::tui::theme::Theme;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+
+const STATUS_TOP_GAP_LINES: u16 = 2;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     let area = frame.area();
@@ -23,12 +25,12 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     if state.pending_permission.is_some() {
         render_permission(frame, rows[2], state, theme);
     }
-    render_status(frame, rows[3], state, theme);
-    render_input(frame, rows[4], state, theme);
+    render_status(frame, rows[4], state, theme);
+    render_input(frame, rows[5], state, theme);
 }
 
-pub(crate) fn transcript_line_count(state: &AppState, theme: &Theme) -> usize {
-    transcript_content_lines(state, theme).len()
+pub(crate) fn transcript_line_count(state: &AppState, theme: &Theme, width: usize) -> usize {
+    transcript_content_lines(state, theme, width).len()
 }
 
 pub(crate) fn transcript_viewport_height(area: Rect, state: &AppState) -> usize {
@@ -42,10 +44,19 @@ fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(permission_height(state)),
+            Constraint::Length(status_top_gap_height(state)),
             Constraint::Length(1),
             Constraint::Length(3),
         ])
         .split(area)
+}
+
+fn status_top_gap_height(state: &AppState) -> u16 {
+    if state.pending_permission.is_none() && !state.transcript.is_empty() {
+        STATUS_TOP_GAP_LINES
+    } else {
+        0
+    }
 }
 
 fn permission_height(state: &AppState) -> u16 {
@@ -79,7 +90,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
-    let lines = visible_transcript_lines(state, theme, area.height as usize);
+    let lines = visible_transcript_lines(state, theme, area.width as usize, area.height as usize);
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::NONE))
         .style(Style::default().fg(theme.text_primary).bg(theme.bg_base))
@@ -87,20 +98,27 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
     frame.render_widget(paragraph, area);
 }
 
-fn transcript_content_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
-    if state.transcript.is_empty() && state.tool_cards.is_empty() {
-        welcome_lines(theme)
+fn transcript_content_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    if state.transcript.is_empty() {
+        welcome_lines(theme, width)
     } else {
-        transcript_lines(state, theme)
+        transcript_lines(state, theme, width)
     }
 }
 
 fn visible_transcript_lines(
     state: &AppState,
     theme: &Theme,
+    width: usize,
     viewport_lines: usize,
 ) -> Vec<Line<'static>> {
-    let lines = transcript_content_lines(state, theme);
+    let mut lines = transcript_content_lines(state, theme, width);
+    if state.transcript.is_empty() && viewport_lines > lines.len() {
+        let top_padding = (viewport_lines - lines.len()) / 2;
+        let mut padded = vec![Line::from(""); top_padding];
+        padded.extend(lines);
+        lines = padded;
+    }
     let offset = state.visible_scroll_offset(lines.len(), viewport_lines);
     lines
         .into_iter()
@@ -109,71 +127,121 @@ fn visible_transcript_lines(
         .collect()
 }
 
-fn welcome_lines(theme: &Theme) -> Vec<Line<'static>> {
-    vec![
-        Line::from(Span::styled(
-            "✦ MYSTERIES",
-            Style::default()
-                .fg(theme.text_title)
-                .bg(theme.bg_base)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "AGENT · v1.0 · 终端编码助手",
-            Style::default().fg(theme.accent_primary).bg(theme.bg_base),
-        )),
-        Line::from(Span::styled(
-            "读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等你按下 y 才动手。",
-            Style::default().fg(theme.text_body).bg(theme.bg_base),
-        )),
-        Line::from(Span::styled(
-            "试试 ↓",
-            Style::default().fg(theme.text_muted).bg(theme.bg_base),
-        )),
-        suggestion_line("任务", "给 Config 加 timeout_secs 字段", theme),
-        suggestion_line("/help", "查看内置命令", theme),
-        suggestion_line("/status", "当前会话快照", theme),
-        suggestion_line("错误", "演示:鉴权失败(致命错误,终止 Loop)", theme),
-    ]
+const WELCOME_MAX_WIDTH: usize = 64;
+
+fn welcome_lines(theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let content_width = width.clamp(1, WELCOME_MAX_WIDTH);
+    let title_style = Style::default()
+        .fg(theme.text_title)
+        .bg(theme.bg_base)
+        .add_modifier(Modifier::BOLD);
+    let subtitle_style = Style::default().fg(theme.accent_primary).bg(theme.bg_base);
+    let body_style = Style::default().fg(theme.text_body).bg(theme.bg_base);
+    let muted_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+
+    let mut lines = vec![
+        centered_text_line("✦ MYSTERIES", title_style, width, theme),
+        centered_text_line("AGENT · v1.0 · 终端编码助手", subtitle_style, width, theme),
+    ];
+    for line in wrap_text(
+        "读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等你按下 y 才动手。",
+        content_width,
+    ) {
+        lines.push(centered_text_line(&line, body_style, width, theme));
+    }
+    lines.push(Line::from(""));
+    lines.push(centered_text_line("试试 ↓", muted_style, width, theme));
+
+    let suggestions = [
+        ("任务", "给 Config 加 timeout_secs 字段"),
+        ("/help", "查看内置命令"),
+        ("/status", "当前会话快照"),
+        ("错误", "演示:鉴权失败(致命错误,终止 Loop)"),
+    ];
+    let suggestion_width = suggestions
+        .iter()
+        .map(|(tag, text)| display_width(&format!("〔{tag}〕 {text}")))
+        .max()
+        .unwrap_or(0);
+    for (tag, text) in suggestions {
+        lines.push(suggestion_line(tag, text, theme, width, suggestion_width));
+    }
+
+    lines
 }
 
-fn suggestion_line(tag: &str, text: &str, theme: &Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("〔{tag}〕"),
-            Style::default().fg(theme.accent_primary).bg(theme.bg_base),
-        ),
-        Span::styled(
-            format!(" {text}"),
-            Style::default().fg(theme.text_primary).bg(theme.bg_base),
-        ),
-    ])
+fn centered_text_line(text: &str, style: Style, width: usize, theme: &Theme) -> Line<'static> {
+    centered_spans(
+        width,
+        display_width(text),
+        vec![Span::styled(text.to_string(), style)],
+        theme,
+    )
 }
 
-fn transcript_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+fn centered_spans(
+    width: usize,
+    content_width: usize,
+    spans: Vec<Span<'static>>,
+    theme: &Theme,
+) -> Line<'static> {
+    let left_padding = width.saturating_sub(content_width) / 2;
+    let mut centered = Vec::with_capacity(spans.len() + 1);
+    if left_padding > 0 {
+        centered.push(Span::styled(
+            " ".repeat(left_padding),
+            Style::default().bg(theme.bg_base),
+        ));
+    }
+    centered.extend(spans);
+    Line::from(centered)
+}
+
+fn suggestion_line(
+    tag: &str,
+    text: &str,
+    theme: &Theme,
+    width: usize,
+    block_width: usize,
+) -> Line<'static> {
+    centered_spans(
+        width,
+        block_width,
+        vec![
+            Span::styled(
+                format!("〔{tag}〕"),
+                Style::default().fg(theme.accent_primary).bg(theme.bg_base),
+            ),
+            Span::styled(
+                format!(" {text}"),
+                Style::default().fg(theme.text_primary).bg(theme.bg_base),
+            ),
+        ],
+        theme,
+    )
+}
+
+fn transcript_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for block in &state.transcript {
         match block {
             TranscriptBlock::User(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "> ",
-                        Style::default().fg(theme.accent_primary).bg(theme.bg_base),
-                    ),
-                    Span::styled(
-                        text.clone(),
-                        Style::default().fg(theme.text_primary).bg(theme.bg_base),
-                    ),
-                ]));
+                lines.extend(message_lines(
+                    "> ",
+                    text,
+                    width,
+                    Style::default().fg(theme.accent_primary).bg(theme.bg_base),
+                    Style::default().fg(theme.text_primary).bg(theme.bg_base),
+                ));
             }
             TranscriptBlock::Assistant(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled("m ", Style::default().fg(theme.info_fg).bg(theme.bg_base)),
-                    Span::styled(
-                        text.clone(),
-                        Style::default().fg(theme.text_body).bg(theme.bg_base),
-                    ),
-                ]));
+                lines.extend(message_lines(
+                    "◆ ",
+                    text,
+                    width,
+                    Style::default().fg(theme.info_fg).bg(theme.bg_base),
+                    Style::default().fg(theme.text_body).bg(theme.bg_base),
+                ));
             }
             TranscriptBlock::Error(text) => {
                 lines.extend(error_block_lines(text, theme));
@@ -187,13 +255,77 @@ fn transcript_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
             TranscriptBlock::Notice(text) => {
                 lines.extend(notice_block_lines(text, theme));
             }
+            TranscriptBlock::Tool(card) => {
+                lines.extend(tool_card_lines(card, state, theme));
+            }
         }
         lines.push(Line::from(""));
     }
-    for card in &state.tool_cards {
-        lines.extend(tool_card_lines(card, state, theme));
-        lines.push(Line::from(""));
+    lines
+}
+
+fn message_lines(
+    marker: &'static str,
+    text: &str,
+    width: usize,
+    marker_style: Style,
+    text_style: Style,
+) -> Vec<Line<'static>> {
+    let marker_width = display_width(marker);
+    let content_width = width.saturating_sub(marker_width).max(1);
+    let indent = " ".repeat(marker_width);
+    let mut lines = Vec::new();
+    let mut first_line = true;
+
+    for physical in text.split('\n') {
+        let wrapped = wrap_text(physical, content_width);
+        let wrapped = if wrapped.is_empty() {
+            vec![String::new()]
+        } else {
+            wrapped
+        };
+
+        for chunk in wrapped {
+            if first_line {
+                lines.push(Line::from(vec![
+                    Span::styled(marker, marker_style),
+                    Span::styled(chunk, text_style),
+                ]));
+                first_line = false;
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(indent.clone(), text_style),
+                    Span::styled(chunk, text_style),
+                ]));
+            }
+        }
     }
+
+    lines
+}
+
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    let max_width = max_width.max(1);
+
+    for ch in text.chars() {
+        let ch_width = char_width(ch);
+        if ch_width > 0 && current_width + ch_width > max_width && !current.is_empty() {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+
+        current.push(ch);
+        current_width += ch_width;
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
     lines
 }
 
@@ -651,6 +783,10 @@ fn display_width(text: &str) -> usize {
 }
 
 fn char_width(ch: char) -> usize {
+    if is_zero_width(ch) {
+        return 0;
+    }
+
     if matches!(
         ch as u32,
         0x2E80..=0xA4CF
@@ -660,6 +796,7 @@ fn char_width(ch: char) -> usize {
             | 0xFE30..=0xFE6F
             | 0xFF00..=0xFF60
             | 0xFFE0..=0xFFE6
+            | 0x1F000..=0x1FAFF
     ) {
         2
     } else {
@@ -667,11 +804,20 @@ fn char_width(ch: char) -> usize {
     }
 }
 
+fn is_zero_width(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200D | 0xFE00..=0xFE0F
+    )
+}
+
 fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+    const INPUT_PROMPT: &str = "mysteries ▸ ";
+
     let content = if state.input.is_empty() {
         Line::from(vec![
             Span::styled(
-                "mysteries ▸ ",
+                INPUT_PROMPT,
                 Style::default().fg(theme.accent_primary).bg(theme.bg_base),
             ),
             Span::styled(
@@ -682,7 +828,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
     } else {
         Line::from(vec![
             Span::styled(
-                "mysteries ▸ ",
+                INPUT_PROMPT,
                 Style::default().fg(theme.accent_primary).bg(theme.bg_base),
             ),
             Span::styled(
@@ -700,6 +846,21 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
         )
         .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
     frame.render_widget(paragraph, area);
+    frame.set_cursor_position(input_cursor_position(area, &state.input));
+}
+
+fn input_cursor_position(area: Rect, input: &str) -> Position {
+    const INPUT_PROMPT: &str = "mysteries ▸ ";
+
+    let content_width = display_width(INPUT_PROMPT) + display_width(input);
+    let max_x = area.x.saturating_add(area.width.saturating_sub(2));
+    let x = area
+        .x
+        .saturating_add(1)
+        .saturating_add(content_width as u16)
+        .min(max_x);
+    let y = area.y.saturating_add(1);
+    Position::new(x, y)
 }
 
 #[cfg(test)]
@@ -712,6 +873,7 @@ mod tests {
     use crate::tui::theme::Theme;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::layout::Position;
     use ratatui::style::{Color, Modifier};
     use ratatui::Terminal;
     use serde_json::json;
@@ -734,6 +896,34 @@ mod tests {
         buffer_to_styled(terminal.backend().buffer(), theme)
     }
 
+    fn render_to_plain_with_size(
+        state: &AppState,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, state, theme)).unwrap();
+        buffer_to_plain(terminal.backend().buffer())
+    }
+
+    fn buffer_to_plain(buffer: &Buffer) -> String {
+        let area = *buffer.area();
+        let mut lines = Vec::new();
+        for y in area.y..area.y + area.height {
+            let mut line = String::new();
+            let mut x = area.x;
+            while x < area.x + area.width {
+                let symbol = buffer[(x, y)].symbol().to_string();
+                line.push_str(&symbol);
+                x += super::display_width(&symbol).max(1) as u16;
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
     fn buffer_to_styled(buffer: &Buffer, theme: &Theme) -> String {
         let area = *buffer.area();
         let mut lines = Vec::new();
@@ -747,7 +937,7 @@ mod tests {
                     symbol.clone(),
                     style_key(cell.fg, cell.bg, cell.modifier, theme),
                 ));
-                x += if is_cjk_wide(&symbol) { 2 } else { 1 };
+                x += super::display_width(&symbol).max(1) as u16;
             }
 
             while matches!(cells.last(), Some((symbol, _)) if symbol == " ") {
@@ -829,26 +1019,51 @@ mod tests {
         Some(format!("‹{}›", parts.join(" ")))
     }
 
-    fn is_cjk_wide(symbol: &str) -> bool {
-        symbol.chars().any(|ch| {
-            matches!(
-                ch as u32,
-                0x2E80..=0xA4CF
-                    | 0xAC00..=0xD7A3
-                    | 0xF900..=0xFAFF
-                    | 0xFE10..=0xFE19
-                    | 0xFE30..=0xFE6F
-                    | 0xFF00..=0xFF60
-                    | 0xFFE0..=0xFFE6
-            )
-        })
-    }
-
     fn status_line(text: &str) -> String {
         text.lines()
             .find(|line| line.contains("status:"))
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn display_width_treats_common_emoji_as_wide() {
+        assert_eq!(super::display_width("a"), 1);
+        assert_eq!(super::display_width("你好"), 4);
+        assert_eq!(super::display_width("👋"), 2);
+        assert_eq!(super::display_width("😊"), 2);
+    }
+
+    #[test]
+    fn assistant_transcript_uses_diamond_marker_hanging_indent_and_emoji_width() {
+        let mut state = AppState::new();
+        state.transcript.push(TranscriptBlock::Assistant(
+            "你好！ 👋 我是在 Mysteries 中运行的 AI 编程助手。".to_string(),
+        ));
+
+        let text = render_to_plain_with_size(&state, &Theme::midnight(), 19, 12);
+        let lines = text.lines().collect::<Vec<_>>();
+
+        assert!(lines.iter().any(|line| line.starts_with("◆ 你好！ 👋")));
+        assert!(lines.iter().any(|line| line.starts_with("  Mysteries")));
+        assert!(!lines.iter().any(|line| line.starts_with("Mysteries")));
+        assert!(!text.contains("m 你好"));
+    }
+
+    #[test]
+    fn input_render_sets_cursor_at_input_end() {
+        let mut state = AppState::new();
+        state.input = "你好".to_string();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &state, &Theme::midnight()))
+            .unwrap();
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(17, 22));
     }
 
     fn tool_card(
@@ -950,16 +1165,40 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_notice_snapshot() {
+        let mut state = AppState::new();
+        state.apply(AgentEvent::Interrupted);
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!(
+            "\n--- interrupted notice frame ---\n{text}\n--- end interrupted notice frame ---"
+        );
+        insta::assert_snapshot!("tui_interrupted_notice", text);
+    }
+
+    #[test]
+    fn interrupted_notice_daylight_snapshot() {
+        let mut state = AppState::new();
+        state.apply(AgentEvent::Interrupted);
+        let text = render_to_styled(&state, &Theme::daylight());
+
+        println!(
+            "\n--- interrupted notice daylight frame ---\n{text}\n--- end interrupted notice daylight frame ---"
+        );
+        insta::assert_snapshot!("tui_interrupted_notice_daylight", text);
+    }
+
+    #[test]
     fn tool_card_running_snapshot() {
         let mut state = AppState::new();
         state.spinner_frame = 3;
-        state.tool_cards.push(tool_card(
+        state.transcript.push(TranscriptBlock::Tool(tool_card(
             "read_file",
             ToolCardStatus::Running,
             None,
             true,
             false,
-        ));
+        )));
         let theme = Theme::midnight();
         let text = render_to_styled(&state, &theme);
 
@@ -970,13 +1209,13 @@ mod tests {
     #[test]
     fn tool_card_done_snapshot() {
         let mut state = AppState::new();
-        state.tool_cards.push(tool_card(
+        state.transcript.push(TranscriptBlock::Tool(tool_card(
             "write_file",
             ToolCardStatus::Done,
             Some("pub struct Config {\n    pub timeout_secs: u64,\n}"),
             false,
             false,
-        ));
+        )));
         let theme = Theme::midnight();
         let text = render_to_styled(&state, &theme);
 
@@ -987,13 +1226,13 @@ mod tests {
     #[test]
     fn tool_card_error_snapshot() {
         let mut state = AppState::new();
-        state.tool_cards.push(tool_card(
+        state.transcript.push(TranscriptBlock::Tool(tool_card(
             "run_shell",
             ToolCardStatus::Error,
             Some("command failed: permission denied"),
             false,
             true,
-        ));
+        )));
         let theme = Theme::midnight();
         let text = render_to_styled(&state, &theme);
 
@@ -1004,7 +1243,7 @@ mod tests {
     #[test]
     fn run_shell_exit_foot_snapshot() {
         let mut state = AppState::new();
-        state.tool_cards.push(ToolCard {
+        state.transcript.push(TranscriptBlock::Tool(ToolCard {
             id: "run-shell-1".to_string(),
             name: "run_shell".to_string(),
             args: json!({ "command": "exit 7" }),
@@ -1013,13 +1252,35 @@ mod tests {
             output: Some("exit: 7\n--- stdout ---\nfailed\n--- stderr ---\n".to_string()),
             truncated: false,
             exit: Some(7),
-        });
+        }));
         let text = render_to_styled(&state, &Theme::midnight());
 
         println!(
             "\n--- run shell exit foot frame ---\n{text}\n--- end run shell exit foot frame ---"
         );
         insta::assert_snapshot!("tui_run_shell_exit_foot", text);
+    }
+
+    #[test]
+    fn timeline_tool_then_final_answer_snapshot() {
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(TranscriptBlock::User("总结这个项目".to_string()));
+        state.transcript.push(TranscriptBlock::Tool(tool_card(
+            "read_file",
+            ToolCardStatus::Done,
+            Some("# Mysteries\nA terminal coding assistant."),
+            true,
+            false,
+        )));
+        state.transcript.push(TranscriptBlock::Assistant(
+            "这是一个 Rust 编写的终端编码助手。".to_string(),
+        ));
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!("\n--- timeline final answer frame ---\n{text}\n--- end timeline final answer frame ---");
+        insta::assert_snapshot!("tui_timeline_tool_then_final_answer", text);
     }
 
     #[test]
@@ -1052,7 +1313,7 @@ mod tests {
         state.transcript.push(TranscriptBlock::Assistant(
             "好的。我先读一下 src/config/schema.rs 里 Config 的结构。".to_string(),
         ));
-        state.tool_cards.push(ToolCard {
+        state.transcript.push(TranscriptBlock::Tool(ToolCard {
             id: "read-file-1".to_string(),
             name: "read_file".to_string(),
             args: json!({ "path": "schema.rs", "offset": 0, "limit": 40 }),
@@ -1064,7 +1325,7 @@ mod tests {
             ),
             truncated: false,
             exit: None,
-        });
+        }));
         state.transcript.push(TranscriptBlock::Assistant(
             "结构清楚了。我在 Config 上加 timeout_secs: u64,并在 Default 里给默认值 30。"
                 .to_string(),
@@ -1101,7 +1362,7 @@ mod tests {
                 .push(TranscriptBlock::User(format!("line {index:02}")));
         }
         let theme = Theme::midnight();
-        let total_lines = transcript_line_count(&state, &theme);
+        let total_lines = transcript_line_count(&state, &theme, 80);
         state.page_up(total_lines, 17);
         let text = render_to_styled(&state, &theme);
 

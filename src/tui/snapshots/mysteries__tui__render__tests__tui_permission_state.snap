@@ -5,13 +5,13 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› {"limit":40,"offset":0,"path":"schema.rs"}‹/›‹text.secondary›  只读 · 自动运行‹/›
 ‹border.subtle›│ ‹/›‹text.body›pub struct Config {‹/›
 ‹border.subtle›│ ‹/›‹text.body›    pub model: String,‹/›
 ‹border.subtle›│ ‹/›‹text.body›    pub max_iterations: u32,‹/›
 ‹border.subtle›│ ‹/›‹text.body›}‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
+
+‹info.fg›◆ ‹/›‹text.body›结构清楚了。我在 Config 上加 timeout_secs: u64,并在 Default 里给默认值 30。‹/›
 
 ‹warning.fg bg=warning.bg›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹warning.fg bg=warning.bg›│‹/›‹warning.fg bg=warning.bg +bold›▲ 需要授权‹/›‹text.primary bg=warning.bg›                                                                    ‹/›‹warning.fg bg=warning.bg›│‹/›

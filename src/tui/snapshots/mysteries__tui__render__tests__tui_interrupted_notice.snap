@@ -5,19 +5,19 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹info.fg›◇ ‹/›‹text.body›⊘ 已中断本轮‹/›
 
 
 
-‹text.primary›                                  ‹/›‹text.title +bold›✦ MYSTERIES‹/›
-‹text.primary›                          ‹/›‹accent.primary›AGENT · v1.0 · 终端编码助手‹/›
-‹text.primary›        ‹/›‹text.body›读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等‹/›
-‹text.primary›                               ‹/›‹text.body›你按下 y 才动手。‹/›
 
-‹text.primary›                                     ‹/›‹text.muted›试试 ↓‹/›
-‹text.primary›                   ‹/›‹accent.primary›〔任务〕‹/›‹text.primary› 给 Config 加 timeout_secs 字段‹/›
-‹text.primary›                   ‹/›‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›
-‹text.primary›                   ‹/›‹accent.primary›〔/status〕‹/›‹text.primary› 当前会话快照‹/›
-‹text.primary›                   ‹/›‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
+
+
+
+
+
+
+
+
 
 
 
