@@ -17,6 +17,7 @@ const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const PROVIDER_LABEL: &str = "OpenAI";
 
 pub struct OpenAiProvider {
+    credential_name: String,
     base_url: String,
     credentials: CredentialChain,
     client: reqwest::Client,
@@ -25,7 +26,35 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(base_url: impl Into<String>, credentials: CredentialChain) -> Self {
-        Self::with_retry_policy(base_url, credentials, default_retry_policy())
+        Self::with_credential_name(base_url, credentials, "openai")
+    }
+
+    pub fn with_credential_name(
+        base_url: impl Into<String>,
+        credentials: CredentialChain,
+        credential_name: impl Into<String>,
+    ) -> Self {
+        Self::with_credential_name_and_retry_policy(
+            base_url,
+            credentials,
+            credential_name,
+            default_retry_policy(),
+        )
+    }
+
+    fn with_credential_name_and_retry_policy(
+        base_url: impl Into<String>,
+        credentials: CredentialChain,
+        credential_name: impl Into<String>,
+        retry_policy: RetryPolicy,
+    ) -> Self {
+        Self {
+            credential_name: credential_name.into(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            credentials,
+            client: reqwest::Client::new(),
+            retry_policy,
+        }
     }
 
     pub fn default(credentials: CredentialChain) -> Self {
@@ -35,33 +64,36 @@ impl OpenAiProvider {
     pub fn with_attempt_timeout(
         base_url: impl Into<String>,
         credentials: CredentialChain,
+        credential_name: impl Into<String>,
         attempt_timeout: Duration,
     ) -> Self {
-        Self::with_retry_policy(
+        Self::with_credential_name_and_retry_policy(
             base_url,
             credentials,
+            credential_name,
             retry_policy_with_attempt_timeout(attempt_timeout),
         )
     }
 
     pub fn default_with_attempt_timeout(
         credentials: CredentialChain,
+        credential_name: impl Into<String>,
         attempt_timeout: Duration,
     ) -> Self {
-        Self::with_attempt_timeout(DEFAULT_BASE_URL, credentials, attempt_timeout)
+        Self::with_attempt_timeout(
+            DEFAULT_BASE_URL,
+            credentials,
+            credential_name,
+            attempt_timeout,
+        )
     }
 
-    fn with_retry_policy(
+    pub fn with_retry_policy(
         base_url: impl Into<String>,
         credentials: CredentialChain,
         retry_policy: RetryPolicy,
     ) -> Self {
-        Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            credentials,
-            client: reqwest::Client::new(),
-            retry_policy,
-        }
+        Self::with_credential_name_and_retry_policy(base_url, credentials, "openai", retry_policy)
     }
 
     pub fn chat_completions_url(&self) -> String {
@@ -97,7 +129,7 @@ impl Provider for OpenAiProvider {
     ) -> Result<ModelResponse, ProviderError> {
         let secret = self
             .credentials
-            .resolve("openai")
+            .resolve(&self.credential_name)
             .ok_or(ProviderError::Auth)?;
         let authorization = format!("Bearer {}", secret.expose_secret());
         let url = self.chat_completions_url();
@@ -154,7 +186,7 @@ fn retry_policy_with_attempt_timeout(attempt_timeout: Duration) -> RetryPolicy {
 mod tests {
     use super::{OpenAiProvider, PROVIDER_LABEL};
     use crate::agent::message::Message;
-    use crate::credential::{CredentialChain, EnvCredentialSource};
+    use crate::credential::{CredentialChain, CredentialSource, EnvCredentialSource};
     use crate::error::ProviderError;
     use crate::provider::stream::StreamAccumulator;
     use crate::provider::transport::{
@@ -162,11 +194,40 @@ mod tests {
         TransportErrorKind, TransportFailure,
     };
     use crate::provider::{DeltaSink, ModelRequest, Provider, ToolCall, ToolSchema};
+    use secrecy::SecretString;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::time::{self, Instant};
+
+    struct MapCredentialSource {
+        keys: HashMap<String, String>,
+    }
+
+    impl MapCredentialSource {
+        fn new(entries: &[(&str, &str)]) -> Self {
+            Self {
+                keys: entries
+                    .iter()
+                    .map(|(provider, key)| ((*provider).to_string(), (*key).to_string()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl CredentialSource for MapCredentialSource {
+        fn resolve(&self, provider: &str) -> Option<SecretString> {
+            self.keys
+                .get(provider)
+                .map(|key| SecretString::from(key.clone()))
+        }
+    }
+
+    fn no_retry_policy() -> RetryPolicy {
+        RetryPolicy::new(0, Duration::from_millis(10), Duration::from_millis(1))
+    }
 
     fn test_policy(max_retries: usize) -> RetryPolicy {
         RetryPolicy::new(
@@ -415,7 +476,7 @@ mod tests {
         let provider = OpenAiProvider::with_retry_policy(
             "http://127.0.0.1:9/v1",
             CredentialChain::new(Vec::new()),
-            RetryPolicy::new(0, Duration::from_millis(10), Duration::from_millis(1)),
+            no_retry_policy(),
         );
         let sink = CaptureSink::new();
 
@@ -423,6 +484,41 @@ mod tests {
 
         assert_eq!(err, ProviderError::Auth);
         assert_eq!(sink.chunks(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn openai_provider_injected_name_rejects_mismatched_chain_key() {
+        let provider = OpenAiProvider::with_credential_name(
+            "http://127.0.0.1:9/v1",
+            CredentialChain::new(vec![Box::new(MapCredentialSource::new(&[(
+                "openai",
+                "sk-openai-only",
+            )]))]),
+            "deepseek",
+        );
+        let sink = CaptureSink::new();
+
+        let err = provider.complete(request(), &sink).await.unwrap_err();
+
+        assert_eq!(err, ProviderError::Auth);
+        assert_eq!(sink.chunks(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn openai_provider_injected_name_resolves_matching_chain_key_before_http() {
+        let provider = OpenAiProvider::with_credential_name(
+            "http://127.0.0.1:9/v1",
+            CredentialChain::new(vec![Box::new(MapCredentialSource::new(&[(
+                "deepseek",
+                "sk-deepseek",
+            )]))]),
+            "deepseek",
+        );
+        let sink = CaptureSink::new();
+
+        let err = provider.complete(request(), &sink).await.unwrap_err();
+
+        assert_ne!(err, ProviderError::Auth);
     }
 
     #[tokio::test]

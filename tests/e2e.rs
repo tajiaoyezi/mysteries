@@ -48,6 +48,7 @@ impl PermissionDecider for AllowAll {
 fn config() -> Config {
     Config {
         provider: ProviderConfig {
+            id: String::new(),
             kind: ProviderKind::Mock,
             base_url: None,
             auth_type: AuthType::ApiKey,

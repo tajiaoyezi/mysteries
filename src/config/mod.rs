@@ -40,6 +40,7 @@ pub struct RawConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderConfig {
+    pub id: String,
     pub kind: ProviderKind,
     pub base_url: Option<String>,
     pub auth_type: AuthType,
@@ -47,6 +48,8 @@ pub struct ProviderConfig {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RawProviderConfig {
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub kind: Option<ProviderKind>,
     #[serde(default)]
@@ -84,6 +87,7 @@ pub enum ConfigError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigWritePatch {
+    pub provider_id: String,
     pub provider_kind: ProviderKind,
     pub base_url: Option<String>,
     pub model: String,
@@ -103,6 +107,7 @@ pub fn write_config(path: &Path, patch: &ConfigWritePatch) -> Result<(), ConfigE
     raw.model = Some(patch.model.clone());
     let mut provider = raw.provider.take().unwrap_or_default();
     provider.kind = Some(patch.provider_kind.clone());
+    provider.id = Some(patch.provider_id.clone());
     provider.base_url = patch.base_url.clone();
     if provider.auth_type.is_none() {
         provider.auth_type = Some(AuthType::ApiKey);
@@ -146,6 +151,7 @@ fn merge_provider(
         (Some(user), None) => Some(user),
         (None, Some(project)) => Some(project),
         (Some(user), Some(project)) => Some(RawProviderConfig {
+            id: project.id.or(user.id),
             kind: project.kind.or(user.kind),
             base_url: project.base_url.or(user.base_url),
             auth_type: project.auth_type.or(user.auth_type),
@@ -156,10 +162,14 @@ fn merge_provider(
 pub fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     let model = raw.model.ok_or(ConfigError::MissingField("model"))?;
     let provider = raw.provider.unwrap_or_default();
+    let kind = provider
+        .kind
+        .ok_or(ConfigError::MissingField("provider.kind"))?;
     let provider = ProviderConfig {
-        kind: provider
-            .kind
-            .ok_or(ConfigError::MissingField("provider.kind"))?,
+        id: provider
+            .id
+            .unwrap_or_else(|| default_provider_id_for_kind(&kind).to_string()),
+        kind,
         base_url: provider.base_url,
         auth_type: provider.auth_type.unwrap_or(AuthType::ApiKey),
     };
@@ -182,6 +192,14 @@ pub fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         compact_trigger_ratio,
         keep_recent_turns: raw.keep_recent_turns.unwrap_or(DEFAULT_KEEP_RECENT_TURNS),
     })
+}
+
+fn default_provider_id_for_kind(kind: &ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Mock => "mock",
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +229,7 @@ kind = "openai"
 
         let provider = raw.provider.unwrap();
         assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+        assert_eq!(provider.id, None);
         assert_eq!(provider.base_url, None);
         assert_eq!(provider.auth_type, None);
     }
@@ -450,6 +469,7 @@ auth_type = "api_key"
         write_config(
             &path,
             &ConfigWritePatch {
+                provider_id: String::new(),
                 provider_kind: ProviderKind::Anthropic,
                 base_url: None,
                 model: "new".to_string(),
@@ -487,6 +507,7 @@ auth_type = "api_key"
         write_config(
             &path,
             &ConfigWritePatch {
+                provider_id: String::new(),
                 provider_kind: ProviderKind::OpenAi,
                 base_url: Some("https://new.example/v1".to_string()),
                 model: "new".to_string(),
@@ -510,6 +531,7 @@ auth_type = "api_key"
         write_config(
             &path,
             &ConfigWritePatch {
+                provider_id: String::new(),
                 provider_kind: ProviderKind::OpenAi,
                 base_url: None,
                 model: "m".to_string(),
@@ -522,6 +544,148 @@ auth_type = "api_key"
         assert_eq!(
             raw.provider.as_ref().unwrap().kind,
             Some(ProviderKind::OpenAi)
+        );
+    }
+
+    #[test]
+    fn parse_old_config_without_provider_id() {
+        let raw = parse(
+            r#"
+model = "gpt-4o-mini"
+
+[provider]
+kind = "openai"
+auth_type = "api_key"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(raw.provider.as_ref().unwrap().id, None);
+    }
+
+    #[test]
+    fn parse_provider_id_when_present() {
+        let raw = parse(
+            r#"
+model = "deepseek-v4-pro"
+
+[provider]
+id = "deepseek"
+kind = "openai"
+"#,
+        )
+        .unwrap();
+
+        let provider = raw.provider.unwrap();
+        assert_eq!(provider.id.as_deref(), Some("deepseek"));
+        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+    }
+
+    #[test]
+    fn resolve_provider_id_falls_back_to_kind_default_name() {
+        for (kind, expected_id) in [
+            ("openai", "openai"),
+            ("anthropic", "anthropic"),
+            ("mock", "mock"),
+        ] {
+            let raw = parse(&format!(
+                r#"
+model = "test-model"
+
+[provider]
+kind = "{kind}"
+auth_type = "api_key"
+"#
+            ))
+            .unwrap();
+
+            let config = resolve(raw).unwrap();
+            assert_eq!(config.provider.id, expected_id);
+        }
+    }
+
+    #[test]
+    fn resolve_provider_id_uses_explicit_id_when_set() {
+        let raw = parse(
+            r#"
+model = "deepseek-v4-pro"
+
+[provider]
+id = "deepseek"
+kind = "openai"
+auth_type = "api_key"
+"#,
+        )
+        .unwrap();
+
+        let config = resolve(raw).unwrap();
+
+        assert_eq!(config.provider.id, "deepseek");
+        assert_eq!(config.provider.kind, ProviderKind::OpenAi);
+    }
+
+    #[test]
+    fn merge_provider_id_field_level() {
+        let user = parse(
+            r#"
+[provider]
+id = "openai"
+kind = "openai"
+"#,
+        )
+        .unwrap();
+        let project = parse(
+            r#"
+[provider]
+id = "deepseek"
+"#,
+        )
+        .unwrap();
+
+        let merged = merge(user, project);
+        let provider = merged.provider.unwrap();
+
+        assert_eq!(provider.id.as_deref(), Some("deepseek"));
+        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+    }
+
+    #[test]
+    fn write_config_persists_provider_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+model = "old"
+max_iterations = 40
+
+[provider]
+kind = "anthropic"
+auth_type = "api_key"
+"#,
+        )
+        .unwrap();
+
+        write_config(
+            &path,
+            &ConfigWritePatch {
+                provider_id: "deepseek".to_string(),
+                provider_kind: ProviderKind::OpenAi,
+                base_url: Some("https://api.deepseek.com".to_string()),
+                model: "deepseek-v4-pro".to_string(),
+            },
+        )
+        .unwrap();
+
+        let raw = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(raw.max_iterations, Some(40));
+        let provider = raw.provider.unwrap();
+        assert_eq!(provider.id.as_deref(), Some("deepseek"));
+        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.deepseek.com")
         );
     }
 }

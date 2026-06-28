@@ -3,7 +3,8 @@ use crate::agent::DEFAULT_SYSTEM_PROMPT;
 use crate::app::{assemble_agent, load_config, select_provider, AssemblyError};
 use crate::config::{write_config, ConfigError, ConfigWritePatch, ProviderKind};
 use crate::credential::{
-    write_credential, CredentialChain, CredentialError, EnvCredentialSource, FileCredentialSource,
+    collect_credential_sources, list_credential_providers, remove_credential, write_credential,
+    CredentialChain, CredentialError, CredentialOrigin, EnvCredentialSource, FileCredentialSource,
 };
 use crate::error::AgentError;
 use crate::permission::{PermissionDecider, PermissionDecision};
@@ -11,6 +12,7 @@ use crate::provider::{DeltaSink, ToolCall};
 use crate::tool::Tool;
 use crate::tool::ToolContext;
 use async_trait::async_trait;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use secrecy::SecretString;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -43,8 +45,6 @@ pub enum CliError {
 pub enum AuthError {
     #[error("auth cancelled")]
     Cancelled,
-    #[error("unsupported provider: {0}")]
-    UnsupportedProvider(String),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -60,52 +60,201 @@ pub struct AuthPaths {
 pub trait AuthPrompter {
     fn read_line(&mut self, prompt: &str) -> Result<Option<String>, AuthError>;
     fn read_secret(&mut self, prompt: &str) -> Result<Option<SecretString>, AuthError>;
+    fn select(&mut self, prompt: &str, options: &[&str]) -> Result<Option<usize>, AuthError>;
 }
 
-pub fn run_auth(paths: &AuthPaths, prompter: &mut dyn AuthPrompter) -> Result<(), AuthError> {
-    let provider_line = prompter.read_line("Provider [openai/anthropic]: ")?;
-    let provider_line = provider_line.ok_or(AuthError::Cancelled)?;
-    let (provider_kind, credential_provider) = parse_auth_provider(&provider_line)?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectAction {
+    Move(usize),
+    Confirm(usize),
+    Cancel,
+    Ignore,
+}
 
-    let base_url_line = prompter.read_line("Base URL (empty for default): ")?;
-    let base_url_line = base_url_line.ok_or(AuthError::Cancelled)?;
+pub fn apply_select_key(highlight: usize, len: usize, key: KeyEvent) -> SelectAction {
+    match key.code {
+        KeyCode::Up if len > 0 => SelectAction::Move((highlight + len - 1) % len),
+        KeyCode::Down if len > 0 => SelectAction::Move((highlight + 1) % len),
+        KeyCode::Enter => SelectAction::Confirm(highlight),
+        KeyCode::Esc => SelectAction::Cancel,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => SelectAction::Cancel,
+        _ => SelectAction::Ignore,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderPreset {
+    OpenAi,
+    Anthropic,
+    DeepSeek,
+}
+
+const OPENAI_DEFAULT_MODEL: &str = "gpt-5.5";
+const ANTHROPIC_DEFAULT_MODEL: &str = "claude-opus-4-8";
+const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-pro";
+const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
+
+pub fn preset_patch(preset: ProviderPreset) -> (ConfigWritePatch, &'static str) {
+    match preset {
+        ProviderPreset::OpenAi => (
+            ConfigWritePatch {
+                provider_id: "openai".to_string(),
+                provider_kind: ProviderKind::OpenAi,
+                base_url: None,
+                model: OPENAI_DEFAULT_MODEL.to_string(),
+            },
+            "openai",
+        ),
+        ProviderPreset::Anthropic => (
+            ConfigWritePatch {
+                provider_id: "anthropic".to_string(),
+                provider_kind: ProviderKind::Anthropic,
+                base_url: None,
+                model: ANTHROPIC_DEFAULT_MODEL.to_string(),
+            },
+            "anthropic",
+        ),
+        ProviderPreset::DeepSeek => (
+            ConfigWritePatch {
+                provider_id: "deepseek".to_string(),
+                provider_kind: ProviderKind::OpenAi,
+                base_url: Some(DEEPSEEK_BASE_URL.to_string()),
+                model: DEEPSEEK_DEFAULT_MODEL.to_string(),
+            },
+            "deepseek",
+        ),
+    }
+}
+
+pub fn run_auth_login_interactive(paths: &AuthPaths) -> Result<(), AuthError> {
+    let mut prompter = StdinAuthPrompter;
+    run_auth_login(paths, &mut prompter)
+}
+
+pub fn run_auth_logout_interactive(paths: &AuthPaths) -> Result<(), AuthError> {
+    let mut prompter = StdinAuthPrompter;
+    run_auth_logout(paths, &mut prompter)
+}
+
+pub fn run_auth_list(paths: &AuthPaths) -> Result<(), AuthError> {
+    let entries = collect_credential_sources(&paths.credentials, |name| std::env::var(name).ok());
+
+    if entries.is_empty() {
+        eprintln!("No credentials configured. Run 'mysteries auth login' to add one.");
+        return Ok(());
+    }
+
+    for entry in entries {
+        let labels: Vec<&str> = entry
+            .origins
+            .iter()
+            .map(|origin| match origin {
+                CredentialOrigin::Env => "env",
+                CredentialOrigin::File => "file",
+            })
+            .collect();
+        eprintln!("{} [{}]", entry.name, labels.join(", "));
+    }
+
+    Ok(())
+}
+
+pub fn run_auth_login(paths: &AuthPaths, prompter: &mut dyn AuthPrompter) -> Result<(), AuthError> {
+    let provider_options = ["OpenAI", "Anthropic", "DeepSeek", "Custom"];
+    let selected = prompter
+        .select("Select provider", &provider_options)?
+        .ok_or(AuthError::Cancelled)?;
+
+    let (patch, credential_key, key) = match selected {
+        0 => login_preset(prompter, ProviderPreset::OpenAi)?,
+        1 => login_preset(prompter, ProviderPreset::Anthropic)?,
+        2 => login_preset(prompter, ProviderPreset::DeepSeek)?,
+        _ => login_custom(prompter)?,
+    };
+
+    write_config(&paths.user_config, &patch)?;
+    write_credential(&paths.credentials, &credential_key, &key)?;
+    eprintln!("Logged in as {}.", patch.provider_id);
+
+    Ok(())
+}
+
+fn login_preset(
+    prompter: &mut dyn AuthPrompter,
+    preset: ProviderPreset,
+) -> Result<(ConfigWritePatch, String, SecretString), AuthError> {
+    let (patch, credential_key) = preset_patch(preset);
+    let key = prompter
+        .read_secret("API key: ")?
+        .ok_or(AuthError::Cancelled)?;
+    Ok((patch, credential_key.to_string(), key))
+}
+
+fn login_custom(
+    prompter: &mut dyn AuthPrompter,
+) -> Result<(ConfigWritePatch, String, SecretString), AuthError> {
+    let kind_options = ["OpenAi", "Anthropic"];
+    let kind_index = prompter
+        .select("Select kind", &kind_options)?
+        .ok_or(AuthError::Cancelled)?;
+    let (provider_kind, default_id) = match kind_index {
+        1 => (ProviderKind::Anthropic, "anthropic"),
+        _ => (ProviderKind::OpenAi, "openai"),
+    };
+
+    let logical_name = prompter
+        .read_line("Logical name (empty for kind default): ")?
+        .ok_or(AuthError::Cancelled)?;
+    let provider_id =
+        normalize_optional_line(&logical_name).unwrap_or_else(|| default_id.to_string());
+
+    let base_url_line = prompter
+        .read_line("Base URL (empty for default): ")?
+        .ok_or(AuthError::Cancelled)?;
     let base_url = normalize_optional_line(&base_url_line);
 
-    let model_line = prompter.read_line("Model: ")?;
-    let model_line = model_line.ok_or(AuthError::Cancelled)?;
+    let model_line = prompter.read_line("Model: ")?.ok_or(AuthError::Cancelled)?;
     let model = model_line.trim();
     if model.is_empty() {
         return Err(AuthError::Cancelled);
     }
 
-    let key = prompter.read_secret("API key: ")?;
-    let key = key.ok_or(AuthError::Cancelled)?;
+    let key = prompter
+        .read_secret("API key: ")?
+        .ok_or(AuthError::Cancelled)?;
 
-    write_config(
-        &paths.user_config,
-        &ConfigWritePatch {
-            provider_kind,
-            base_url,
-            model: model.to_string(),
-        },
-    )?;
+    let patch = ConfigWritePatch {
+        provider_id: provider_id.clone(),
+        provider_kind,
+        base_url,
+        model: model.to_string(),
+    };
 
-    write_credential(&paths.credentials, credential_provider, &key)?;
+    Ok((patch, provider_id, key))
+}
+
+pub fn run_auth_logout(
+    paths: &AuthPaths,
+    prompter: &mut dyn AuthPrompter,
+) -> Result<(), AuthError> {
+    let providers = list_credential_providers(&paths.credentials);
+    if providers.is_empty() {
+        eprintln!("No configured credentials to log out.");
+        return Ok(());
+    }
+
+    let options: Vec<&str> = providers.iter().map(String::as_str).collect();
+    let selected = prompter.select("Select provider to log out", &options)?;
+    let Some(index) = selected else {
+        return Ok(());
+    };
+
+    if let Some(provider) = providers.get(index) {
+        remove_credential(&paths.credentials, provider)?;
+        eprintln!("Logged out of {provider}.");
+    }
 
     Ok(())
-}
-
-pub fn run_auth_interactive(paths: &AuthPaths) -> Result<(), AuthError> {
-    let mut prompter = StdinAuthPrompter;
-    run_auth(paths, &mut prompter)
-}
-
-fn parse_auth_provider(input: &str) -> Result<(ProviderKind, &'static str), AuthError> {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "openai" => Ok((ProviderKind::OpenAi, "openai")),
-        "anthropic" => Ok((ProviderKind::Anthropic, "anthropic")),
-        other => Err(AuthError::UnsupportedProvider(other.to_string())),
-    }
 }
 
 fn normalize_optional_line(input: &str) -> Option<String> {
@@ -142,10 +291,42 @@ impl AuthPrompter for StdinAuthPrompter {
     fn read_secret(&mut self, prompt: &str) -> Result<Option<SecretString>, AuthError> {
         read_secret_hidden(prompt)
     }
+
+    fn select(&mut self, prompt: &str, options: &[&str]) -> Result<Option<usize>, AuthError> {
+        read_select(prompt, options)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecretKeyAction {
+    Append(char),
+    Backspace,
+    Submit,
+    Cancel,
+    Ignore,
+}
+
+fn apply_secret_key(key: KeyEvent) -> SecretKeyAction {
+    if key.kind != KeyEventKind::Press {
+        return SecretKeyAction::Ignore;
+    }
+    match key.code {
+        KeyCode::Enter => SecretKeyAction::Submit,
+        KeyCode::Esc => SecretKeyAction::Cancel,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            SecretKeyAction::Cancel
+        }
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            SecretKeyAction::Ignore
+        }
+        KeyCode::Char(c) => SecretKeyAction::Append(c),
+        KeyCode::Backspace | KeyCode::Delete => SecretKeyAction::Backspace,
+        _ => SecretKeyAction::Ignore,
+    }
 }
 
 fn read_secret_hidden(prompt: &str) -> Result<Option<SecretString>, AuthError> {
-    use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{read, Event};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
     eprint!("{prompt}");
@@ -156,20 +337,22 @@ fn read_secret_hidden(prompt: &str) -> Result<Option<SecretString>, AuthError> {
         let mut secret = String::new();
         loop {
             let event = read().map_err(|_| AuthError::Cancelled)?;
-            if let Event::Key(KeyEvent {
-                code, modifiers, ..
-            }) = event
-            {
-                match code {
-                    KeyCode::Enter => break,
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Char('\x03') => return Ok(None),
-                    KeyCode::Char(_) if modifiers.contains(KeyModifiers::CONTROL) => {}
-                    KeyCode::Char(c) => secret.push(c),
-                    KeyCode::Backspace | KeyCode::Delete => {
-                        secret.pop();
+            if let Event::Key(key) = event {
+                match apply_secret_key(key) {
+                    SecretKeyAction::Append(c) => {
+                        secret.push(c);
+                        eprint!("*");
+                        let _ = io::stderr().flush();
                     }
-                    _ => {}
+                    SecretKeyAction::Backspace => {
+                        if secret.pop().is_some() {
+                            eprint!("\x08 \x08");
+                            let _ = io::stderr().flush();
+                        }
+                    }
+                    SecretKeyAction::Submit => break,
+                    SecretKeyAction::Cancel => return Ok(None),
+                    SecretKeyAction::Ignore => {}
                 }
             }
         }
@@ -182,6 +365,61 @@ fn read_secret_hidden(prompt: &str) -> Result<Option<SecretString>, AuthError> {
     let _ = disable_raw_mode();
     eprintln!();
     read_result
+}
+
+fn read_select(prompt: &str, options: &[&str]) -> Result<Option<usize>, AuthError> {
+    use crossterm::event::{read, Event, KeyEventKind};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    if options.is_empty() {
+        return Ok(None);
+    }
+
+    eprintln!("{prompt}");
+    let _ = io::stderr().flush();
+
+    enable_raw_mode().map_err(|_| AuthError::Cancelled)?;
+    let result = (|| -> Result<Option<usize>, AuthError> {
+        let mut highlight = 0usize;
+        render_select(options, highlight, true);
+        loop {
+            let event = read().map_err(|_| AuthError::Cancelled)?;
+            if let Event::Key(key) = event {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match apply_select_key(highlight, options.len(), key) {
+                    SelectAction::Move(idx) => {
+                        highlight = idx;
+                        render_select(options, highlight, false);
+                    }
+                    SelectAction::Confirm(idx) => return Ok(Some(idx)),
+                    SelectAction::Cancel => return Ok(None),
+                    SelectAction::Ignore => {}
+                }
+            }
+        }
+    })();
+    let _ = disable_raw_mode();
+    eprintln!();
+    result
+}
+
+fn render_select(options: &[&str], highlight: usize, first: bool) {
+    use crossterm::cursor::MoveToPreviousLine;
+    use crossterm::execute;
+    use crossterm::terminal::{Clear, ClearType};
+
+    let mut out = io::stderr();
+    if !first {
+        let _ = execute!(out, MoveToPreviousLine(options.len() as u16));
+    }
+    for (idx, option) in options.iter().enumerate() {
+        let _ = execute!(out, Clear(ClearType::CurrentLine));
+        let marker = if idx == highlight { '>' } else { ' ' };
+        let _ = write!(out, "\r{marker} {option}\r\n");
+    }
+    let _ = out.flush();
 }
 
 impl From<io::Error> for CliError {
@@ -262,20 +500,27 @@ fn initial_history(prompt: &str) -> Vec<Message> {
 
 #[cfg(test)]
 mod tests {
-    use super::{initial_history, parse_decision, run_auth, AuthError, AuthPaths, AuthPrompter};
+    use super::{
+        apply_secret_key, apply_select_key, initial_history, parse_decision, preset_patch,
+        run_auth_login, run_auth_logout, AuthError, AuthPaths, AuthPrompter, ProviderPreset,
+        SecretKeyAction, SelectAction,
+    };
     use crate::agent::message::Message;
     use crate::agent::DEFAULT_SYSTEM_PROMPT;
     use crate::config::{parse, ProviderKind};
     use crate::credential::{CredentialSource, FileCredentialSource};
     use crate::permission::PermissionDecision;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use secrecy::{ExposeSecret, SecretString};
     use std::fs;
 
     struct ScriptedAuthPrompter {
         lines: Vec<Option<String>>,
         secrets: Vec<Option<String>>,
+        select_indices: Vec<Option<usize>>,
         line_idx: usize,
         secret_idx: usize,
+        select_idx: usize,
     }
 
     impl ScriptedAuthPrompter {
@@ -283,9 +528,16 @@ mod tests {
             Self {
                 lines,
                 secrets,
+                select_indices: Vec::new(),
                 line_idx: 0,
                 secret_idx: 0,
+                select_idx: 0,
             }
+        }
+
+        fn with_select_script(mut self, script: Vec<Option<usize>>) -> Self {
+            self.select_indices = script;
+            self
         }
     }
 
@@ -304,6 +556,20 @@ mod tests {
             self.secret_idx += 1;
             Ok(value)
         }
+
+        fn select(&mut self, _prompt: &str, _options: &[&str]) -> Result<Option<usize>, AuthError> {
+            let value = self
+                .select_indices
+                .get(self.select_idx)
+                .cloned()
+                .unwrap_or(None);
+            self.select_idx += 1;
+            Ok(value)
+        }
+    }
+
+    fn key_event(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]
@@ -332,80 +598,259 @@ mod tests {
     }
 
     #[test]
-    fn run_auth_writes_config_and_credentials_with_injected_input() {
+    fn apply_select_key_wraps_highlight_at_bounds() {
+        assert_eq!(
+            apply_select_key(0, 3, key_event(KeyCode::Up)),
+            SelectAction::Move(2)
+        );
+        assert_eq!(
+            apply_select_key(2, 3, key_event(KeyCode::Down)),
+            SelectAction::Move(0)
+        );
+        assert_eq!(
+            apply_select_key(1, 3, key_event(KeyCode::Down)),
+            SelectAction::Move(2)
+        );
+        assert_eq!(
+            apply_select_key(1, 3, key_event(KeyCode::Up)),
+            SelectAction::Move(0)
+        );
+    }
+
+    #[test]
+    fn apply_select_key_confirm_and_cancel() {
+        assert_eq!(
+            apply_select_key(1, 3, key_event(KeyCode::Enter)),
+            SelectAction::Confirm(1)
+        );
+        assert_eq!(
+            apply_select_key(0, 2, key_event(KeyCode::Esc)),
+            SelectAction::Cancel
+        );
+        assert_eq!(
+            apply_select_key(
+                0,
+                2,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            SelectAction::Cancel
+        );
+    }
+
+    #[test]
+    fn apply_select_key_ignores_unrelated_keys() {
+        assert_eq!(
+            apply_select_key(0, 3, key_event(KeyCode::Char('a'))),
+            SelectAction::Ignore
+        );
+    }
+
+    #[test]
+    fn apply_secret_key_ignores_non_press_so_leftover_release_does_not_submit_or_duplicate() {
+        let release_enter =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+        assert_eq!(apply_secret_key(release_enter), SecretKeyAction::Ignore);
+
+        let release_char = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(apply_secret_key(release_char), SecretKeyAction::Ignore);
+    }
+
+    #[test]
+    fn apply_secret_key_maps_press_events() {
+        assert_eq!(
+            apply_secret_key(key_event(KeyCode::Char('a'))),
+            SecretKeyAction::Append('a')
+        );
+        assert_eq!(
+            apply_secret_key(key_event(KeyCode::Enter)),
+            SecretKeyAction::Submit
+        );
+        assert_eq!(
+            apply_secret_key(key_event(KeyCode::Esc)),
+            SecretKeyAction::Cancel
+        );
+        assert_eq!(
+            apply_secret_key(key_event(KeyCode::Backspace)),
+            SecretKeyAction::Backspace
+        );
+        assert_eq!(
+            apply_secret_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            SecretKeyAction::Cancel
+        );
+    }
+
+    #[test]
+    fn scripted_auth_prompter_select_returns_scripted_indices() {
+        let options = ["OpenAI", "Anthropic", "DeepSeek"];
+        let mut prompter =
+            ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![Some(1), None]);
+
+        assert_eq!(prompter.select("Provider", &options).unwrap(), Some(1));
+        assert_eq!(prompter.select("Provider", &options).unwrap(), None);
+    }
+
+    #[test]
+    fn preset_patch_maps_each_preset_to_config_and_credential_key() {
+        let (openai, openai_key) = preset_patch(ProviderPreset::OpenAi);
+        assert_eq!(openai.provider_id, "openai");
+        assert_eq!(openai.provider_kind, ProviderKind::OpenAi);
+        assert_eq!(openai.base_url, None);
+        assert_eq!(openai.model, "gpt-5.5");
+        assert_eq!(openai_key, "openai");
+
+        let (anthropic, anthropic_key) = preset_patch(ProviderPreset::Anthropic);
+        assert_eq!(anthropic.provider_id, "anthropic");
+        assert_eq!(anthropic.provider_kind, ProviderKind::Anthropic);
+        assert_eq!(anthropic.base_url, None);
+        assert_eq!(anthropic.model, "claude-opus-4-8");
+        assert_eq!(anthropic_key, "anthropic");
+
+        let (deepseek, deepseek_key) = preset_patch(ProviderPreset::DeepSeek);
+        assert_eq!(deepseek.provider_id, "deepseek");
+        assert_eq!(deepseek.provider_kind, ProviderKind::OpenAi);
+        assert_eq!(
+            deepseek.base_url.as_deref(),
+            Some("https://api.deepseek.com")
+        );
+        assert_eq!(deepseek.model, "deepseek-v4-pro");
+        assert_eq!(deepseek_key, "deepseek");
+    }
+
+    #[test]
+    fn run_auth_login_preset_deepseek_writes_config_and_credential() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
-        fs::write(
-            &config_path,
-            r#"
-model = "old-model"
-max_iterations = 40
-
-[provider]
-kind = "anthropic"
-auth_type = "api_key"
-"#,
-        )
-        .unwrap();
         let credentials_path = temp.path().join("credentials");
+        let paths = AuthPaths {
+            user_config: config_path.clone(),
+            credentials: credentials_path.clone(),
+        };
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-deepseek".to_string())])
+            .with_select_script(vec![Some(2)]);
 
+        run_auth_login(&paths, &mut prompter).unwrap();
+
+        let raw = parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(raw.model.as_deref(), Some("deepseek-v4-pro"));
+        let provider = raw.provider.as_ref().unwrap();
+        assert_eq!(provider.id.as_deref(), Some("deepseek"));
+        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.deepseek.com")
+        );
+
+        let source = FileCredentialSource::new(&credentials_path);
+        assert_eq!(
+            source.resolve("deepseek").unwrap().expose_secret(),
+            "sk-deepseek"
+        );
+    }
+
+    #[test]
+    fn run_auth_login_custom_writes_config_and_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let credentials_path = temp.path().join("credentials");
         let paths = AuthPaths {
             user_config: config_path.clone(),
             credentials: credentials_path.clone(),
         };
         let mut prompter = ScriptedAuthPrompter::new(
             vec![
-                Some("openai".to_string()),
-                Some(String::new()),
-                Some("gpt-4o".to_string()),
+                Some("myllm".to_string()),
+                Some("https://my.example/v1".to_string()),
+                Some("my-model".to_string()),
             ],
-            vec![Some("sk-xxx".to_string())],
-        );
+            vec![Some("sk-my".to_string())],
+        )
+        .with_select_script(vec![Some(3), Some(0)]);
 
-        run_auth(&paths, &mut prompter).unwrap();
+        run_auth_login(&paths, &mut prompter).unwrap();
 
         let raw = parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(raw.model.as_deref(), Some("gpt-4o"));
-        assert_eq!(raw.max_iterations, Some(40));
-        assert_eq!(
-            raw.provider.as_ref().unwrap().kind,
-            Some(ProviderKind::OpenAi)
-        );
+        assert_eq!(raw.model.as_deref(), Some("my-model"));
+        let provider = raw.provider.as_ref().unwrap();
+        assert_eq!(provider.id.as_deref(), Some("myllm"));
+        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+        assert_eq!(provider.base_url.as_deref(), Some("https://my.example/v1"));
 
         let source = FileCredentialSource::new(&credentials_path);
-        assert_eq!(source.resolve("openai").unwrap().expose_secret(), "sk-xxx");
+        assert_eq!(source.resolve("myllm").unwrap().expose_secret(), "sk-my");
     }
 
     #[test]
-    fn run_auth_aborts_without_writing_on_eof() {
+    fn run_auth_login_cancelled_select_writes_nothing() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
-        let original_config = r#"
-model = "keep-model"
-max_iterations = 12
-
-[provider]
-kind = "anthropic"
-auth_type = "api_key"
-"#;
-        fs::write(&config_path, original_config).unwrap();
         let credentials_path = temp.path().join("credentials");
-        fs::write(&credentials_path, "anthropic = sk-keep\n").unwrap();
-
         let paths = AuthPaths {
             user_config: config_path.clone(),
             credentials: credentials_path.clone(),
         };
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![None]);
+
+        let result = run_auth_login(&paths, &mut prompter);
+
+        assert_eq!(result, Err(AuthError::Cancelled));
+        assert!(!config_path.exists());
+        assert!(!credentials_path.exists());
+    }
+
+    #[test]
+    fn run_auth_logout_removes_selected_keeps_others() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials");
+        fs::write(&credentials_path, "openai = sk-o\ndeepseek = sk-d\n").unwrap();
+        let paths = AuthPaths {
+            user_config: temp.path().join("config.toml"),
+            credentials: credentials_path.clone(),
+        };
         let mut prompter =
-            ScriptedAuthPrompter::new(vec![Some("openai".to_string()), None], vec![]);
+            ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![Some(1)]);
 
-        let err = run_auth(&paths, &mut prompter).unwrap_err();
-        assert_eq!(err, AuthError::Cancelled);
+        run_auth_logout(&paths, &mut prompter).unwrap();
 
-        assert_eq!(fs::read_to_string(&config_path).unwrap(), original_config);
+        let source = FileCredentialSource::new(&credentials_path);
+        assert!(source.resolve("deepseek").is_none());
+        assert_eq!(source.resolve("openai").unwrap().expose_secret(), "sk-o");
+    }
+
+    #[test]
+    fn run_auth_logout_cancelled_select_keeps_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials");
+        fs::write(&credentials_path, "openai = sk-o\ndeepseek = sk-d\n").unwrap();
+        let paths = AuthPaths {
+            user_config: temp.path().join("config.toml"),
+            credentials: credentials_path.clone(),
+        };
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![None]);
+
+        run_auth_logout(&paths, &mut prompter).unwrap();
+
         assert_eq!(
             fs::read_to_string(&credentials_path).unwrap(),
-            "anthropic = sk-keep\n"
+            "openai = sk-o\ndeepseek = sk-d\n"
         );
+    }
+
+    #[test]
+    fn run_auth_logout_without_credentials_returns_ok() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials");
+        let paths = AuthPaths {
+            user_config: temp.path().join("config.toml"),
+            credentials: credentials_path.clone(),
+        };
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![]);
+
+        run_auth_logout(&paths, &mut prompter).unwrap();
+
+        assert!(!credentials_path.exists());
     }
 }

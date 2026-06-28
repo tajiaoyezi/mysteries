@@ -76,6 +76,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut calling_model_started_at: Option<Instant> = None;
+    let mut first_token_at: Option<Instant> = None;
 
     terminal
         .terminal_mut()
@@ -98,7 +99,12 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                                 if should_exit(&state, key) {
                                     break;
                                 }
-                                if !handle_scroll_key(&mut terminal, &mut state, key, &theme)? {
+                                let scroll_handled = if arrows_route_to_completion(&state, key) {
+                                    false
+                                } else {
+                                    handle_scroll_key(&mut terminal, &mut state, key, &theme)?
+                                };
+                                if !scroll_handled {
                                     state.on_key_with_interrupt(key, &input_tx, &interrupt_tx);
                                     if state.should_exit {
                                         break;
@@ -117,7 +123,12 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
             event = ui_rx.recv() => {
                 match event {
                     Some(event) => {
-                        apply_ui_event(&mut state, event, &mut calling_model_started_at);
+                        apply_ui_event(
+                            &mut state,
+                            event,
+                            &mut calling_model_started_at,
+                            &mut first_token_at,
+                        );
                     }
                     None => break,
                 }
@@ -143,13 +154,18 @@ fn apply_ui_event(
     state: &mut app::AppState,
     event: channel::AgentEvent,
     calling_model_started_at: &mut Option<Instant>,
+    first_token_at: &mut Option<Instant>,
 ) {
     match &event {
         channel::AgentEvent::StatusChanged(AgentStatus::CallingModel) => {
             *calling_model_started_at = Some(Instant::now());
+            *first_token_at = None;
             state.reset_streaming_chars_for_call();
         }
         channel::AgentEvent::TextDelta(text) => {
+            if first_token_at.is_none() {
+                *first_token_at = Some(Instant::now());
+            }
             let elapsed = calling_model_started_at
                 .as_ref()
                 .map(|start| start.elapsed())
@@ -160,9 +176,13 @@ fn apply_ui_event(
             input_tokens,
             output_tokens,
         } => {
-            let elapsed = calling_model_started_at
+            let elapsed = first_token_at
                 .take()
-                .map(|start| start.elapsed())
+                .map(|start| {
+                    calling_model_started_at.take();
+                    start.elapsed()
+                })
+                .or_else(|| calling_model_started_at.take().map(|start| start.elapsed()))
                 .unwrap_or(Duration::ZERO);
             state.record_usage(
                 Usage {
@@ -198,11 +218,21 @@ fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
         return false;
     }
 
+    if state.command_completion.is_some() && key.code == KeyCode::Esc {
+        return false;
+    }
+
     if key.code == KeyCode::Esc {
         return !state.phase.is_running();
     }
 
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn arrows_route_to_completion(state: &app::AppState, key: KeyEvent) -> bool {
+    is_key_press(key)
+        && state.command_completion.is_some()
+        && matches!(key.code, KeyCode::Up | KeyCode::Down)
 }
 
 fn handle_scroll_key(
@@ -409,7 +439,10 @@ fn error_message(err: AgentError) -> String {
 #[cfg(test)]
 mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
-    use super::{run_agent_task, scroll_action_for_key, should_exit, DEFAULT_SYSTEM_PROMPT};
+    use super::{
+        arrows_route_to_completion, run_agent_task, scroll_action_for_key, should_exit,
+        DEFAULT_SYSTEM_PROMPT,
+    };
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
     use crate::app::assemble_agent;
@@ -424,6 +457,8 @@ mod tests {
         DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, ToolCall,
     };
     use crate::tool::ToolContext;
+    use crate::tui::app::CommandCompletion;
+    use crate::tui::command::command_metadata;
     use async_trait::async_trait;
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -461,6 +496,7 @@ mod tests {
     fn config() -> Config {
         Config {
             provider: ProviderConfig {
+                id: String::new(),
                 kind: ProviderKind::Mock,
                 base_url: None,
                 auth_type: AuthType::ApiKey,
@@ -540,6 +576,46 @@ mod tests {
         assert!(!should_exit(&state, repeat_escape));
     }
 
+    fn state_with_command_completion() -> super::app::AppState {
+        let mut state = super::app::AppState::new();
+        state.command_completion = Some(CommandCompletion {
+            candidates: command_metadata().to_vec(),
+            selected: 0,
+        });
+        state
+    }
+
+    #[test]
+    fn arrows_route_to_completion_when_popup_active() {
+        let with_completion = state_with_command_completion();
+        assert!(arrows_route_to_completion(
+            &with_completion,
+            key(KeyCode::Up)
+        ));
+        assert!(arrows_route_to_completion(
+            &with_completion,
+            key(KeyCode::Down)
+        ));
+        assert!(!arrows_route_to_completion(
+            &with_completion,
+            key(KeyCode::PageUp)
+        ));
+        assert!(!arrows_route_to_completion(
+            &with_completion,
+            key(KeyCode::Home)
+        ));
+
+        let without_completion = super::app::AppState::new();
+        assert!(!arrows_route_to_completion(
+            &without_completion,
+            key(KeyCode::Up)
+        ));
+
+        let release_up =
+            KeyEvent::new_with_kind(KeyCode::Up, KeyModifiers::NONE, KeyEventKind::Release);
+        assert!(!arrows_route_to_completion(&with_completion, release_up));
+    }
+
     #[test]
     fn should_exit_routes_escape_by_pending_running_or_ready_state() {
         let ready = super::app::AppState::new();
@@ -564,6 +640,12 @@ mod tests {
         }));
         assert!(!should_exit(
             &pending,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+        ));
+
+        let with_completion = state_with_command_completion();
+        assert!(!should_exit(
+            &with_completion,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
         ));
     }

@@ -1056,7 +1056,7 @@ fn render_command_completion(
         return;
     }
 
-    let list_height = completion.candidates.len().min(6) as u16 + 2;
+    let list_height = completion.candidates.len() as u16 + 2;
     let width = input_area.width.min(52);
     let area = Rect {
         x: input_area.x,
@@ -1068,7 +1068,6 @@ fn render_command_completion(
     let lines = completion
         .candidates
         .iter()
-        .take(list_height.saturating_sub(2) as usize)
         .enumerate()
         .map(|(index, command)| {
             let base = Style::default().bg(theme.bg_surface);
@@ -1393,12 +1392,15 @@ mod tests {
     fn command_completion_snapshot() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = AppState::new();
-        for ch in ['/', 'c', 'o'] {
-            state.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
-        }
+        state.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), &tx);
         let text = render_to_styled(&state, &Theme::midnight());
 
-        assert!(text.contains("/compact"));
+        for command in ["/help", "/logout", "/compact"] {
+            assert!(
+                text.contains(command),
+                "completion popup should list {command}"
+            );
+        }
         println!(
             "\n--- command completion frame ---\n{text}\n--- end command completion frame ---"
         );

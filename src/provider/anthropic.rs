@@ -19,6 +19,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const PROVIDER_LABEL: &str = "Anthropic";
 
 pub struct AnthropicProvider {
+    credential_name: String,
     base_url: String,
     credentials: CredentialChain,
     client: reqwest::Client,
@@ -27,7 +28,20 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(base_url: impl Into<String>, credentials: CredentialChain) -> Self {
-        Self::with_retry_policy(base_url, credentials, default_retry_policy())
+        Self::with_credential_name(base_url, credentials, "anthropic")
+    }
+
+    pub fn with_credential_name(
+        base_url: impl Into<String>,
+        credentials: CredentialChain,
+        credential_name: impl Into<String>,
+    ) -> Self {
+        Self::with_credential_name_and_retry_policy(
+            base_url,
+            credentials,
+            credential_name,
+            default_retry_policy(),
+        )
     }
 
     pub fn default(credentials: CredentialChain) -> Self {
@@ -37,28 +51,51 @@ impl AnthropicProvider {
     pub fn with_attempt_timeout(
         base_url: impl Into<String>,
         credentials: CredentialChain,
+        credential_name: impl Into<String>,
         attempt_timeout: Duration,
     ) -> Self {
-        Self::with_retry_policy(
+        Self::with_credential_name_and_retry_policy(
             base_url,
             credentials,
+            credential_name,
             retry_policy_with_attempt_timeout(attempt_timeout),
         )
     }
 
     pub fn default_with_attempt_timeout(
         credentials: CredentialChain,
+        credential_name: impl Into<String>,
         attempt_timeout: Duration,
     ) -> Self {
-        Self::with_attempt_timeout(DEFAULT_BASE_URL, credentials, attempt_timeout)
+        Self::with_attempt_timeout(
+            DEFAULT_BASE_URL,
+            credentials,
+            credential_name,
+            attempt_timeout,
+        )
     }
 
-    fn with_retry_policy(
+    pub fn with_retry_policy(
         base_url: impl Into<String>,
         credentials: CredentialChain,
         retry_policy: RetryPolicy,
     ) -> Self {
+        Self::with_credential_name_and_retry_policy(
+            base_url,
+            credentials,
+            "anthropic",
+            retry_policy,
+        )
+    }
+
+    fn with_credential_name_and_retry_policy(
+        base_url: impl Into<String>,
+        credentials: CredentialChain,
+        credential_name: impl Into<String>,
+        retry_policy: RetryPolicy,
+    ) -> Self {
         Self {
+            credential_name: credential_name.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             credentials,
             client: reqwest::Client::new(),
@@ -114,7 +151,7 @@ impl Provider for AnthropicProvider {
     ) -> Result<ModelResponse, ProviderError> {
         let secret = self
             .credentials
-            .resolve("anthropic")
+            .resolve(&self.credential_name)
             .ok_or(ProviderError::Auth)?;
         let api_key = secret.expose_secret().to_string();
         let url = self.messages_url();
@@ -172,14 +209,43 @@ fn retry_policy_with_attempt_timeout(attempt_timeout: Duration) -> RetryPolicy {
 mod tests {
     use super::{AnthropicProvider, ANTHROPIC_VERSION};
     use crate::agent::message::Message;
-    use crate::credential::{CredentialChain, EnvCredentialSource};
+    use crate::credential::{CredentialChain, CredentialSource, EnvCredentialSource};
     use crate::error::ProviderError;
     use crate::provider::transport::RetryPolicy;
     use crate::provider::{DeltaSink, ModelRequest, Provider, ToolSchema};
     use reqwest::header::{HeaderName, AUTHORIZATION};
+    use secrecy::SecretString;
     use serde_json::{json, Value};
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    struct MapCredentialSource {
+        keys: HashMap<String, String>,
+    }
+
+    impl MapCredentialSource {
+        fn new(entries: &[(&str, &str)]) -> Self {
+            Self {
+                keys: entries
+                    .iter()
+                    .map(|(provider, key)| ((*provider).to_string(), (*key).to_string()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl CredentialSource for MapCredentialSource {
+        fn resolve(&self, provider: &str) -> Option<SecretString> {
+            self.keys
+                .get(provider)
+                .map(|key| SecretString::from(key.clone()))
+        }
+    }
+
+    fn no_retry_policy() -> RetryPolicy {
+        RetryPolicy::new(0, Duration::from_millis(10), Duration::from_millis(1))
+    }
 
     struct CaptureSink {
         chunks: Mutex<Vec<String>>,
@@ -221,7 +287,7 @@ mod tests {
         let provider = AnthropicProvider::with_retry_policy(
             "http://127.0.0.1:9",
             CredentialChain::new(Vec::new()),
-            RetryPolicy::new(0, Duration::from_millis(10), Duration::from_millis(1)),
+            no_retry_policy(),
         );
         let sink = CaptureSink::new();
 
@@ -229,6 +295,41 @@ mod tests {
 
         assert_eq!(err, ProviderError::Auth);
         assert_eq!(sink.chunks(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_injected_name_rejects_mismatched_chain_key() {
+        let provider = AnthropicProvider::with_credential_name(
+            "http://127.0.0.1:9",
+            CredentialChain::new(vec![Box::new(MapCredentialSource::new(&[(
+                "anthropic",
+                "sk-anthropic-only",
+            )]))]),
+            "custom-llm",
+        );
+        let sink = CaptureSink::new();
+
+        let err = provider.complete(request(), &sink).await.unwrap_err();
+
+        assert_eq!(err, ProviderError::Auth);
+        assert_eq!(sink.chunks(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_injected_name_resolves_matching_chain_key_before_http() {
+        let provider = AnthropicProvider::with_credential_name(
+            "http://127.0.0.1:9",
+            CredentialChain::new(vec![Box::new(MapCredentialSource::new(&[(
+                "custom-llm",
+                "sk-custom",
+            )]))]),
+            "custom-llm",
+        );
+        let sink = CaptureSink::new();
+
+        let err = provider.complete(request(), &sink).await.unwrap_err();
+
+        assert_ne!(err, ProviderError::Auth);
     }
 
     #[test]

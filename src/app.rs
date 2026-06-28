@@ -54,24 +54,37 @@ pub fn select_provider(
     credentials: CredentialChain,
 ) -> Result<Arc<dyn Provider>, AssemblyError> {
     let attempt_timeout = Duration::from_secs(config.timeout_secs);
+    let credential_name = config.provider.id.as_str();
     let provider: Box<dyn Provider> = match config.provider.kind {
         ProviderKind::OpenAi => {
             let provider = match &config.provider.base_url {
-                Some(base_url) => {
-                    OpenAiProvider::with_attempt_timeout(base_url, credentials, attempt_timeout)
-                }
-                None => OpenAiProvider::default_with_attempt_timeout(credentials, attempt_timeout),
+                Some(base_url) => OpenAiProvider::with_attempt_timeout(
+                    base_url,
+                    credentials,
+                    credential_name,
+                    attempt_timeout,
+                ),
+                None => OpenAiProvider::default_with_attempt_timeout(
+                    credentials,
+                    credential_name,
+                    attempt_timeout,
+                ),
             };
             Box::new(provider)
         }
         ProviderKind::Anthropic => {
             let provider = match &config.provider.base_url {
-                Some(base_url) => {
-                    AnthropicProvider::with_attempt_timeout(base_url, credentials, attempt_timeout)
-                }
-                None => {
-                    AnthropicProvider::default_with_attempt_timeout(credentials, attempt_timeout)
-                }
+                Some(base_url) => AnthropicProvider::with_attempt_timeout(
+                    base_url,
+                    credentials,
+                    credential_name,
+                    attempt_timeout,
+                ),
+                None => AnthropicProvider::default_with_attempt_timeout(
+                    credentials,
+                    credential_name,
+                    attempt_timeout,
+                ),
             };
             Box::new(provider)
         }
@@ -150,7 +163,8 @@ mod tests {
         AuthType, Config, ConfigError, ProviderConfig, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
         DEFAULT_KEEP_RECENT_TURNS,
     };
-    use crate::credential::CredentialChain;
+    use crate::credential::{CredentialChain, FileCredentialSource};
+    use crate::error::ProviderError;
     use crate::permission::{PermissionDecider, PermissionDecision};
     use crate::provider::mock::MockProvider;
     use crate::provider::{DeltaSink, ModelRequest};
@@ -271,6 +285,7 @@ kind = "mock"
     fn config_for(kind: ProviderKind) -> Config {
         Config {
             provider: ProviderConfig {
+                id: String::new(),
                 kind,
                 base_url: None,
                 auth_type: AuthType::ApiKey,
@@ -319,6 +334,64 @@ kind = "mock"
 
             assert_eq!(provider.attempt_timeout(), Some(Duration::from_secs(12)));
         }
+    }
+
+    #[tokio::test]
+    async fn select_provider_injects_provider_id_as_credential_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let cred_path = temp.path().join("credentials");
+        fs::write(&cred_path, "openai = sk-openai-only\n").unwrap();
+
+        let mut config = config_for(ProviderKind::OpenAi);
+        config.provider.id = "deepseek".to_string();
+        config.provider.base_url = Some("http://127.0.0.1:9/v1".to_string());
+        let chain = CredentialChain::new(vec![Box::new(FileCredentialSource::new(&cred_path))]);
+
+        let provider = select_provider(&config, chain).unwrap();
+        let sink = NoopSink;
+        let err = provider
+            .complete(
+                ModelRequest {
+                    model: "test-model".to_string(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    max_tokens: None,
+                },
+                &sink,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, ProviderError::Auth);
+    }
+
+    #[tokio::test]
+    async fn select_provider_uses_resolved_id_so_matching_key_passes_auth() {
+        let temp = tempfile::tempdir().unwrap();
+        let cred_path = temp.path().join("credentials");
+        fs::write(&cred_path, "deepseek = sk-deepseek\n").unwrap();
+
+        let mut config = config_for(ProviderKind::OpenAi);
+        config.provider.id = "deepseek".to_string();
+        config.provider.base_url = Some("http://127.0.0.1:9/v1".to_string());
+        let chain = CredentialChain::new(vec![Box::new(FileCredentialSource::new(&cred_path))]);
+
+        let provider = select_provider(&config, chain).unwrap();
+        let sink = NoopSink;
+        let err = provider
+            .complete(
+                ModelRequest {
+                    model: "test-model".to_string(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    max_tokens: None,
+                },
+                &sink,
+            )
+            .await
+            .unwrap_err();
+
+        assert_ne!(err, ProviderError::Auth);
     }
 
     #[tokio::test]
@@ -389,6 +462,7 @@ kind = "mock"
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             provider: ProviderConfig {
+                id: String::new(),
                 kind: ProviderKind::Mock,
                 base_url: None,
                 auth_type: AuthType::ApiKey,
@@ -443,6 +517,7 @@ kind = "mock"
     async fn assemble_agent_installs_compacting_when_window_configured() {
         let config = Config {
             provider: ProviderConfig {
+                id: String::new(),
                 kind: ProviderKind::Mock,
                 base_url: None,
                 auth_type: AuthType::ApiKey,

@@ -46,6 +46,7 @@ impl CredentialSource for EnvCredentialSource {
         let env_name = match provider {
             "openai" => "OPENAI_API_KEY",
             "anthropic" => "ANTHROPIC_API_KEY",
+            "deepseek" => "DEEPSEEK_API_KEY",
             _ => return None,
         };
 
@@ -123,6 +124,137 @@ pub fn write_credential(
     }
 
     write_credential_file(path, updated.as_bytes())
+}
+
+pub fn remove_credential(path: &Path, provider: &str) -> Result<(), CredentialError> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(CredentialError::Write(format!(
+                "read {}: {}",
+                path.display(),
+                err.kind()
+            )));
+        }
+    };
+
+    let updated = remove_credential_line(&content, provider);
+    if updated == content {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                return Err(CredentialError::Write(format!(
+                    "create dir {}: {}",
+                    parent.display(),
+                    err.kind()
+                )));
+            }
+        }
+    }
+
+    write_credential_file(path, updated.as_bytes())
+}
+
+pub fn list_credential_providers(path: &Path) -> Vec<String> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    let mut providers = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((name, _)) = trimmed.split_once('=') {
+            let name = name.trim();
+            if !name.is_empty() {
+                providers.push(name.to_string());
+            }
+        }
+    }
+
+    providers
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CredentialOrigin {
+    Env,
+    File,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialEntry {
+    pub name: String,
+    pub origins: Vec<CredentialOrigin>,
+}
+
+pub fn collect_credential_sources<F>(credentials_path: &Path, env_lookup: F) -> Vec<CredentialEntry>
+where
+    F: Fn(&str) -> Option<String> + Send + Sync + 'static,
+{
+    const PRESET_PROVIDERS: [&str; 3] = ["openai", "anthropic", "deepseek"];
+
+    let env_source = EnvCredentialSource::with_lookup(env_lookup);
+    let file_providers = list_credential_providers(credentials_path);
+    let mut entries = Vec::new();
+
+    for name in &file_providers {
+        let env_hit = env_source.resolve(name).is_some();
+        let origins = if env_hit {
+            vec![CredentialOrigin::Env, CredentialOrigin::File]
+        } else {
+            vec![CredentialOrigin::File]
+        };
+        entries.push(CredentialEntry {
+            name: name.clone(),
+            origins,
+        });
+    }
+
+    for preset in PRESET_PROVIDERS {
+        if file_providers.iter().any(|name| name == preset) {
+            continue;
+        }
+        if env_source.resolve(preset).is_some() {
+            entries.push(CredentialEntry {
+                name: preset.to_string(),
+                origins: vec![CredentialOrigin::Env],
+            });
+        }
+    }
+
+    entries
+}
+
+fn remove_credential_line(content: &str, provider: &str) -> String {
+    let mut out_lines = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Some((line_provider, _)) = trimmed.split_once('=') {
+                if line_provider.trim() == provider {
+                    continue;
+                }
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+
+    if out_lines.is_empty() {
+        return String::new();
+    }
+
+    let mut result = out_lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -226,7 +358,8 @@ impl CredentialChain {
 #[cfg(test)]
 mod tests {
     use super::{
-        write_credential, CredentialChain, CredentialSource, EnvCredentialSource,
+        collect_credential_sources, remove_credential, write_credential, CredentialChain,
+        CredentialEntry, CredentialOrigin, CredentialSource, EnvCredentialSource,
         FileCredentialSource,
     };
     use secrecy::{ExposeSecret, SecretString};
@@ -478,5 +611,191 @@ mod tests {
         let source = FileCredentialSource::new(&path);
         assert_eq!(source.resolve("openai").unwrap().expose_secret(), "sk-o");
         assert_eq!(source.resolve("anthropic").unwrap().expose_secret(), "sk-a");
+    }
+
+    #[test]
+    fn remove_credential_removes_matching_line_preserving_others() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+        fs::write(
+            &path,
+            "# header\nopenai = sk-o\ndeepseek = sk-d\n# footer\n",
+        )
+        .unwrap();
+
+        remove_credential(&path, "deepseek").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("openai = sk-o"));
+        assert!(!content.contains("deepseek = sk-d"));
+        assert!(content.contains("# header"));
+        assert!(content.contains("# footer"));
+
+        let source = FileCredentialSource::new(&path);
+        assert!(source.resolve("deepseek").is_none());
+        assert_eq!(source.resolve("openai").unwrap().expose_secret(), "sk-o");
+    }
+
+    #[test]
+    fn remove_credential_idempotent_when_no_match_or_missing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+        fs::write(&path, "openai = sk-o\n").unwrap();
+
+        remove_credential(&path, "deepseek").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "openai = sk-o\n");
+
+        remove_credential(&temp.path().join("missing"), "openai").unwrap();
+    }
+
+    #[test]
+    fn remove_credential_error_does_not_leak_plaintext() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+        fs::create_dir(&path).unwrap();
+
+        let err = remove_credential(&path, "deepseek").unwrap_err();
+
+        assert!(!err.to_string().contains("sk-super-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_credential_rewrites_with_owner_only_permissions_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+        fs::write(&path, "openai = sk-o\ndeepseek = sk-d\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        remove_credential(&path, "deepseek").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn env_credential_source_resolves_deepseek_from_injected_lookup() {
+        let source = EnvCredentialSource::with_lookup(|name| {
+            if name == "DEEPSEEK_API_KEY" {
+                Some("sk-deepseek-env".to_string())
+            } else {
+                None
+            }
+        });
+
+        let secret = source.resolve("deepseek").unwrap();
+
+        assert_eq!(secret.expose_secret(), "sk-deepseek-env");
+    }
+
+    #[test]
+    fn env_credential_source_custom_name_does_not_use_env_even_when_present() {
+        let source = EnvCredentialSource::with_lookup(|name| {
+            if name == "MYLLM_API_KEY" {
+                Some("sk-my".to_string())
+            } else {
+                None
+            }
+        });
+
+        assert!(source.resolve("myllm").is_none());
+    }
+
+    fn credential_entry(name: &str, origins: &[CredentialOrigin]) -> CredentialEntry {
+        CredentialEntry {
+            name: name.to_string(),
+            origins: origins.to_vec(),
+        }
+    }
+
+    #[test]
+    fn collect_credential_sources_lists_file_only_entries_preserving_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+        fs::write(&path, "openai = sk-o\nmyllm = sk-m\n").unwrap();
+
+        let entries = collect_credential_sources(&path, |_| None);
+
+        assert_eq!(
+            entries,
+            vec![
+                credential_entry("openai", &[CredentialOrigin::File]),
+                credential_entry("myllm", &[CredentialOrigin::File]),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_credential_sources_lists_env_only_when_file_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+
+        let entries = collect_credential_sources(&path, |name| {
+            if name == "OPENAI_API_KEY" {
+                Some("sk-env".to_string())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(
+            entries,
+            vec![credential_entry("openai", &[CredentialOrigin::Env])]
+        );
+    }
+
+    #[test]
+    fn collect_credential_sources_merges_same_name_with_env_before_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+        fs::write(&path, "openai = sk-o\n").unwrap();
+
+        let entries = collect_credential_sources(&path, |name| {
+            if name == "OPENAI_API_KEY" {
+                Some("sk-env".to_string())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(
+            entries,
+            vec![credential_entry(
+                "openai",
+                &[CredentialOrigin::Env, CredentialOrigin::File]
+            )]
+        );
+    }
+
+    #[test]
+    fn collect_credential_sources_custom_name_does_not_use_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+        fs::write(&path, "myllm = sk-m\n").unwrap();
+
+        let entries = collect_credential_sources(&path, |name| {
+            if name == "MYLLM_API_KEY" {
+                Some("sk-env".to_string())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(
+            entries,
+            vec![credential_entry("myllm", &[CredentialOrigin::File])]
+        );
+    }
+
+    #[test]
+    fn collect_credential_sources_returns_empty_when_no_file_or_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials");
+
+        let entries = collect_credential_sources(&path, |_| None);
+
+        assert!(entries.is_empty());
     }
 }
