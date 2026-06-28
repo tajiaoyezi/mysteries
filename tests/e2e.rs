@@ -77,11 +77,13 @@ async fn assembled_agent_runs_multiturn_tool_flow_offline() {
                 }),
             }],
             finish_reason: FinishReason::ToolCalls,
+            ..Default::default()
         },
         ModelResponse {
             text: "done".to_string(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
+            ..Default::default()
         },
     ]));
     let agent = assemble_agent(Box::new(provider.clone()), &config(), Box::new(AllowAll));

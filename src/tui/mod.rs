@@ -469,6 +469,7 @@ mod tests {
                 text: "second done".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
+                usage: None,
             })
         }
     }
@@ -690,11 +691,13 @@ mod tests {
                     arguments: json!({ "path": "note.txt", "content": "from tui" }),
                 }],
                 finish_reason: FinishReason::ToolCalls,
+                usage: None,
             },
             ModelResponse {
                 text: "done".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
+                usage: None,
             },
         ]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -801,11 +804,13 @@ mod tests {
                     arguments: json!({ "path": "note.txt", "content": "from tui" }),
                 }],
                 finish_reason: FinishReason::ToolCalls,
+                usage: None,
             },
             ModelResponse {
                 text: "done".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
+                usage: None,
             },
         ]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -872,6 +877,7 @@ mod tests {
             text: "done".to_string(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
+            usage: None,
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();

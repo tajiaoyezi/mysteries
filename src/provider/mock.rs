@@ -57,7 +57,7 @@ mod tests {
     use super::MockProvider;
     use crate::agent::message::Message;
     use crate::error::ProviderError;
-    use crate::provider::{DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider};
+    use crate::provider::{DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, Usage};
     use std::sync::Mutex;
 
     struct CaptureSink {
@@ -92,6 +92,7 @@ mod tests {
             text: text.to_string(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
+            usage: None,
         }
     }
 
@@ -137,5 +138,27 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ProviderError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn mock_provider_preserves_scripted_usage() {
+        let usage = Usage {
+            input_tokens: 5,
+            output_tokens: 8,
+        };
+        let provider = MockProvider::new(vec![ModelResponse {
+            text: "with usage".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: Some(usage.clone()),
+        }]);
+        let sink = CaptureSink::new();
+
+        let response = provider
+            .complete(request("model", "prompt"), &sink)
+            .await
+            .unwrap();
+
+        assert_eq!(response.usage, Some(usage));
     }
 }

@@ -1,6 +1,6 @@
 use crate::error::ProviderError;
 use crate::provider::transport::SseAccumulator;
-use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall};
+use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall, Usage};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -9,6 +9,7 @@ pub struct StreamAccumulator {
     text: String,
     tool_calls: BTreeMap<usize, PartialToolCall>,
     finish_reason: FinishReason,
+    usage: Option<Usage>,
     finished: bool,
 }
 
@@ -26,6 +27,7 @@ impl StreamAccumulator {
             text: String::new(),
             tool_calls: BTreeMap::new(),
             finish_reason: FinishReason::Other(String::new()),
+            usage: None,
             finished: false,
         }
     }
@@ -85,11 +87,14 @@ impl StreamAccumulator {
     fn apply_data(&mut self, data: &str, sink: &dyn DeltaSink) -> Result<(), ProviderError> {
         let body: Value = serde_json::from_str(data)
             .map_err(|err| ProviderError::Decode(format!("SSE data JSON invalid: {err}")))?;
-        let choice = body
+        let choices = body
             .get("choices")
             .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
             .ok_or_else(|| ProviderError::Decode("missing choices[0]".to_string()))?;
+        let Some(choice) = choices.first() else {
+            self.usage = parse_usage(body.get("usage"));
+            return Ok(());
+        };
 
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish_reason = parse_finish_reason(reason);
@@ -163,8 +168,26 @@ impl StreamAccumulator {
             text: self.text.clone(),
             tool_calls,
             finish_reason: self.finish_reason.clone(),
+            usage: self.usage.clone(),
         })
     }
+}
+
+fn parse_usage(value: Option<&Value>) -> Option<Usage> {
+    let value = value?;
+    let input_tokens = value
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|tokens| u32::try_from(tokens).ok())?;
+    let output_tokens = value
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|tokens| u32::try_from(tokens).ok())?;
+
+    Some(Usage {
+        input_tokens,
+        output_tokens,
+    })
 }
 
 impl SseAccumulator for StreamAccumulator {
@@ -218,7 +241,7 @@ fn parse_finish_reason(reason: &str) -> FinishReason {
 mod tests {
     use super::StreamAccumulator;
     use crate::error::ProviderError;
-    use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall};
+    use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall, Usage};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -294,6 +317,71 @@ data: [DONE]
         assert_eq!(response.text, "Hello");
         assert_eq!(response.tool_calls, Vec::<ToolCall>::new());
         assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(response.usage, None);
+    }
+
+    #[test]
+    fn usage_only_chunk_sets_usage_without_affecting_stream_content() {
+        let mut accumulator = StreamAccumulator::new();
+        let sink = CaptureSink::new();
+
+        let response = push_all(
+            &mut accumulator,
+            &sink,
+            &[
+                br#"data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
+
+"#,
+                br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}
+
+data: [DONE]
+
+"#,
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(sink.chunks(), vec!["Hello"]);
+        assert_eq!(response.text, "Hello");
+        assert_eq!(response.tool_calls, Vec::<ToolCall>::new());
+        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 12,
+                output_tokens: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn usage_chunk_with_missing_fields_degrades_to_none() {
+        let mut accumulator = StreamAccumulator::new();
+        let sink = CaptureSink::new();
+
+        let response = push_all(
+            &mut accumulator,
+            &sink,
+            &[
+                br#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}
+
+"#,
+                br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":12}}
+
+data: [DONE]
+
+"#,
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(response.text, "Hi");
+        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(response.usage, None);
     }
 
     #[test]

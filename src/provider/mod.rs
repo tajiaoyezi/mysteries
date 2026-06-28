@@ -38,14 +38,28 @@ pub struct ModelRequest {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+impl Usage {
+    pub fn total(&self) -> u32 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
+    pub usage: Option<Usage>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum FinishReason {
+    #[default]
     Stop,
     Length,
     ToolCalls,
@@ -95,7 +109,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider};
+    use super::{DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, Usage};
     use crate::agent::message::Message;
     use crate::error::ProviderError;
     use async_trait::async_trait;
@@ -150,6 +164,7 @@ mod tests {
                 text: "hello world".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
+                usage: None,
             })
         }
     }
@@ -173,6 +188,34 @@ mod tests {
         assert_eq!(provider.name(), "fake");
         assert_eq!(response.text, "hello world");
         assert_eq!(response.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn usage_total_adds_input_and_output_tokens() {
+        let response = ModelResponse {
+            text: "usage".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: Some(Usage {
+                input_tokens: 11,
+                output_tokens: 7,
+            }),
+        };
+
+        let usage = response.usage.as_ref().expect("usage should be present");
+        assert_eq!(usage.total(), 18);
+    }
+
+    #[test]
+    fn model_response_without_usage_represents_unknown_usage() {
+        let response = ModelResponse {
+            text: "no usage".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        };
+
+        assert_eq!(response.usage, None);
     }
 
     #[tokio::test]

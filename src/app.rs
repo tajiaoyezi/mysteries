@@ -77,6 +77,7 @@ pub fn select_provider(
             text: "mock response".to_string(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
+            usage: None,
         }]))),
     }
 }
@@ -365,11 +366,13 @@ kind = "mock"
                     arguments: json!({ "path": "note.txt", "content": "created" }),
                 }],
                 finish_reason: FinishReason::ToolCalls,
+                usage: None,
             },
             ModelResponse {
                 text: "done".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
+                usage: None,
             },
         ]));
         let agent = assemble_agent(Box::new(provider.clone()), &config, Box::new(AllowAll));

@@ -71,6 +71,7 @@ impl OpenAiProvider {
     pub fn build_request_body(&self, req: &ModelRequest) -> Value {
         let mut body = wire::serialize_request(req);
         body["stream"] = Value::Bool(true);
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
         body
     }
 
@@ -396,6 +397,7 @@ mod tests {
         );
         assert_eq!(body["model"], json!("gpt-test"));
         assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
         assert_eq!(body["max_tokens"], json!(128));
         assert_eq!(
             body["messages"][0],

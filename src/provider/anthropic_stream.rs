@@ -1,6 +1,6 @@
 use crate::error::ProviderError;
 use crate::provider::transport::SseAccumulator;
-use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall};
+use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall, Usage};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -9,6 +9,9 @@ pub struct AnthropicAccumulator {
     text: String,
     tool_calls: BTreeMap<usize, PartialToolUse>,
     finish_reason: FinishReason,
+    usage_input_tokens: Option<u32>,
+    usage_output_tokens: Option<u32>,
+    usage_parse_failed: bool,
     finished: bool,
 }
 
@@ -26,6 +29,9 @@ impl AnthropicAccumulator {
             text: String::new(),
             tool_calls: BTreeMap::new(),
             finish_reason: FinishReason::Other(String::new()),
+            usage_input_tokens: None,
+            usage_output_tokens: None,
+            usage_parse_failed: false,
             finished: false,
         }
     }
@@ -91,6 +97,7 @@ impl AnthropicAccumulator {
             .or(event_name.as_deref());
 
         match event_type {
+            Some("message_start") => self.apply_message_start(&body),
             Some("content_block_start") => self.apply_content_block_start(&body)?,
             Some("content_block_delta") => self.apply_content_block_delta(&body, sink)?,
             Some("message_delta") => self.apply_message_delta(&body),
@@ -98,7 +105,7 @@ impl AnthropicAccumulator {
                 self.finished = true;
                 return self.finish().map(Some);
             }
-            Some("message_start" | "content_block_stop" | "ping") | None => {}
+            Some("content_block_stop" | "ping") | None => {}
             Some(_) => {}
         }
 
@@ -136,6 +143,17 @@ impl AnthropicAccumulator {
         }
 
         Ok(())
+    }
+
+    fn apply_message_start(&mut self, body: &Value) {
+        let Some(usage) = body.get("message").and_then(|message| message.get("usage")) else {
+            return;
+        };
+
+        match optional_u32_field(usage, "input_tokens") {
+            Ok(tokens) => self.usage_input_tokens = Some(tokens.unwrap_or(0)),
+            Err(()) => self.usage_parse_failed = true,
+        }
     }
 
     fn apply_content_block_delta(
@@ -184,6 +202,15 @@ impl AnthropicAccumulator {
         {
             self.finish_reason = parse_finish_reason(reason);
         }
+
+        let Some(usage) = body.get("usage") else {
+            return;
+        };
+
+        match optional_u32_field(usage, "output_tokens") {
+            Ok(tokens) => self.usage_output_tokens = Some(tokens.unwrap_or(0)),
+            Err(()) => self.usage_parse_failed = true,
+        }
     }
 
     pub fn finish(&self) -> Result<ModelResponse, ProviderError> {
@@ -218,6 +245,21 @@ impl AnthropicAccumulator {
             text: self.text.clone(),
             tool_calls,
             finish_reason: self.finish_reason.clone(),
+            usage: self.usage(),
+        })
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        if self.usage_parse_failed {
+            return None;
+        }
+        if self.usage_input_tokens.is_none() && self.usage_output_tokens.is_none() {
+            return None;
+        }
+
+        Some(Usage {
+            input_tokens: self.usage_input_tokens.unwrap_or(0),
+            output_tokens: self.usage_output_tokens.unwrap_or(0),
         })
     }
 }
@@ -247,6 +289,17 @@ fn required_index(body: &Value) -> Result<usize, ProviderError> {
         .and_then(Value::as_u64)
         .map(|index| index as usize)
         .ok_or_else(|| ProviderError::Decode("content_block.index missing".to_string()))
+}
+
+fn optional_u32_field(value: &Value, field: &str) -> Result<Option<u32>, ()> {
+    let Some(value) = value.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .map(Some)
+        .ok_or(())
 }
 
 fn parse_finish_reason(reason: &str) -> FinishReason {
@@ -281,7 +334,7 @@ mod tests {
     use super::AnthropicAccumulator;
     use crate::error::ProviderError;
     use crate::provider::transport::accumulate_stream;
-    use crate::provider::{DeltaSink, FinishReason, ToolCall};
+    use crate::provider::{DeltaSink, FinishReason, ToolCall, Usage};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -374,6 +427,80 @@ data: {"type":"message_stop"}
             }]
         );
         assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 472,
+                output_tokens: 89,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_without_usage_returns_none() {
+        let sink = CaptureSink::new();
+        let stream = futures_util::stream::iter([Ok::<_, &'static str>(
+            br#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+        )]);
+
+        let response =
+            accumulate_stream(stream, &sink, AnthropicAccumulator::new(), PROVIDER_LABEL)
+                .await
+                .unwrap();
+
+        assert_eq!(response.text, "Hello");
+        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(response.usage, None);
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_message_start_usage_without_delta_uses_zero_output_tokens() {
+        let sink = CaptureSink::new();
+        let stream = futures_util::stream::iter([Ok::<_, &'static str>(
+            br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","usage":{"input_tokens":33},"content":[],"stop_reason":null}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+        )]);
+
+        let response =
+            accumulate_stream(stream, &sink, AnthropicAccumulator::new(), PROVIDER_LABEL)
+                .await
+                .unwrap();
+
+        assert_eq!(response.text, "Hello");
+        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 33,
+                output_tokens: 0,
+            })
+        );
     }
 
     #[tokio::test]

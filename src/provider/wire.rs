@@ -114,6 +114,7 @@ pub fn parse_response(body: &Value) -> Result<ModelResponse, ProviderError> {
         text,
         tool_calls,
         finish_reason,
+        usage: None,
     })
 }
 
@@ -329,6 +330,7 @@ mod tests {
                 text: "hello".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
+                usage: None,
             }
         );
     }

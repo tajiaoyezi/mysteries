@@ -309,6 +309,7 @@ mod tests {
             text: text.to_string(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
+            usage: None,
         }
     }
 
@@ -317,6 +318,7 @@ mod tests {
             text: String::new(),
             tool_calls,
             finish_reason: FinishReason::ToolCalls,
+            usage: None,
         }
     }
 
