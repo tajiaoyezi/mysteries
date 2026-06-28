@@ -1,4 +1,7 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
 use thiserror::Error;
 
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
@@ -17,7 +20,7 @@ pub struct Config {
     pub keep_recent_turns: u32,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct RawConfig {
     #[serde(default)]
     pub provider: Option<RawProviderConfig>,
@@ -42,7 +45,7 @@ pub struct ProviderConfig {
     pub auth_type: AuthType,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RawProviderConfig {
     #[serde(default)]
     pub kind: Option<ProviderKind>,
@@ -52,7 +55,7 @@ pub struct RawProviderConfig {
     pub auth_type: Option<AuthType>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     OpenAi,
@@ -60,7 +63,7 @@ pub enum ProviderKind {
     Mock,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthType {
     ApiKey,
@@ -75,6 +78,47 @@ pub enum ConfigError {
     MissingField(&'static str),
     #[error("invalid config value: {0}")]
     InvalidValue(&'static str),
+    #[error("failed to write config: {0}")]
+    Write(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigWritePatch {
+    pub provider_kind: ProviderKind,
+    pub base_url: Option<String>,
+    pub model: String,
+}
+
+pub fn read_raw_config(path: &Path) -> Result<RawConfig, ConfigError> {
+    match fs::read_to_string(path) {
+        Ok(source) => parse(&source),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(RawConfig::default()),
+        Err(err) => Err(ConfigError::Write(err.to_string())),
+    }
+}
+
+pub fn write_config(path: &Path, patch: &ConfigWritePatch) -> Result<(), ConfigError> {
+    let mut raw = read_raw_config(path)?;
+
+    raw.model = Some(patch.model.clone());
+    let mut provider = raw.provider.take().unwrap_or_default();
+    provider.kind = Some(patch.provider_kind.clone());
+    provider.base_url = patch.base_url.clone();
+    if provider.auth_type.is_none() {
+        provider.auth_type = Some(AuthType::ApiKey);
+    }
+    raw.provider = Some(provider);
+
+    let serialized =
+        toml::to_string_pretty(&raw).map_err(|err| ConfigError::Toml(err.to_string()))?;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| ConfigError::Write(err.to_string()))?;
+        }
+    }
+    fs::write(path, serialized.as_bytes()).map_err(|err| ConfigError::Write(err.to_string()))?;
+    Ok(())
 }
 
 pub fn parse(source: &str) -> Result<RawConfig, ConfigError> {
@@ -143,9 +187,11 @@ pub fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge, parse, resolve, AuthType, ConfigError, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
-        DEFAULT_KEEP_RECENT_TURNS, DEFAULT_TIMEOUT_SECS,
+        merge, parse, read_raw_config, resolve, write_config, AuthType, ConfigError,
+        ConfigWritePatch, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS,
+        DEFAULT_TIMEOUT_SECS,
     };
+    use std::fs;
 
     #[test]
     fn parse_partial_toml_sets_some_and_missing_fields_to_none() {
@@ -382,5 +428,100 @@ auth_type = "api_key"
                 "ratio {invalid} should be invalid: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn write_config_merges_model_and_preserves_other_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+model = "old"
+max_iterations = 40
+
+[provider]
+kind = "anthropic"
+auth_type = "api_key"
+"#,
+        )
+        .unwrap();
+
+        write_config(
+            &path,
+            &ConfigWritePatch {
+                provider_kind: ProviderKind::Anthropic,
+                base_url: None,
+                model: "new".to_string(),
+            },
+        )
+        .unwrap();
+
+        let raw = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.model.as_deref(), Some("new"));
+        assert_eq!(raw.max_iterations, Some(40));
+        assert_eq!(
+            raw.provider.as_ref().unwrap().kind,
+            Some(ProviderKind::Anthropic)
+        );
+    }
+
+    #[test]
+    fn write_config_merges_provider_kind_and_base_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+model = "old"
+max_iterations = 40
+
+[provider]
+kind = "anthropic"
+base_url = "https://old.example/v1"
+auth_type = "api_key"
+"#,
+        )
+        .unwrap();
+
+        write_config(
+            &path,
+            &ConfigWritePatch {
+                provider_kind: ProviderKind::OpenAi,
+                base_url: Some("https://new.example/v1".to_string()),
+                model: "new".to_string(),
+            },
+        )
+        .unwrap();
+
+        let raw = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.model.as_deref(), Some("new"));
+        assert_eq!(raw.max_iterations, Some(40));
+        let provider = raw.provider.unwrap();
+        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+        assert_eq!(provider.base_url.as_deref(), Some("https://new.example/v1"));
+    }
+
+    #[test]
+    fn write_config_creates_file_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+
+        write_config(
+            &path,
+            &ConfigWritePatch {
+                provider_kind: ProviderKind::OpenAi,
+                base_url: None,
+                model: "m".to_string(),
+            },
+        )
+        .unwrap();
+
+        let raw = read_raw_config(&path).unwrap();
+        assert_eq!(raw.model.as_deref(), Some("m"));
+        assert_eq!(
+            raw.provider.as_ref().unwrap().kind,
+            Some(ProviderKind::OpenAi)
+        );
     }
 }

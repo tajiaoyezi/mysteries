@@ -1,4 +1,4 @@
-use mysteries::cli::{run_cli, CliError, CliPaths};
+use mysteries::cli::{run_auth_interactive, run_cli, AuthPaths, CliError, CliPaths};
 use mysteries::tui::run_tui;
 use std::env;
 use std::io;
@@ -8,6 +8,14 @@ use std::path::PathBuf;
 async fn main() -> Result<(), CliError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let paths = default_paths()?;
+
+    if args.first().map(String::as_str) == Some("auth") {
+        let auth_paths = AuthPaths {
+            user_config: paths.user_config,
+            credentials: paths.credentials,
+        };
+        return run_auth_interactive(&auth_paths).map_err(Into::into);
+    }
 
     if args.iter().any(|arg| arg == "--headless") {
         let prompt = read_prompt(&args)?;
