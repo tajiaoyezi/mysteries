@@ -5,13 +5,11 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹accent.primary›> ‹/›‹text.primary›总结这个项目‹/›
-
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=note.txt‹/›‹text.secondary›  只读 · 自动运行 · 2 行 ⌄‹/›
-
-‹info.fg›◆ ‹/›‹text.body›这是一个 Rust 编写的终端编码助手。‹/›
-
-
+‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› {"path":"note.txt"}‹/›
+‹border.subtle›│ ‹/›‹text.body›pub struct Config {‹/›
+‹border.subtle›│ ‹/›‹text.body›    pub timeout_secs: u64,‹/›
+‹border.subtle›│ ‹/›‹text.body›}‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
 
 
 
@@ -22,7 +20,9 @@ expression: text
 
 
 
-‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                         mock · mock-model · iter 0/4 · 2 msgs · .‹/›
+
+
+‹text.secondary›status: ‹/›‹text.muted›◇ 就绪                         mock · mock-model · iter 0/4 · 0 msgs · .‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›

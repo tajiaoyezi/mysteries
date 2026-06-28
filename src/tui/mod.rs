@@ -9,6 +9,8 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use futures_util::StreamExt;
+use std::fs::OpenOptions;
+use std::io::Write;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 
@@ -54,6 +56,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     });
     let mut events = EventStream::new();
     let theme = theme::Theme::midnight();
+    let debug_events = debug_events_enabled();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -65,25 +68,33 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
         tokio::select! {
             event = events.next() => {
                 match event {
-                    Some(Ok(Event::Key(key))) => {
-                        if !is_key_press(key) {
-                            continue;
+                    Some(Ok(event)) => {
+                        if debug_events {
+                            append_debug_event_line(&debug_event_line(&event));
                         }
-                        if should_exit(&state, key) {
-                            break;
-                        }
-                        if !handle_scroll_key(&mut terminal, &mut state, key, &theme)? {
-                            state.on_key_with_interrupt(key, &input_tx, &interrupt_tx);
-                            if state.should_exit {
-                                break;
+
+                        match event {
+                            Event::Key(key) => {
+                                if !is_key_press(key) {
+                                    continue;
+                                }
+                                if should_exit(&state, key) {
+                                    break;
+                                }
+                                if !handle_scroll_key(&mut terminal, &mut state, key, &theme)? {
+                                    state.on_key_with_interrupt(key, &input_tx, &interrupt_tx);
+                                    if state.should_exit {
+                                        break;
+                                    }
+                                }
                             }
+                            Event::Mouse(mouse) => {
+                                handle_scroll_mouse(&mut terminal, &mut state, mouse, &theme)?;
+                            }
+                            Event::Resize(_, _) => {}
+                            Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
                         }
                     }
-                    Some(Ok(Event::Mouse(mouse))) => {
-                        handle_scroll_mouse(&mut terminal, &mut state, mouse, &theme)?;
-                    }
-                    Some(Ok(Event::Resize(_, _))) => {}
-                    Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(CliError::Io(err.to_string())),
                     None => break,
                 }
@@ -109,6 +120,18 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let _ = agent_handle.await;
 
     Ok(())
+}
+
+fn debug_events_enabled() -> bool {
+    std::env::var_os("MYSTERIES_TUI_DEBUG_EVENTS")
+        .is_some_and(|value| !value.as_os_str().is_empty())
+}
+
+fn append_debug_event_line(line: &str) {
+    let path = std::env::temp_dir().join("mysteries-tui-events.log");
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
@@ -137,13 +160,27 @@ fn handle_scroll_key(
         return Ok(false);
     }
 
-    let scroll = match key.code {
-        KeyCode::PageUp => app::AppState::page_up,
-        KeyCode::PageDown => app::AppState::page_down,
-        _ => return Ok(false),
+    let Some(scroll) = scroll_action_for_key(key) else {
+        return Ok(false);
     };
     apply_scroll(terminal, state, theme, scroll)?;
     Ok(true)
+}
+
+fn scroll_action_for_key(key: KeyEvent) -> Option<fn(&mut app::AppState, usize, usize)> {
+    if !is_key_press(key) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Up => Some(scroll_up_one_line),
+        KeyCode::Down => Some(scroll_down_one_line),
+        KeyCode::PageUp => Some(app::AppState::page_up),
+        KeyCode::PageDown => Some(app::AppState::page_down),
+        KeyCode::Home => Some(app::AppState::scroll_to_top),
+        KeyCode::End => Some(app::AppState::scroll_to_bottom),
+        _ => None,
+    }
 }
 
 fn handle_scroll_mouse(
@@ -181,6 +218,90 @@ fn scroll_up_lines(state: &mut app::AppState, total_lines: usize, viewport_lines
 
 fn scroll_down_lines(state: &mut app::AppState, total_lines: usize, viewport_lines: usize) {
     state.scroll_down(total_lines, viewport_lines, MOUSE_SCROLL_LINES);
+}
+
+fn scroll_up_one_line(state: &mut app::AppState, total_lines: usize, viewport_lines: usize) {
+    state.scroll_up(total_lines, viewport_lines, 1);
+}
+
+fn scroll_down_one_line(state: &mut app::AppState, total_lines: usize, viewport_lines: usize) {
+    state.scroll_down(total_lines, viewport_lines, 1);
+}
+
+fn debug_event_line(event: &Event) -> String {
+    match event {
+        Event::Key(key) => format!(
+            "event=key code={} kind={:?} modifiers={}",
+            debug_key_code(key.code),
+            key.kind,
+            debug_modifiers(key.modifiers)
+        ),
+        Event::Mouse(mouse) => format!(
+            "event=mouse kind={:?} column={} row={} modifiers={}",
+            mouse.kind,
+            mouse.column,
+            mouse.row,
+            debug_modifiers(mouse.modifiers)
+        ),
+        Event::Paste(text) => format!("event=paste len={}", text.chars().count()),
+        Event::Resize(columns, rows) => format!("event=resize columns={columns} rows={rows}"),
+        Event::FocusGained => "event=focus_gained".to_string(),
+        Event::FocusLost => "event=focus_lost".to_string(),
+    }
+}
+
+fn debug_modifiers(modifiers: KeyModifiers) -> String {
+    if modifiers.is_empty() {
+        return "NONE".to_string();
+    }
+
+    let mut labels = Vec::new();
+    for (flag, label) in [
+        (KeyModifiers::SHIFT, "SHIFT"),
+        (KeyModifiers::CONTROL, "CONTROL"),
+        (KeyModifiers::ALT, "ALT"),
+        (KeyModifiers::SUPER, "SUPER"),
+        (KeyModifiers::HYPER, "HYPER"),
+        (KeyModifiers::META, "META"),
+    ] {
+        if modifiers.contains(flag) {
+            labels.push(label);
+        }
+    }
+
+    labels.join("|")
+}
+
+fn debug_key_code(code: KeyCode) -> String {
+    match code {
+        KeyCode::Char(_) => "Char(<redacted>)".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PageUp".to_string(),
+        KeyCode::PageDown => "PageDown".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::BackTab => "BackTab".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::Insert => "Insert".to_string(),
+        KeyCode::F(number) => format!("F({number})"),
+        KeyCode::Null => "Null".to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::CapsLock => "CapsLock".to_string(),
+        KeyCode::ScrollLock => "ScrollLock".to_string(),
+        KeyCode::NumLock => "NumLock".to_string(),
+        KeyCode::PrintScreen => "PrintScreen".to_string(),
+        KeyCode::Pause => "Pause".to_string(),
+        KeyCode::Menu => "Menu".to_string(),
+        KeyCode::KeypadBegin => "KeypadBegin".to_string(),
+        KeyCode::Media(key) => format!("Media({key:?})"),
+        KeyCode::Modifier(modifier) => format!("Modifier({modifier:?})"),
+    }
 }
 
 fn is_key_press(key: KeyEvent) -> bool {
@@ -246,7 +367,7 @@ fn error_message(err: AgentError) -> String {
 #[cfg(test)]
 mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
-    use super::{run_agent_task, should_exit};
+    use super::{run_agent_task, scroll_action_for_key, should_exit};
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
     use crate::app::assemble_agent;
@@ -259,13 +380,32 @@ mod tests {
     };
     use crate::tool::ToolContext;
     use async_trait::async_trait;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    };
     use serde_json::json;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::{timeout, Duration};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn apply_scroll_key_for_test(
+        state: &mut super::app::AppState,
+        key: KeyEvent,
+        total_lines: usize,
+        viewport_lines: usize,
+    ) -> bool {
+        let Some(scroll) = scroll_action_for_key(key) else {
+            return false;
+        };
+        scroll(state, total_lines, viewport_lines);
+        true
+    }
 
     fn config() -> Config {
         Config {
@@ -371,6 +511,171 @@ mod tests {
             &pending,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
         ));
+    }
+
+    #[test]
+    fn scroll_key_routing_maps_line_and_boundary_keys_only_for_press() {
+        let mut state = super::app::AppState::new();
+
+        assert!(
+            apply_scroll_key_for_test(&mut state, key(KeyCode::Up), 40, 5),
+            "Up should be handled as one-line scroll up"
+        );
+        assert_eq!(state.visible_scroll_offset(40, 5), 34);
+        assert_eq!(state.visible_scroll_offset(50, 5), 34);
+
+        assert!(apply_scroll_key_for_test(
+            &mut state,
+            key(KeyCode::Down),
+            40,
+            5
+        ));
+        assert_eq!(state.visible_scroll_offset(40, 5), 35);
+        assert_eq!(state.visible_scroll_offset(50, 5), 45);
+
+        state.scroll_up(40, 5, 10);
+        assert!(apply_scroll_key_for_test(
+            &mut state,
+            key(KeyCode::Home),
+            40,
+            5
+        ));
+        assert_eq!(state.visible_scroll_offset(40, 5), 0);
+        assert_eq!(state.visible_scroll_offset(50, 5), 0);
+
+        assert!(apply_scroll_key_for_test(
+            &mut state,
+            key(KeyCode::End),
+            40,
+            5
+        ));
+        assert_eq!(state.visible_scroll_offset(40, 5), 35);
+        assert_eq!(state.visible_scroll_offset(50, 5), 45);
+
+        let before = state.visible_scroll_offset(40, 5);
+        assert!(!apply_scroll_key_for_test(
+            &mut state,
+            KeyEvent::new_with_kind(KeyCode::Up, KeyModifiers::NONE, KeyEventKind::Release),
+            40,
+            5
+        ));
+        assert!(!apply_scroll_key_for_test(
+            &mut state,
+            KeyEvent::new_with_kind(KeyCode::End, KeyModifiers::NONE, KeyEventKind::Repeat),
+            40,
+            5
+        ));
+        assert_eq!(state.visible_scroll_offset(40, 5), before);
+    }
+
+    #[test]
+    fn keyboard_boundary_navigation_reaches_top_and_bottom_without_mouse_events() {
+        let mut state = super::app::AppState::new();
+
+        assert!(apply_scroll_key_for_test(
+            &mut state,
+            key(KeyCode::Home),
+            40,
+            5
+        ));
+        assert_eq!(state.visible_scroll_offset(40, 5), 0);
+        assert_eq!(
+            state.visible_scroll_offset(50, 5),
+            0,
+            "Home should stop following bottom without relying on mouse events"
+        );
+
+        assert!(apply_scroll_key_for_test(
+            &mut state,
+            key(KeyCode::End),
+            40,
+            5
+        ));
+        assert_eq!(state.visible_scroll_offset(40, 5), 35);
+        assert_eq!(
+            state.visible_scroll_offset(50, 5),
+            45,
+            "End should restore bottom following without relying on mouse events"
+        );
+    }
+
+    #[test]
+    fn repeated_line_keys_match_mouse_scroll_line_primitives() {
+        let mut keyboard = super::app::AppState::new();
+        let mut mouse = super::app::AppState::new();
+
+        for _ in 0..super::MOUSE_SCROLL_LINES {
+            assert!(apply_scroll_key_for_test(
+                &mut keyboard,
+                key(KeyCode::Up),
+                40,
+                5
+            ));
+        }
+        super::scroll_up_lines(&mut mouse, 40, 5);
+
+        assert_eq!(
+            keyboard.visible_scroll_offset(40, 5),
+            mouse.visible_scroll_offset(40, 5)
+        );
+        assert_eq!(
+            keyboard.visible_scroll_offset(50, 5),
+            mouse.visible_scroll_offset(50, 5)
+        );
+
+        for _ in 0..super::MOUSE_SCROLL_LINES {
+            assert!(apply_scroll_key_for_test(
+                &mut keyboard,
+                key(KeyCode::Down),
+                40,
+                5
+            ));
+        }
+        super::scroll_down_lines(&mut mouse, 40, 5);
+
+        assert_eq!(
+            keyboard.visible_scroll_offset(40, 5),
+            mouse.visible_scroll_offset(40, 5)
+        );
+        assert_eq!(
+            keyboard.visible_scroll_offset(50, 5),
+            mouse.visible_scroll_offset(50, 5)
+        );
+    }
+
+    #[test]
+    fn debug_event_line_formats_known_events_and_redacts_char_payloads() {
+        let paste_line = super::debug_event_line(&Event::Paste("secret-prompt-body".into()));
+        assert_eq!(paste_line, "event=paste len=18");
+        assert!(
+            !paste_line.contains("secret") && !paste_line.contains("prompt"),
+            "diagnostic output must not record pasted prompt text"
+        );
+
+        let mouse_line = super::debug_event_line(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 7,
+            row: 9,
+            modifiers: KeyModifiers::SHIFT,
+        }));
+        assert_eq!(
+            mouse_line,
+            "event=mouse kind=ScrollUp column=7 row=9 modifiers=SHIFT"
+        );
+
+        let key_line = super::debug_event_line(&Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(
+            key_line,
+            "event=key code=Char(<redacted>) kind=Press modifiers=CONTROL"
+        );
+        assert!(
+            !key_line.contains('x'),
+            "diagnostic output must not record prompt text or typed characters"
+        );
     }
 
     #[tokio::test]

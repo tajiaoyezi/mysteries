@@ -516,36 +516,17 @@ fn error_block_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
 }
 
 fn tool_card_lines(card: &ToolCard, state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
-    let (glyph, glyph_color) = match card.status {
-        ToolCardStatus::Running => (state.spinner_glyph(), theme.accent_primary),
-        ToolCardStatus::Done => ("✓", theme.success_fg),
-        ToolCardStatus::Error => ("✗", theme.error_fg),
+    let args = if state.tools_expanded {
+        card.args.to_string()
+    } else {
+        tool_args_preview(&card.name, &card.args)
     };
-    let mut head = vec![
-        Span::styled(
-            "┌─ ",
-            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
-        ),
-        Span::styled(glyph, Style::default().fg(glyph_color).bg(theme.bg_base)),
-        Span::styled(" ", Style::default().fg(theme.text_muted).bg(theme.bg_base)),
-        Span::styled(
-            card.name.clone(),
-            Style::default()
-                .fg(theme.accent_primary)
-                .bg(theme.bg_base)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {}", card.args),
-            Style::default().fg(theme.text_muted).bg(theme.bg_base),
-        ),
-    ];
-    if card.readonly {
-        head.push(Span::styled(
-            "  只读 · 自动运行",
-            Style::default().fg(theme.text_secondary).bg(theme.bg_base),
-        ));
+    let mut head = tool_card_head(card, state, theme, args);
+    if !state.tools_expanded {
+        head.extend(collapsed_tool_summary(card, theme));
+        return vec![Line::from(head)];
     }
+
     let mut lines = vec![Line::from(head)];
 
     match &card.output {
@@ -594,6 +575,108 @@ fn tool_card_lines(card: &ToolCard, state: &AppState, theme: &Theme) -> Vec<Line
         Style::default().fg(theme.border_subtle).bg(theme.bg_base),
     )));
     lines
+}
+
+fn tool_card_head(
+    card: &ToolCard,
+    state: &AppState,
+    theme: &Theme,
+    args: String,
+) -> Vec<Span<'static>> {
+    let (glyph, glyph_color) = match card.status {
+        ToolCardStatus::Running => (state.spinner_glyph(), theme.accent_primary),
+        ToolCardStatus::Done => ("✓", theme.success_fg),
+        ToolCardStatus::Error => ("✗", theme.error_fg),
+    };
+    let mut head = vec![
+        Span::styled(
+            "┌─ ",
+            Style::default().fg(theme.border_subtle).bg(theme.bg_base),
+        ),
+        Span::styled(glyph, Style::default().fg(glyph_color).bg(theme.bg_base)),
+        Span::styled(" ", Style::default().fg(theme.text_muted).bg(theme.bg_base)),
+        Span::styled(
+            card.name.clone(),
+            Style::default()
+                .fg(theme.accent_primary)
+                .bg(theme.bg_base)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {args}"),
+            Style::default().fg(theme.text_muted).bg(theme.bg_base),
+        ),
+    ];
+    if card.readonly {
+        head.push(Span::styled(
+            "  只读 · 自动运行",
+            Style::default().fg(theme.text_secondary).bg(theme.bg_base),
+        ));
+    }
+    head
+}
+
+fn collapsed_tool_summary(card: &ToolCard, theme: &Theme) -> Vec<Span<'static>> {
+    if matches!(card.status, ToolCardStatus::Running) {
+        return vec![Span::styled(
+            " · 运行中…",
+            Style::default().fg(theme.text_secondary).bg(theme.bg_base),
+        )];
+    }
+
+    if let Some(exit) = card.exit {
+        let color = if exit == 0 {
+            theme.success_fg
+        } else {
+            theme.error_fg
+        };
+        return vec![Span::styled(
+            format!(" · exit {exit}"),
+            Style::default().fg(color).bg(theme.bg_base),
+        )];
+    }
+
+    match &card.output {
+        Some(output) if !output.is_empty() => {
+            let line_count = visible_tool_output_lines(card, output).len();
+            vec![Span::styled(
+                format!(" · {line_count} 行 ⌄"),
+                Style::default().fg(theme.text_secondary).bg(theme.bg_base),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn tool_args_preview(tool_name: &str, args: &serde_json::Value) -> String {
+    match tool_name {
+        "read_file" | "list_dir" | "write_file" | "edit_file" => args
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| format!("path={path}"))
+            .unwrap_or_else(|| args.to_string()),
+        "run_shell" => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|command| format!("command={command}"))
+            .unwrap_or_else(|| args.to_string()),
+        "glob" => args
+            .get("pattern")
+            .and_then(serde_json::Value::as_str)
+            .map(|pattern| format!("pattern={pattern}"))
+            .unwrap_or_else(|| args.to_string()),
+        "grep" => {
+            let pattern = args.get("pattern").and_then(serde_json::Value::as_str);
+            let path = args.get("path").and_then(serde_json::Value::as_str);
+            match (pattern, path) {
+                (Some(pattern), Some(path)) => format!("pattern={pattern} path={path}"),
+                (Some(pattern), None) => format!("pattern={pattern}"),
+                (None, Some(path)) => format!("path={path}"),
+                (None, None) => args.to_string(),
+            }
+        }
+        _ => args.to_string(),
+    }
 }
 
 fn tool_output_line(text: &str, theme: &Theme) -> Line<'static> {
@@ -1224,6 +1307,25 @@ mod tests {
     }
 
     #[test]
+    fn tool_card_expanded_done_snapshot() {
+        let mut state = AppState::new();
+        state.tools_expanded = true;
+        state.transcript.push(TranscriptBlock::Tool(tool_card(
+            "write_file",
+            ToolCardStatus::Done,
+            Some("pub struct Config {\n    pub timeout_secs: u64,\n}"),
+            false,
+            false,
+        )));
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!(
+            "\n--- tool card expanded done frame ---\n{text}\n--- end tool card expanded done frame ---"
+        );
+        insta::assert_snapshot!("tui_tool_card_expanded_done", text);
+    }
+
+    #[test]
     fn tool_card_error_snapshot() {
         let mut state = AppState::new();
         state.transcript.push(TranscriptBlock::Tool(tool_card(
@@ -1281,6 +1383,30 @@ mod tests {
 
         println!("\n--- timeline final answer frame ---\n{text}\n--- end timeline final answer frame ---");
         insta::assert_snapshot!("tui_timeline_tool_then_final_answer", text);
+    }
+
+    #[test]
+    fn folding_only_affects_tool_blocks_snapshot() {
+        let mut state = AppState::new();
+        state.transcript.push(TranscriptBlock::User(
+            "第一行用户消息\n第二行用户消息仍然完整显示".to_string(),
+        ));
+        state.transcript.push(TranscriptBlock::Tool(tool_card(
+            "read_file",
+            ToolCardStatus::Done,
+            Some("hidden line one\nhidden line two"),
+            true,
+            false,
+        )));
+        state.transcript.push(TranscriptBlock::Assistant(
+            "第一行最终回答\n第二行最终回答仍然完整显示".to_string(),
+        ));
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!(
+            "\n--- folding only tool blocks frame ---\n{text}\n--- end folding only tool blocks frame ---"
+        );
+        insta::assert_snapshot!("tui_folding_only_affects_tool_blocks", text);
     }
 
     #[test]

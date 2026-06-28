@@ -2,7 +2,7 @@ use crate::agent::AgentStatus;
 use crate::permission::PermissionDecision;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
 use crate::tui::command::{parse_command, Command};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -130,6 +130,7 @@ pub struct AppState {
     pub session: SessionSnapshot,
     pub iteration: u32,
     pub transcript: Vec<TranscriptBlock>,
+    pub tools_expanded: bool,
     pub input: String,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
@@ -149,6 +150,7 @@ impl AppState {
             session,
             iteration: 0,
             transcript: Vec::new(),
+            tools_expanded: false,
             input: String::new(),
             phase: Phase::Ready,
             pending_permission: None,
@@ -208,6 +210,15 @@ impl AppState {
         self.follows_bottom = next == bottom;
     }
 
+    pub fn scroll_to_top(&mut self, _total_lines: usize, _viewport_lines: usize) {
+        self.scroll_offset = 0;
+        self.follows_bottom = false;
+    }
+
+    pub fn scroll_to_bottom(&mut self, _total_lines: usize, _viewport_lines: usize) {
+        self.follows_bottom = true;
+    }
+
     pub fn scroll_up(&mut self, total_lines: usize, viewport_lines: usize, lines: usize) {
         let current = self.visible_scroll_offset(total_lines, viewport_lines);
         self.scroll_offset = current.saturating_sub(lines);
@@ -230,6 +241,10 @@ impl AppState {
 
     pub fn spinner_glyph(&self) -> &'static str {
         spinner_glyph(self.spinner_frame, true)
+    }
+
+    pub fn toggle_tools_expanded(&mut self) {
+        self.tools_expanded = !self.tools_expanded;
     }
 
     pub fn apply(&mut self, event: AgentEvent) {
@@ -333,6 +348,11 @@ impl AppState {
         interrupt_tx: Option<&mpsc::UnboundedSender<UserInput>>,
     ) {
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_tools_expanded();
             return;
         }
 
@@ -463,6 +483,14 @@ mod tests {
         KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
     }
 
+    fn key_with_modifiers_and_kind(
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        kind: KeyEventKind,
+    ) -> KeyEvent {
+        KeyEvent::new_with_kind(code, modifiers, kind)
+    }
+
     fn diff_line(kind: DiffKind, text: &str) -> DiffLine {
         DiffLine {
             kind,
@@ -555,6 +583,28 @@ mod tests {
         state.scroll_down(40, 5, 20);
         assert_eq!(state.visible_scroll_offset(40, 5), 35);
         assert_eq!(state.visible_scroll_offset(50, 5), 45);
+    }
+
+    #[test]
+    fn boundary_scroll_jumps_to_top_and_returns_to_followed_bottom() {
+        let mut state = AppState::new();
+
+        assert_eq!(state.visible_scroll_offset(40, 5), 35);
+        assert!(state.follows_bottom);
+
+        state.scroll_up(40, 5, 7);
+        assert_eq!(state.scroll_offset, 28);
+        assert_eq!(state.visible_scroll_offset(40, 5), 28);
+        assert!(!state.follows_bottom);
+
+        state.scroll_to_top(40, 5);
+        assert_eq!(state.scroll_offset, 0);
+        assert_eq!(state.visible_scroll_offset(40, 5), 0);
+        assert!(!state.follows_bottom);
+
+        state.scroll_to_bottom(40, 5);
+        assert!(state.follows_bottom);
+        assert_eq!(state.visible_scroll_offset(40, 5), 35);
     }
 
     #[test]
@@ -928,6 +978,131 @@ mod tests {
         state.on_key(key_with_kind(KeyCode::Char('a'), KeyEventKind::Repeat), &tx);
 
         assert_eq!(state.input, "a");
+    }
+
+    #[test]
+    fn ctrl_o_is_reserved_for_tool_expansion_and_never_enters_input() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        assert!(!state.tools_expanded);
+
+        state.on_key(
+            key_with_modifiers_and_kind(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            &tx,
+        );
+
+        assert!(
+            state.tools_expanded,
+            "ctrl+o Press should expand folded tool cards"
+        );
+        assert_eq!(
+            state.input, "",
+            "ctrl+o should toggle tool expansion instead of typing 'o'"
+        );
+        assert!(rx.try_recv().is_err());
+
+        state.on_key(
+            key_with_modifiers_and_kind(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            &tx,
+        );
+
+        assert!(
+            !state.tools_expanded,
+            "second ctrl+o Press should fold tool cards again"
+        );
+        assert_eq!(state.input, "");
+
+        state.input = "keep".to_string();
+        state.on_key(
+            key_with_modifiers_and_kind(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            ),
+            &tx,
+        );
+        state.on_key(
+            key_with_modifiers_and_kind(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+            &tx,
+        );
+
+        assert!(!state.tools_expanded);
+        assert_eq!(state.input, "keep");
+    }
+
+    #[test]
+    fn ctrl_o_toggles_during_pending_permission_without_answering_it() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (allow_tx, mut allow_rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "write_file".to_string(),
+            args: json!({}),
+            responder: allow_tx,
+        }));
+
+        state.on_key(
+            key_with_modifiers_and_kind(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            &input_tx,
+        );
+
+        assert!(state.tools_expanded);
+        assert!(state.pending_permission.is_some());
+        assert_eq!(state.phase, Phase::WaitingForPermission);
+        assert!(allow_rx.try_recv().is_err());
+
+        state.on_key(key(KeyCode::Char('y')), &input_tx);
+
+        assert_eq!(allow_rx.try_recv().unwrap(), PermissionDecision::Allow);
+        assert!(state.pending_permission.is_none());
+        assert_eq!(state.phase, Phase::Busy);
+        assert!(state.tools_expanded);
+    }
+
+    #[test]
+    fn ctrl_o_toggles_during_running_phase_without_interrupting_escape() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.phase = Phase::CallingModel;
+
+        state.on_key_with_interrupt(
+            key_with_modifiers_and_kind(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        assert!(state.tools_expanded);
+        assert_eq!(state.phase, Phase::CallingModel);
+        assert!(input_rx.try_recv().is_err());
+        assert!(interrupt_rx.try_recv().is_err());
+
+        state.on_key_with_interrupt(key(KeyCode::Esc), &input_tx, &interrupt_tx);
+
+        assert_eq!(interrupt_rx.try_recv().unwrap(), UserInput::Interrupt);
+        assert_eq!(state.phase, Phase::CallingModel);
+        assert!(state.tools_expanded);
     }
 
     #[test]

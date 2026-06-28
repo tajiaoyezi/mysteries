@@ -5,11 +5,11 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›│ ‹/›‹text.body›pub struct Config {‹/›
-‹border.subtle›│ ‹/›‹text.body›    pub model: String,‹/›
-‹border.subtle›│ ‹/›‹text.body›    pub max_iterations: u32,‹/›
-‹border.subtle›│ ‹/›‹text.body›}‹/›
-‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
+‹accent.primary›> ‹/›‹text.primary›在 Config 里加一个 timeout_secs 字段,默认 30 秒‹/›
+
+‹info.fg›◆ ‹/›‹text.body›好的。我先读一下 src/config/schema.rs 里 Config 的结构。‹/›
+
+‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=schema.rs‹/›‹text.secondary›  只读 · 自动运行 · 4 行 ⌄‹/›
 
 ‹info.fg›◆ ‹/›‹text.body›结构清楚了。我在 Config 上加 timeout_secs: u64,并在 Default 里给默认值 30。‹/›
 

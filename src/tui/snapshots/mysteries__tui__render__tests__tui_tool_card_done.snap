@@ -5,11 +5,11 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› {"path":"note.txt"}‹/›
-‹border.subtle›│ ‹/›‹text.body›pub struct Config {‹/›
-‹border.subtle›│ ‹/›‹text.body›    pub timeout_secs: u64,‹/›
-‹border.subtle›│ ‹/›‹text.body›}‹/›
-‹border.subtle›└──────────────────────────────────────────────────────────────────────────────‹/›
+‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› path=note.txt‹/›‹text.secondary› · 3 行 ⌄‹/›
+
+
+
+
 
 
 

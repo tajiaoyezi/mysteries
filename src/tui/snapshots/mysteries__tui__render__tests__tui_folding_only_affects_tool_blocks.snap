@@ -5,13 +5,13 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹accent.primary›> ‹/›‹text.primary›总结这个项目‹/›
+‹accent.primary›> ‹/›‹text.primary›第一行用户消息‹/›
+‹text.primary›  第二行用户消息仍然完整显示‹/›
 
 ‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=note.txt‹/›‹text.secondary›  只读 · 自动运行 · 2 行 ⌄‹/›
 
-‹info.fg›◆ ‹/›‹text.body›这是一个 Rust 编写的终端编码助手。‹/›
-
-
+‹info.fg›◆ ‹/›‹text.body›第一行最终回答‹/›
+‹text.body›  第二行最终回答仍然完整显示‹/›
 
 
 
