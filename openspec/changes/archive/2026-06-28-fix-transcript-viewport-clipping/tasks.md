@@ -24,4 +24,4 @@
 - [x] 3.1 `cargo build` 通过;`cargo test` 全绿。
 - [x] 3.2 迁移因去 `.wrap` 漂移的 insta 快照(若有;80 宽默认帧通常不变,仅含 >80 宽行的帧可能变),人工审后更新锁定。
 - [x] 3.3 `openspec validate fix-transcript-viewport-clipping --strict` 通过。
-- [ ] 3.4 TUI 手动冒烟:窄终端下发消息后,最新 `User`/`Assistant` **立即可见**(不再等模型继续输出才「顶上来」);含工具卡 / 长输出的会话滚动正常。
+- [x] 3.4 TUI 手动冒烟:窄终端下发消息后,最新 `User`/`Assistant` **立即可见**(不再等模型继续输出才「顶上来」);含工具卡 / 长输出的会话滚动正常。

@@ -41,6 +41,6 @@
 
 ## 6. 收尾验证
 
-- [ ] 6.1 `cargo build` 通过;`cargo test` 全绿(含新红-绿与迁移后的 insta)。
-- [ ] 6.2 `openspec validate claude-code-style-loop --strict` 通过。
-- [ ] 6.3 TUI 手动冒烟(非自动):Esc 三态(等授权拒绝 / 运行中中断回 Idle 不退 / 就绪退出);一轮跑到自然结束后最终回答钉底可见;PageUp/PageDown + 鼠标滚轮滚动正常。
+- [x] 6.1 `cargo build` 通过;`cargo test` 全绿(含新红-绿与迁移后的 insta)。
+- [x] 6.2 `openspec validate claude-code-style-loop --strict` 通过。
+- [x] 6.3 TUI 手动冒烟(非自动):Esc 三态(等授权拒绝 / 运行中中断回 Idle 不退 / 就绪退出);一轮跑到自然结束后最终回答钉底可见;PageUp/PageDown + 鼠标滚轮滚动正常。

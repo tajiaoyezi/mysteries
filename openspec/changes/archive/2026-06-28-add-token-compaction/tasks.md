@@ -41,4 +41,4 @@
 - [x] 6.1 `cargo build` 通过;`cargo test` 全绿(含新红-绿 + 零回归)。
 - [x] 6.2 `openspec validate add-token-compaction --strict` 通过。
 - [x] 6.3 `cargo clippy --all-targets -- -D warnings` 零警告;`cargo fmt --check` 净。
-- [ ] 6.4 手动冒烟(非自动,留用户):配 `model_context_window` 后跑长会话触发自动压缩;`/compact` 手动触发;均最终回答可见、不崩。
+- [x] 6.4 手动冒烟(非自动,留用户):配 `model_context_window` 后跑长会话触发自动压缩;`/compact` 手动触发;均最终回答可见、不崩。

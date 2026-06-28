@@ -33,10 +33,10 @@
 - [x] 4.1 契约测(逻辑):纯键盘(**无任何 `MouseEvent`**)经 `scroll_to_top`/`scroll_to_bottom` 达顶 / 回底;行级键与鼠标滚轮共用同一 `scroll_up`/`scroll_down` 原语(键盘 = 滚轮能力超集)。
 - [x] 4.2 `terminal.rs` **不改**:确认鼠标捕获仍开启(根因在 ConPTY 平台、非捕获缺失);**不**新增 mouse capture 模式 / 事件路径(故 C 主线无新红灯)。
 - [x] 4.3 诊断:env `MYSTERIES_TUI_DEBUG_EVENTS` 门控,`run_tui` 把经过脱敏的原始 `Event` 摘要落日志;核心 `debug_event_line(&Event) -> String` 为纯函数——先写失败测(🔴 **红灯停点③**:新事件诊断路径首次成型,停下等确认),再绿。失败静默降级、不阻主循环;日志落 `std::env::temp_dir()` 下固定名;**禁记任何凭据**(CLAUDE.md)。
-- [ ] 4.4 手动冒烟(真机核验根因,非自动):在 Windows Terminal(记录 `conhost` 版本)下确认是否收到 `Event::Mouse(ScrollUp/Down)`;并验证键盘 `↑↓`/`PgUp·PgDn`/`Home·End` 全覆盖滚动正常(滚轮不转发时键盘兜底无损)。
+- [x] 4.4 手动冒烟(真机核验根因,非自动):在 Windows Terminal(记录 `conhost` 版本)下确认是否收到 `Event::Mouse(ScrollUp/Down)`;并验证键盘 `↑↓`/`PgUp·PgDn`/`Home·End` 全覆盖滚动正常(滚轮不转发时键盘兜底无损)。
 
 ## 5. 收尾验证
 
 - [x] 5.1 `cargo build` 通过;`cargo test` 全绿(含新红-绿与迁移后的 insta)。
 - [x] 5.2 `openspec validate improve-tui-interaction --strict` 通过。
-- [ ] 5.3 TUI 手动冒烟:工具卡默认折叠、`ctrl+o` 全局展开 / 折回;`↑↓`/`Home`/`End`/`PageUp`/`PageDown` 键盘全覆盖;滚轮在转发的终端可用、不转发时键盘兜底无损。
+- [x] 5.3 TUI 手动冒烟:工具卡默认折叠、`ctrl+o` 全局展开 / 折回;`↑↓`/`Home`/`End`/`PageUp`/`PageDown` 键盘全覆盖;滚轮在转发的终端可用、不转发时键盘兜底无损。

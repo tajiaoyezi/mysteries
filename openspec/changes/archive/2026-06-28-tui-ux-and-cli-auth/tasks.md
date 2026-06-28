@@ -43,4 +43,4 @@
 - [x] 7.1 `cargo build`/`cargo test`(全 target)全绿。
 - [x] 7.2 `openspec validate tui-ux-and-cli-auth --strict` 通过。
 - [x] 7.3 `cargo clippy --all-targets -- -D warnings` 零警告;`cargo fmt --check` 净。
-- [ ] 7.4 手动冒烟(留用户):`/` 补全;终端选择复制;状态栏在最底;`mysteries auth` 配置后进 TUI 可用。
+- [x] 7.4 手动冒烟(留用户):`/` 补全;终端选择复制;状态栏在最底;`mysteries auth` 配置后进 TUI 可用。
