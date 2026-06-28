@@ -1,8 +1,5 @@
-# builtin-commands Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change finish-1-0. Update Purpose after archive.
-## Requirements
 ### Requirement: slash 命令解析
 
 系统 SHALL 提供纯函数 `parse_command(input: &str) -> Option<Command>`:输入以 `/` 起头时解析为 `Command`(`Help` / `Clear` / `Model(Option<String>)` / `Status` / `Exit` / `Compact` / `Unknown(String)`),否则 `None`(当普通 prompt)。解析 MUST 不触发任何副作用(IO / 网络),可离线单测。系统 SHALL 额外提供内置命令**元数据**清单(每项:命令名 / 简述 / 用法),供 `/` 命令补全 UI 列出与过滤;元数据清单与 `parse_command` 可识别的命令集 MUST **同源**(单一定义,避免补全与解析漂移)。**`/login` / `/logout` 不再是内置命令**(auth 迁至 CLI `mysteries auth`),MUST 解析为 `Unknown`(`/login` → `Unknown("login")`、`/logout` → `Unknown("logout")`),且 MUST NOT 出现在内置命令元数据清单中。
@@ -44,23 +41,3 @@ TBD - created by archiving change finish-1-0. Update Purpose after archive.
 
 - **WHEN** 执行 `Model(Some("m2"))`
 - **THEN** UI 当前 model 显示 `"m2"`,并向 agent-task 发出 `SetModel("m2")`;下一轮 `ModelRequest.model` 为 `"m2"`
-
-### Requirement: /compact 手动压缩
-
-`/compact` 命令 SHALL 立即对当前会话 history 跑一次压缩(**无视阈值**,直接压),复用与自动压缩**同一** `Compacting` 逻辑(被压区间 / 结构化 summary / 入 `System` / 保留窗口与正确性红线一致)。压缩结果替换会话 history,并回一条 notice(含压缩前后消息数);summary 失败时 SHALL 回 notice 提示可重试(history 不变),MUST NOT panic。压缩禁用(未配 `model_context_window`)或无 provider 时,`/compact` SHALL 回提示而非压缩、MUST NOT panic。命令解析与执行走既有 builtin-commands 语义(同 `/model` 等)。
-
-#### Scenario: /compact 立即压缩
-
-- **WHEN** 在配了 `model_context_window` 的会话中输入 `/compact`(Mock provider 返回 summary)
-- **THEN** 当前 history 被替换为 `[ System(原 system + summary), 最近 keep_recent_turns 轮 ]`,回一条 notice 含压缩前后消息数
-
-#### Scenario: /compact summary 失败回 notice
-
-- **WHEN** 输入 `/compact` 但 summary 的 `provider.complete` 失败
-- **THEN** history 保持不变,回一条 notice 提示压缩失败 / 可重试,不 panic
-
-#### Scenario: 压缩禁用时 /compact 回提示
-
-- **WHEN** 未配 `model_context_window` 时输入 `/compact`
-- **THEN** 回一条提示(压缩未启用 / 需配 `model_context_window`),history 不变、不 panic
-
