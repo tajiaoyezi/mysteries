@@ -1,13 +1,17 @@
+pub mod compacting;
 pub mod context;
 pub mod message;
 
+pub use compacting::run_compact_command;
+pub use compacting::{CompactCommandOutcome, Compacting, CompactionSettings, SUMMARY_HEADER};
 pub use context::{ContextError, ContextStrategy, Passthrough};
 
 use crate::agent::message::Message;
 use crate::error::{AgentError, ProviderError};
 use crate::permission::{gate, PermissionDecider, PermissionDecision};
-use crate::provider::{DeltaSink, ModelRequest, Provider};
+use crate::provider::{DeltaSink, ModelRequest, Provider, Usage};
 use crate::tool::{PermissionLevel, ToolContext, ToolOutcome, ToolRegistry};
+use std::sync::Arc;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant. Do not claim to be Claude, ChatGPT, OpenAI, Anthropic, or any specific upstream model. If asked about your model identity, say you are running inside Mysteries and the configured model name is shown in the status line.";
 const DEFAULT_MODEL: &str = "mock-model";
@@ -63,7 +67,7 @@ pub struct NoopObserver;
 impl AgentObserver for NoopObserver {}
 
 pub struct Agent {
-    provider: Box<dyn Provider>,
+    provider: Arc<dyn Provider>,
     registry: ToolRegistry,
     decider: Box<dyn PermissionDecider>,
     model: String,
@@ -73,7 +77,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(
-        provider: Box<dyn Provider>,
+        provider: Arc<dyn Provider>,
         registry: ToolRegistry,
         decider: Box<dyn PermissionDecider>,
         model: String,
@@ -113,9 +117,11 @@ impl Agent {
         sink: &dyn DeltaSink,
         observer: &dyn AgentObserver,
     ) -> Result<String, AgentError> {
+        let mut last_usage: Option<Usage> = None;
+
         for _ in 0..self.max_iterations {
             observer.on_status(AgentStatus::CallingModel);
-            let msgs = self.strategy.prepare(history).await?;
+            let msgs = self.strategy.prepare(history, last_usage.as_ref()).await?;
             let response = self
                 .provider
                 .complete(
@@ -130,6 +136,7 @@ impl Agent {
                 .await?;
             let text = response.text;
             let tool_calls = response.tool_calls;
+            last_usage = response.usage;
 
             history.push(Message::Assistant {
                 text: text.clone(),
@@ -193,7 +200,7 @@ impl Agent {
             }
         }
 
-        let msgs = self.strategy.prepare(history).await?;
+        let msgs = self.strategy.prepare(history, last_usage.as_ref()).await?;
         let response = self
             .provider
             .complete(
@@ -226,18 +233,20 @@ impl Agent {
 
 impl From<ContextError> for AgentError {
     fn from(err: ContextError) -> Self {
-        AgentError::Provider(ProviderError::Transport(err.to_string()))
+        AgentError::Context(err.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{run_single_turn, Agent, AgentObserver, AgentStatus, DEFAULT_SYSTEM_PROMPT};
+    use super::{
+        run_single_turn, Agent, AgentObserver, AgentStatus, ContextStrategy, DEFAULT_SYSTEM_PROMPT,
+    };
     use crate::agent::message::Message;
     use crate::error::{AgentError, ProviderError};
     use crate::permission::{PermissionDecider, PermissionDecision};
     use crate::provider::mock::MockProvider;
-    use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall};
+    use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall, Usage};
     use crate::tool::edit::WriteFileTool;
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome, ToolRegistry};
     use async_trait::async_trait;
@@ -337,6 +346,104 @@ mod tests {
             finish_reason: FinishReason::ToolCalls,
             usage: None,
         }
+    }
+
+    fn tool_response_with_usage(tool_calls: Vec<ToolCall>, usage: Usage) -> ModelResponse {
+        ModelResponse {
+            text: String::new(),
+            tool_calls,
+            finish_reason: FinishReason::ToolCalls,
+            usage: Some(usage),
+        }
+    }
+
+    fn response_with_usage(text: &str, usage: Usage) -> ModelResponse {
+        ModelResponse {
+            text: text.to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: Some(usage),
+        }
+    }
+
+    #[derive(Default)]
+    struct LastUsageRecorder {
+        seen: Mutex<Vec<Option<Usage>>>,
+    }
+
+    impl LastUsageRecorder {
+        fn seen(&self) -> Vec<Option<Usage>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    struct RecordingStrategy {
+        recorder: Arc<LastUsageRecorder>,
+    }
+
+    #[async_trait]
+    impl ContextStrategy for RecordingStrategy {
+        async fn prepare(
+            &self,
+            history: &[Message],
+            last_usage: Option<&Usage>,
+        ) -> Result<Vec<Message>, crate::agent::ContextError> {
+            self.recorder.seen.lock().unwrap().push(last_usage.cloned());
+            Ok(history.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_passes_previous_response_usage_as_last_usage_on_next_prepare() {
+        let first_usage = Usage {
+            input_tokens: 11,
+            output_tokens: 22,
+        };
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response_with_usage(
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({ "input": "from tool" }),
+                }],
+                first_usage.clone(),
+            ),
+            response_with_usage(
+                "done",
+                Usage {
+                    input_tokens: 33,
+                    output_tokens: 44,
+                },
+            ),
+        ]));
+        let recorder = Arc::new(LastUsageRecorder::default());
+        let mut agent = Agent::new(
+            provider,
+            registry_with_echo(),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        agent.set_strategy(Box::new(RecordingStrategy {
+            recorder: recorder.clone(),
+        }));
+        let sink = NoopSink;
+        let mut history = vec![
+            Message::System("system".to_string()),
+            Message::User("hello".to_string()),
+        ];
+
+        let text = agent.run(&mut history, &ctx(), &sink).await.unwrap();
+        assert_eq!(text, "done");
+
+        let seen = recorder.seen();
+        assert_eq!(seen.len(), 2, "two model rounds => two prepare calls");
+        assert_eq!(seen[0], None, "first prepare should receive None");
+        assert_eq!(
+            seen[1],
+            Some(first_usage),
+            "second prepare should receive previous response usage"
+        );
     }
 
     #[test]
@@ -530,7 +637,7 @@ mod tests {
     async fn agent_loop_stops_after_text_response_and_records_assistant() {
         let provider = Arc::new(MockProvider::new(vec![response("final reply")]));
         let agent = Agent::new(
-            Box::new(provider.clone()),
+            provider.clone(),
             ToolRegistry::new(),
             Box::new(AllowAll),
             "mock-model".to_string(),
@@ -559,7 +666,7 @@ mod tests {
     async fn set_model_updates_next_model_request() {
         let provider = Arc::new(MockProvider::new(vec![response("after switch")]));
         let mut agent = Agent::new(
-            Box::new(provider.clone()),
+            provider.clone(),
             ToolRegistry::new(),
             Box::new(AllowAll),
             "m1".to_string(),
@@ -587,7 +694,7 @@ mod tests {
             response("done"),
         ]));
         let agent = Agent::new(
-            Box::new(provider.clone()),
+            provider.clone(),
             registry_with_echo(),
             Box::new(AllowAll),
             "mock-model".to_string(),
@@ -648,7 +755,7 @@ mod tests {
             response("done"),
         ]));
         let agent = Agent::new(
-            Box::new(provider),
+            provider,
             registry_with_echo(),
             Box::new(AllowAll),
             "mock-model".to_string(),
@@ -702,7 +809,7 @@ mod tests {
             response("recovered"),
         ]));
         let agent = Agent::new(
-            Box::new(provider),
+            provider,
             registry_with_confirm_tool(executions.clone()),
             Box::new(DenyAll),
             "mock-model".to_string(),
@@ -756,7 +863,7 @@ mod tests {
             response("recovered"),
         ]));
         let agent = Agent::new(
-            Box::new(provider),
+            provider,
             registry_with_error_tool(),
             Box::new(AllowAll),
             "mock-model".to_string(),
@@ -789,7 +896,7 @@ mod tests {
             response("recovered"),
         ]));
         let agent = Agent::new(
-            Box::new(provider),
+            provider,
             ToolRegistry::new(),
             Box::new(AllowAll),
             "mock-model".to_string(),
@@ -823,7 +930,7 @@ mod tests {
             response("recovered"),
         ]));
         let agent = Agent::new(
-            Box::new(provider),
+            provider,
             registry_with_confirm_tool(executions.clone()),
             Box::new(DenyAll),
             "mock-model".to_string(),
@@ -858,7 +965,7 @@ mod tests {
             response("recovered"),
         ]));
         let agent = Agent::new(
-            Box::new(provider),
+            provider,
             registry_with_write_file(),
             Box::new(DenyAll),
             "mock-model".to_string(),
@@ -901,7 +1008,7 @@ mod tests {
             response("forced final"),
         ]));
         let agent = Agent::new(
-            Box::new(provider.clone()),
+            provider.clone(),
             registry_with_echo(),
             Box::new(AllowAll),
             "mock-model".to_string(),
@@ -939,7 +1046,7 @@ mod tests {
             response(""),
         ]));
         let agent = Agent::new(
-            Box::new(provider),
+            provider,
             registry_with_echo(),
             Box::new(AllowAll),
             "mock-model".to_string(),
@@ -961,7 +1068,7 @@ mod tests {
             arguments: json!({ "input": "again" }),
         }])]));
         let agent = Agent::new(
-            Box::new(provider),
+            provider,
             registry_with_echo(),
             Box::new(AllowAll),
             "mock-model".to_string(),
@@ -982,7 +1089,7 @@ mod tests {
     async fn agent_loop_returns_provider_error_as_fatal() {
         let provider = Arc::new(MockProvider::new(Vec::new()));
         let agent = Agent::new(
-            Box::new(provider),
+            provider,
             ToolRegistry::new(),
             Box::new(AllowAll),
             "mock-model".to_string(),

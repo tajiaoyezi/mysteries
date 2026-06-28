@@ -1,3 +1,4 @@
+use crate::agent::message::Message;
 use crate::agent::AgentStatus;
 use crate::permission::PermissionDecision;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
@@ -5,7 +6,8 @@ use crate::tui::command::{parse_command, Command};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use std::path::PathBuf;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const ASCII_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
@@ -128,6 +130,7 @@ fn diff_lines(value: Option<&Value>, kind: DiffKind) -> Vec<DiffLine> {
 
 pub struct AppState {
     pub session: SessionSnapshot,
+    pub agent_history: Arc<Mutex<Vec<Message>>>,
     pub iteration: u32,
     pub transcript: Vec<TranscriptBlock>,
     pub tools_expanded: bool,
@@ -146,8 +149,21 @@ impl AppState {
     }
 
     pub fn with_session(session: SessionSnapshot) -> Self {
+        Self::with_session_and_history(
+            session,
+            Arc::new(Mutex::new(vec![Message::System(
+                crate::agent::DEFAULT_SYSTEM_PROMPT.to_string(),
+            )])),
+        )
+    }
+
+    pub fn with_session_and_history(
+        session: SessionSnapshot,
+        agent_history: Arc<Mutex<Vec<Message>>>,
+    ) -> Self {
         Self {
             session,
+            agent_history,
             iteration: 0,
             transcript: Vec::new(),
             tools_expanded: false,
@@ -312,6 +328,9 @@ impl AppState {
                 self.iteration = 0;
                 self.phase = Phase::Ready;
             }
+            AgentEvent::Notice(message) => {
+                self.transcript.push(TranscriptBlock::Notice(message));
+            }
             AgentEvent::Interrupted => {
                 self.pending_permission = None;
                 self.iteration = 0;
@@ -430,6 +449,9 @@ impl AppState {
             Command::Model(Some(model)) => {
                 self.session.model = model.clone();
                 let _ = _input_tx.send(UserInput::SetModel(model));
+            }
+            Command::Compact => {
+                let _ = _input_tx.send(UserInput::Compact);
             }
         }
     }

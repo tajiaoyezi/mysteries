@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use mysteries::agent::message::Message;
 use mysteries::app::assemble_agent;
-use mysteries::config::{AuthType, Config, ProviderConfig, ProviderKind};
+use mysteries::config::{
+    AuthType, Config, ProviderConfig, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
+    DEFAULT_KEEP_RECENT_TURNS,
+};
 use mysteries::permission::{PermissionDecider, PermissionDecision};
 use mysteries::provider::mock::MockProvider;
 use mysteries::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall};
@@ -52,6 +55,9 @@ fn config() -> Config {
         model: "e2e-model".to_string(),
         max_iterations: 4,
         timeout_secs: 30,
+        model_context_window: None,
+        compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
+        keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
     }
 }
 
@@ -86,14 +92,15 @@ async fn assembled_agent_runs_multiturn_tool_flow_offline() {
             ..Default::default()
         },
     ]));
-    let agent = assemble_agent(Box::new(provider.clone()), &config(), Box::new(AllowAll));
+    let assembled = assemble_agent(provider.clone(), &config(), Box::new(AllowAll));
     let sink = CaptureSink::new();
     let mut history = vec![
         Message::System("system".to_string()),
         Message::User("write a file".to_string()),
     ];
 
-    let final_text = agent
+    let final_text = assembled
+        .agent
         .run(&mut history, &ctx(temp.path()), &sink)
         .await
         .unwrap();

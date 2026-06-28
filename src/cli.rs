@@ -80,7 +80,7 @@ pub async fn run_cli(paths: CliPaths, prompt: &str) -> Result<(), CliError> {
         Box::new(FileCredentialSource::new(paths.credentials.clone())),
     ]);
     let provider = select_provider(&config, credentials)?;
-    let agent = assemble_agent(provider, &config, Box::new(StdinDecider));
+    let assembled = assemble_agent(provider, &config, Box::new(StdinDecider));
     let ctx = ToolContext {
         cwd: paths.cwd,
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -88,7 +88,7 @@ pub async fn run_cli(paths: CliPaths, prompt: &str) -> Result<(), CliError> {
     let sink = StdoutSink;
     let mut history = initial_history(prompt);
 
-    agent.run(&mut history, &ctx, &sink).await?;
+    assembled.agent.run(&mut history, &ctx, &sink).await?;
     println!();
 
     Ok(())

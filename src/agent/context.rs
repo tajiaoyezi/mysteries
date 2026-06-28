@@ -1,4 +1,5 @@
 use crate::agent::message::Message;
+use crate::provider::Usage;
 use async_trait::async_trait;
 use std::fmt;
 
@@ -19,7 +20,11 @@ impl std::error::Error for ContextError {}
 
 #[async_trait]
 pub trait ContextStrategy: Send + Sync {
-    async fn prepare(&self, history: &[Message]) -> Result<Vec<Message>, ContextError>;
+    async fn prepare(
+        &self,
+        history: &[Message],
+        last_usage: Option<&Usage>,
+    ) -> Result<Vec<Message>, ContextError>;
 }
 
 /// 默认策略：原样返回 history 克隆。
@@ -27,7 +32,11 @@ pub struct Passthrough;
 
 #[async_trait]
 impl ContextStrategy for Passthrough {
-    async fn prepare(&self, history: &[Message]) -> Result<Vec<Message>, ContextError> {
+    async fn prepare(
+        &self,
+        history: &[Message],
+        _last_usage: Option<&Usage>,
+    ) -> Result<Vec<Message>, ContextError> {
         Ok(history.to_vec())
     }
 }
@@ -36,7 +45,7 @@ impl ContextStrategy for Passthrough {
 mod tests {
     use super::{ContextStrategy, Passthrough};
     use crate::agent::message::Message;
-    use crate::provider::ToolCall;
+    use crate::provider::{ToolCall, Usage};
     use serde_json::json;
 
     fn sample_history() -> Vec<Message> {
@@ -63,7 +72,7 @@ mod tests {
     async fn passthrough_prepare_returns_history_unchanged() {
         let history = sample_history();
         let prepared = Passthrough
-            .prepare(&history)
+            .prepare(&history, None)
             .await
             .expect("Passthrough prepare should succeed");
 
@@ -71,5 +80,27 @@ mod tests {
             prepared, history,
             "Passthrough must return messages identical to input history"
         );
+    }
+
+    #[tokio::test]
+    async fn passthrough_prepare_ignores_last_usage() {
+        let history = sample_history();
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+
+        let with_usage = Passthrough
+            .prepare(&history, Some(&usage))
+            .await
+            .expect("Passthrough prepare should succeed");
+        let without_usage = Passthrough
+            .prepare(&history, None)
+            .await
+            .expect("Passthrough prepare should succeed");
+
+        assert_eq!(with_usage, history);
+        assert_eq!(without_usage, history);
+        assert_eq!(with_usage, without_usage);
     }
 }

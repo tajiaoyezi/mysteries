@@ -1,6 +1,7 @@
 use crate::agent::message::Message;
+use crate::agent::run_compact_command;
 use crate::agent::DEFAULT_SYSTEM_PROMPT;
-use crate::agent::{Agent, AgentStatus};
+use crate::agent::{Agent, AgentStatus, Compacting};
 use crate::cli::{CliError, CliPaths};
 use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSource};
 use crate::error::AgentError;
@@ -11,7 +12,8 @@ use crossterm::event::{
 use futures_util::StreamExt;
 use std::fs::OpenOptions;
 use std::io::Write;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{Duration, MissedTickBehavior};
 
 pub mod app;
@@ -35,25 +37,41 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-    let agent = crate::app::assemble_agent(
+    let assembled = crate::app::assemble_agent(
         provider,
         &config,
         Box::new(channel::ChannelDecider::new(ui_tx.clone())),
     );
+    let compacting = assembled.compacting;
+    let agent = assembled.agent;
+    let agent_history = Arc::new(Mutex::new(vec![Message::System(
+        DEFAULT_SYSTEM_PROMPT.to_string(),
+    )]));
     let cwd = paths.cwd.clone();
     let ctx = ToolContext {
         cwd: cwd.clone(),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
     };
-    let agent_handle = tokio::spawn(run_agent_task(agent, input_rx, interrupt_rx, ui_tx, ctx));
+    let agent_handle = tokio::spawn(run_agent_task(
+        agent,
+        agent_history.clone(),
+        compacting,
+        input_rx,
+        interrupt_rx,
+        ui_tx,
+        ctx,
+    ));
     let mut terminal = terminal::TerminalGuard::new()?;
-    let mut state = app::AppState::with_session(app::SessionSnapshot {
-        provider: provider_name,
-        model: config.model.clone(),
-        max_iterations: config.max_iterations,
-        cwd,
-        tools: crate::app::default_registry().schemas().len(),
-    });
+    let mut state = app::AppState::with_session_and_history(
+        app::SessionSnapshot {
+            provider: provider_name,
+            model: config.model.clone(),
+            max_iterations: config.max_iterations,
+            cwd,
+            tools: crate::app::default_registry().schemas().len(),
+        },
+        agent_history,
+    );
     let mut events = EventStream::new();
     let theme = theme::Theme::midnight();
     let debug_events = debug_events_enabled();
@@ -310,6 +328,8 @@ fn is_key_press(key: KeyEvent) -> bool {
 
 pub async fn run_agent_task(
     mut agent: Agent,
+    agent_history: Arc<Mutex<Vec<Message>>>,
+    compacting: Option<Compacting>,
     mut input_rx: mpsc::UnboundedReceiver<channel::UserInput>,
     mut interrupt_rx: mpsc::UnboundedReceiver<channel::UserInput>,
     ui_tx: mpsc::UnboundedSender<channel::AgentEvent>,
@@ -319,18 +339,25 @@ pub async fn run_agent_task(
         match input {
             channel::UserInput::SetModel(model) => agent.set_model(model),
             channel::UserInput::Interrupt => {}
+            channel::UserInput::Compact => {
+                let mut history = agent_history.lock().await;
+                let outcome = run_compact_command(compacting.as_ref(), &mut history).await;
+                let _ = ui_tx.send(channel::AgentEvent::Notice(outcome.notice));
+            }
             channel::UserInput::Prompt(prompt) => {
                 while interrupt_rx.try_recv().is_ok() {}
 
-                let mut history = vec![
-                    Message::System(DEFAULT_SYSTEM_PROMPT.to_string()),
-                    Message::User(prompt),
-                ];
+                let mut working = {
+                    let mut history = agent_history.lock().await;
+                    history.push(Message::User(prompt));
+                    history.clone()
+                };
                 let sink = channel::ChannelSink::new(ui_tx.clone());
                 let observer = channel::ChannelObserver::new(ui_tx.clone());
 
                 tokio::select! {
-                    result = agent.run_observed(&mut history, &ctx, &sink, &observer) => {
+                    result = agent.run_observed(&mut working, &ctx, &sink, &observer) => {
+                        *agent_history.lock().await = working;
                         match result {
                             Ok(_) => {
                                 let _ = ui_tx.send(channel::AgentEvent::TurnComplete);
@@ -341,6 +368,7 @@ pub async fn run_agent_task(
                         }
                     }
                     _ = wait_for_interrupt(&mut interrupt_rx) => {
+                        *agent_history.lock().await = working;
                         let _ = ui_tx.send(channel::AgentEvent::Interrupted);
                         let _ = ui_tx.send(channel::AgentEvent::StatusChanged(AgentStatus::Idle));
                     }
@@ -367,11 +395,14 @@ fn error_message(err: AgentError) -> String {
 #[cfg(test)]
 mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
-    use super::{run_agent_task, scroll_action_for_key, should_exit};
+    use super::{run_agent_task, scroll_action_for_key, should_exit, DEFAULT_SYSTEM_PROMPT};
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
     use crate::app::assemble_agent;
-    use crate::config::{AuthType, Config, ProviderConfig, ProviderKind};
+    use crate::config::{
+        AuthType, Config, ProviderConfig, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
+        DEFAULT_KEEP_RECENT_TURNS,
+    };
     use crate::error::ProviderError;
     use crate::permission::PermissionDecision;
     use crate::provider::mock::MockProvider;
@@ -387,8 +418,14 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{mpsc, oneshot, Mutex};
     use tokio::time::{timeout, Duration};
+
+    fn agent_history() -> Arc<Mutex<Vec<Message>>> {
+        Arc::new(Mutex::new(vec![Message::System(
+            DEFAULT_SYSTEM_PROMPT.to_string(),
+        )]))
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -417,6 +454,9 @@ mod tests {
             model: "tui-test-model".to_string(),
             max_iterations: 4,
             timeout_secs: 30,
+            model_context_window: None,
+            compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
+            keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
         }
     }
 
@@ -703,8 +743,8 @@ mod tests {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-        let agent = assemble_agent(
-            Box::new(provider),
+        let assembled = assemble_agent(
+            provider,
             &config(),
             Box::new(ChannelDecider::new(ui_tx.clone())),
         );
@@ -713,7 +753,15 @@ mod tests {
             max_output_bytes: 4096,
         };
 
-        let handle = tokio::spawn(run_agent_task(agent, input_rx, interrupt_rx, ui_tx, ctx));
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            None,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+            ctx,
+        ));
         input_tx
             .send(UserInput::Prompt("write note".to_string()))
             .unwrap();
@@ -816,8 +864,8 @@ mod tests {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-        let agent = assemble_agent(
-            Box::new(provider.clone()),
+        let assembled = assemble_agent(
+            provider.clone(),
             &config(),
             Box::new(ChannelDecider::new(ui_tx.clone())),
         );
@@ -826,7 +874,15 @@ mod tests {
             max_output_bytes: 4096,
         };
 
-        let handle = tokio::spawn(run_agent_task(agent, input_rx, interrupt_rx, ui_tx, ctx));
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            None,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+            ctx,
+        ));
         input_tx
             .send(UserInput::Prompt("write note".to_string()))
             .unwrap();
@@ -882,8 +938,8 @@ mod tests {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-        let agent = assemble_agent(
-            Box::new(provider.clone()),
+        let assembled = assemble_agent(
+            provider.clone(),
             &config(),
             Box::new(ChannelDecider::new(ui_tx.clone())),
         );
@@ -892,7 +948,15 @@ mod tests {
             max_output_bytes: 4096,
         };
 
-        let handle = tokio::spawn(run_agent_task(agent, input_rx, interrupt_rx, ui_tx, ctx));
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            None,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+            ctx,
+        ));
         input_tx
             .send(UserInput::SetModel("tui-next-model".to_string()))
             .unwrap();
@@ -914,14 +978,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_agent_task_accumulates_history_across_prompts_without_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                text: "first reply".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+            },
+            ModelResponse {
+                text: "second reply".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]));
+        let history = agent_history();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config(),
+            Box::new(ChannelDecider::new(ui_tx.clone())),
+        );
+        let ctx = ToolContext {
+            cwd: temp.path().to_path_buf(),
+            max_output_bytes: 4096,
+        };
+
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            None,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+            ctx,
+        ));
+
+        for prompt in ["round one", "round two"] {
+            input_tx
+                .send(UserInput::Prompt(prompt.to_string()))
+                .unwrap();
+            loop {
+                if let Some(AgentEvent::TurnComplete) = ui_rx.recv().await {
+                    break;
+                }
+            }
+        }
+
+        drop(input_tx);
+        handle.await.unwrap();
+
+        let second_request_messages = {
+            let recorded = provider.recorded_requests();
+            assert_eq!(recorded.len(), 2, "expected two provider calls");
+            recorded[1].messages.clone()
+        };
+        assert!(
+            second_request_messages
+                .iter()
+                .any(|msg| { matches!(msg, Message::User(text) if text == "round one") }),
+            "second request should include first prompt user message"
+        );
+        assert!(
+            second_request_messages.iter().any(|msg| {
+                matches!(
+                    msg,
+                    Message::Assistant { text, tool_calls }
+                        if text == "first reply" && tool_calls.is_empty()
+                )
+            }),
+            "second request should include first round assistant reply"
+        );
+
+        let stored = history.lock().await;
+        assert!(stored
+            .iter()
+            .any(|msg| { matches!(msg, Message::User(text) if text == "round one") }));
+        assert!(stored.iter().any(|msg| {
+            matches!(
+                msg,
+                Message::Assistant { text, .. } if text == "first reply"
+            )
+        }));
+        assert!(stored
+            .iter()
+            .any(|msg| { matches!(msg, Message::User(text) if text == "round two") }));
+    }
+
+    #[tokio::test]
     async fn run_agent_task_interrupts_running_prompt_without_terminal() {
         let temp = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-        let agent = assemble_agent(
-            Box::new(HangingProvider {
+        let assembled = assemble_agent(
+            Arc::new(HangingProvider {
                 calls: calls.clone(),
             }),
             &config(),
@@ -932,7 +1088,15 @@ mod tests {
             max_output_bytes: 4096,
         };
 
-        let handle = tokio::spawn(run_agent_task(agent, input_rx, interrupt_rx, ui_tx, ctx));
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            None,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+            ctx,
+        ));
         input_tx
             .send(UserInput::Prompt("hang".to_string()))
             .unwrap();
@@ -979,8 +1143,8 @@ mod tests {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-        let agent = assemble_agent(
-            Box::new(FirstCallHangsThenRespondsProvider {
+        let assembled = assemble_agent(
+            Arc::new(FirstCallHangsThenRespondsProvider {
                 calls: calls.clone(),
             }),
             &config(),
@@ -991,7 +1155,15 @@ mod tests {
             max_output_bytes: 4096,
         };
 
-        let handle = tokio::spawn(run_agent_task(agent, input_rx, interrupt_rx, ui_tx, ctx));
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            None,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+            ctx,
+        ));
         input_tx
             .send(UserInput::Prompt("first".to_string()))
             .unwrap();

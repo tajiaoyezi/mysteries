@@ -18,6 +18,8 @@ pub enum ProviderError {
 pub enum AgentError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error("context preparation failed: {0}")]
+    Context(String),
     #[error("agent loop reached max_iterations limit: {limit}")]
     MaxIterations { limit: u32 },
 }

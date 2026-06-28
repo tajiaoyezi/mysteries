@@ -3,16 +3,21 @@ use thiserror::Error;
 
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_COMPACT_TRIGGER_RATIO: f32 = 0.8;
+pub const DEFAULT_KEEP_RECENT_TURNS: u32 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub provider: ProviderConfig,
     pub model: String,
     pub max_iterations: u32,
     pub timeout_secs: u64,
+    pub model_context_window: Option<u32>,
+    pub compact_trigger_ratio: f32,
+    pub keep_recent_turns: u32,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct RawConfig {
     #[serde(default)]
     pub provider: Option<RawProviderConfig>,
@@ -22,6 +27,12 @@ pub struct RawConfig {
     pub max_iterations: Option<u32>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub model_context_window: Option<u32>,
+    #[serde(default)]
+    pub compact_trigger_ratio: Option<f32>,
+    #[serde(default)]
+    pub keep_recent_turns: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +73,8 @@ pub enum ConfigError {
     Toml(String),
     #[error("missing required config field: {0}")]
     MissingField(&'static str),
+    #[error("invalid config value: {0}")]
+    InvalidValue(&'static str),
 }
 
 pub fn parse(source: &str) -> Result<RawConfig, ConfigError> {
@@ -74,6 +87,9 @@ pub fn merge(user: RawConfig, project: RawConfig) -> RawConfig {
         model: project.model.or(user.model),
         max_iterations: project.max_iterations.or(user.max_iterations),
         timeout_secs: project.timeout_secs.or(user.timeout_secs),
+        model_context_window: project.model_context_window.or(user.model_context_window),
+        compact_trigger_ratio: project.compact_trigger_ratio.or(user.compact_trigger_ratio),
+        keep_recent_turns: project.keep_recent_turns.or(user.keep_recent_turns),
     }
 }
 
@@ -104,17 +120,32 @@ pub fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         auth_type: provider.auth_type.unwrap_or(AuthType::ApiKey),
     };
 
+    let compact_trigger_ratio = raw
+        .compact_trigger_ratio
+        .unwrap_or(DEFAULT_COMPACT_TRIGGER_RATIO);
+    if compact_trigger_ratio <= 0.0 || compact_trigger_ratio > 1.0 {
+        return Err(ConfigError::InvalidValue(
+            "compact_trigger_ratio must be in (0, 1]",
+        ));
+    }
+
     Ok(Config {
         provider,
         model,
         max_iterations: raw.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS),
         timeout_secs: raw.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        model_context_window: raw.model_context_window,
+        compact_trigger_ratio,
+        keep_recent_turns: raw.keep_recent_turns.unwrap_or(DEFAULT_KEEP_RECENT_TURNS),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{merge, parse, resolve, AuthType, ConfigError, ProviderKind, DEFAULT_TIMEOUT_SECS};
+    use super::{
+        merge, parse, resolve, AuthType, ConfigError, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
+        DEFAULT_KEEP_RECENT_TURNS, DEFAULT_TIMEOUT_SECS,
+    };
 
     #[test]
     fn parse_partial_toml_sets_some_and_missing_fields_to_none() {
@@ -279,5 +310,77 @@ auth_type = "api_key"
         let err = resolve(raw).unwrap_err();
 
         assert_eq!(err, ConfigError::MissingField("provider.kind"));
+    }
+
+    fn minimal_raw() -> String {
+        r#"
+model = "gpt-4o-mini"
+
+[provider]
+kind = "mock"
+auth_type = "api_key"
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn resolve_applies_compaction_defaults_when_unset() {
+        let config = resolve(parse(&minimal_raw()).unwrap()).unwrap();
+
+        assert_eq!(config.compact_trigger_ratio, DEFAULT_COMPACT_TRIGGER_RATIO);
+        assert_eq!(config.keep_recent_turns, DEFAULT_KEEP_RECENT_TURNS);
+        assert_eq!(config.model_context_window, None);
+    }
+
+    #[test]
+    fn merge_overrides_compaction_fields_from_project_layer() {
+        let user = parse(
+            r#"
+model = "user-model"
+model_context_window = 128000
+compact_trigger_ratio = 0.9
+
+[provider]
+kind = "mock"
+auth_type = "api_key"
+"#,
+        )
+        .unwrap();
+        let project = parse(
+            r#"
+model = "project-model"
+compact_trigger_ratio = 0.7
+"#,
+        )
+        .unwrap();
+
+        let merged = merge(user, project);
+        let config = resolve(merged).unwrap();
+
+        assert_eq!(config.model, "project-model");
+        assert_eq!(config.model_context_window, Some(128000));
+        assert_eq!(config.compact_trigger_ratio, 0.7);
+        assert_eq!(config.keep_recent_turns, DEFAULT_KEEP_RECENT_TURNS);
+    }
+
+    #[test]
+    fn resolve_rejects_compact_trigger_ratio_out_of_range() {
+        for invalid in ["0.0", "-0.1", "1.5", "2.0"] {
+            let source = format!(
+                r#"
+model = "gpt-4o-mini"
+compact_trigger_ratio = {invalid}
+
+[provider]
+kind = "mock"
+auth_type = "api_key"
+"#
+            );
+            let err = resolve(parse(&source).unwrap()).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidValue(_)),
+                "ratio {invalid} should be invalid: {err:?}"
+            );
+        }
     }
 }

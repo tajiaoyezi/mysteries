@@ -17,10 +17,11 @@
 - `context-strategy`: **MODIFY**「请求前上下文策略钩子」(`prepare` 加 `last_usage`)+ **ADD**「Compacting 压缩策略」。
 - `config-layering`: **ADD**「上下文压缩配置」(window / ratio / keep_recent + 默认与校验)。
 - `builtin-commands`: **ADD**「/compact 手动压缩」。
+- `tui-shell`: **ADD**「会话 history 跨轮累积」(TUI 维护跨 prompt 共享 history,非每 prompt 重建)。
 
 ## Impact
 
-- **code**:新增 `Compacting`(strategy)+ 结构化 summary 生成;`agent/mod.rs`(维护 `last_usage` + `prepare` 调用点 + `AgentError::Context`);`config`(新配置项 + 解析 / 默认 / 校验);`builtin-commands` / tui command(`/compact`);`Agent.provider` 共享给 strategy(`Box` → `Arc` 或注入独立句柄)。
+- **code**:新增 `Compacting`(strategy)+ 结构化 summary 生成;`agent/mod.rs`(维护 `last_usage` + `prepare` 调用点 + `AgentError::Context`);`config`(新配置项 + 解析 / 默认 / 校验);`builtin-commands` / tui command(`/compact`);`Agent.provider` 共享给 strategy(`Box` → `Arc` 或注入独立句柄);**TUI** 以 `agent_history` 跨轮累积会话 history(偏离原「每 prompt 重建」)。
 - **正确性红线**:① summary **MUST 入 `System`**(不引入额外 message),以保 `user`/`assistant` 交替(Anthropic 强制交替,连续同 role → `400`);② 保留窗口边界 **MUST 对齐完整轮**(从 `User` 处切),不切断 `assistant.tool_calls` ↔ `tool_result` 配对;③ `system` 永留。
 - **降级**:summary 的 provider 调用失败 → **退回不压**(返回原 history,不致命);手动 `/compact` 失败可再手动一次;自动失败下轮再触发。
 - **deps**:零新增。

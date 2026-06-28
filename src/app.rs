@@ -1,4 +1,5 @@
-use crate::agent::Agent;
+use crate::agent::context::{ContextStrategy, Passthrough};
+use crate::agent::{Agent, Compacting, CompactionSettings};
 use crate::config::{self, Config, ConfigError, ProviderKind, RawConfig};
 use crate::credential::CredentialChain;
 use crate::permission::PermissionDecider;
@@ -13,6 +14,7 @@ use crate::tool::ToolRegistry;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -50,9 +52,9 @@ fn read_config_layer(path: &Path) -> Result<RawConfig, AssemblyError> {
 pub fn select_provider(
     config: &Config,
     credentials: CredentialChain,
-) -> Result<Box<dyn Provider>, AssemblyError> {
+) -> Result<Arc<dyn Provider>, AssemblyError> {
     let attempt_timeout = Duration::from_secs(config.timeout_secs);
-    match config.provider.kind {
+    let provider: Box<dyn Provider> = match config.provider.kind {
         ProviderKind::OpenAi => {
             let provider = match &config.provider.base_url {
                 Some(base_url) => {
@@ -60,7 +62,7 @@ pub fn select_provider(
                 }
                 None => OpenAiProvider::default_with_attempt_timeout(credentials, attempt_timeout),
             };
-            Ok(Box::new(provider))
+            Box::new(provider)
         }
         ProviderKind::Anthropic => {
             let provider = match &config.provider.base_url {
@@ -71,15 +73,16 @@ pub fn select_provider(
                     AnthropicProvider::default_with_attempt_timeout(credentials, attempt_timeout)
                 }
             };
-            Ok(Box::new(provider))
+            Box::new(provider)
         }
-        ProviderKind::Mock => Ok(Box::new(MockProvider::new(vec![ModelResponse {
+        ProviderKind::Mock => Box::new(MockProvider::new(vec![ModelResponse {
             text: "mock response".to_string(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        }]))),
-    }
+        }])),
+    };
+    Ok(Arc::from(provider))
 }
 
 pub fn default_registry() -> ToolRegistry {
@@ -94,25 +97,59 @@ pub fn default_registry() -> ToolRegistry {
     registry
 }
 
+fn compaction_settings(config: &Config) -> Option<CompactionSettings> {
+    config
+        .model_context_window
+        .map(|window| CompactionSettings {
+            model_context_window: window,
+            compact_trigger_ratio: config.compact_trigger_ratio,
+            keep_recent_turns: config.keep_recent_turns,
+        })
+}
+
+pub fn build_compacting(provider: Arc<dyn Provider>, config: &Config) -> Option<Compacting> {
+    compaction_settings(config)
+        .map(|settings| Compacting::new(provider, config.model.clone(), settings))
+}
+
+pub struct AssembledAgent {
+    pub agent: Agent,
+    pub compacting: Option<Compacting>,
+}
+
 pub fn assemble_agent(
-    provider: Box<dyn Provider>,
+    provider: Arc<dyn Provider>,
     config: &Config,
     decider: Box<dyn PermissionDecider>,
-) -> Agent {
-    Agent::new(
+) -> AssembledAgent {
+    let compacting = build_compacting(provider.clone(), config);
+    let strategy: Box<dyn ContextStrategy> = match compaction_settings(config) {
+        Some(settings) => Box::new(Compacting::new(
+            provider.clone(),
+            config.model.clone(),
+            settings,
+        )),
+        None => Box::new(Passthrough),
+    };
+    let mut agent = Agent::new(
         provider,
         default_registry(),
         decider,
         config.model.clone(),
         config.max_iterations,
-    )
+    );
+    agent.set_strategy(strategy);
+    AssembledAgent { agent, compacting }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{assemble_agent, default_registry, load_config, select_provider, AssemblyError};
     use crate::agent::message::Message;
-    use crate::config::{AuthType, Config, ConfigError, ProviderConfig, ProviderKind};
+    use crate::config::{
+        AuthType, Config, ConfigError, ProviderConfig, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
+        DEFAULT_KEEP_RECENT_TURNS,
+    };
     use crate::credential::CredentialChain;
     use crate::permission::{PermissionDecider, PermissionDecision};
     use crate::provider::mock::MockProvider;
@@ -241,6 +278,9 @@ kind = "mock"
             model: "test-model".to_string(),
             max_iterations: 4,
             timeout_secs: 30,
+            model_context_window: None,
+            compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
+            keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
         }
     }
 
@@ -356,6 +396,9 @@ kind = "mock"
             model: "configured-model".to_string(),
             max_iterations: 2,
             timeout_secs: 30,
+            model_context_window: None,
+            compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
+            keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
         };
         let provider = Arc::new(MockProvider::new(vec![
             ModelResponse {
@@ -375,11 +418,12 @@ kind = "mock"
                 usage: None,
             },
         ]));
-        let agent = assemble_agent(Box::new(provider.clone()), &config, Box::new(AllowAll));
+        let assembled = assemble_agent(provider.clone(), &config, Box::new(AllowAll));
         let sink = NoopSink;
         let mut history = vec![Message::User("write note".to_string())];
 
-        let text = agent
+        let text = assembled
+            .agent
             .run(&mut history, &ctx(temp.path().to_path_buf()), &sink)
             .await
             .unwrap();
@@ -392,5 +436,32 @@ kind = "mock"
         let recorded = provider.recorded_requests();
         assert_eq!(recorded[0].model, "configured-model");
         assert_eq!(recorded[0].tools.len(), 7);
+        assert!(assembled.compacting.is_none());
+    }
+
+    #[tokio::test]
+    async fn assemble_agent_installs_compacting_when_window_configured() {
+        let config = Config {
+            provider: ProviderConfig {
+                kind: ProviderKind::Mock,
+                base_url: None,
+                auth_type: AuthType::ApiKey,
+            },
+            model: "configured-model".to_string(),
+            max_iterations: 4,
+            timeout_secs: 30,
+            model_context_window: Some(128_000),
+            compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
+            keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
+        };
+        let provider = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "ok".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        }]));
+        let assembled = assemble_agent(provider, &config, Box::new(AllowAll));
+
+        assert!(assembled.compacting.is_some());
     }
 }
