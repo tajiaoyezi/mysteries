@@ -99,16 +99,7 @@ const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 pub(crate) const WPS_CODEPLAN_OPENAI_BASE_URL: &str = "https://ai-kas.kso.net/codeplan/v1";
 pub(crate) const WPS_CODEPLAN_ANTHROPIC_BASE_URL: &str =
     "https://ai-kas.kso.net/codeplan/anthropic";
-pub(crate) const WPS_MODELS: &[&str] = &[
-    "moonshot/kimi-k2.5",
-    "deepseek/deepseek-v4-pro",
-    "xiaomi/mimo-v2.5-pro",
-    "ali/qwen3.7-max",
-    "deepseek/deepseek-v4-flash",
-    "google/gemini-3.5-flash",
-    "zhipu/glm-5",
-    "zhipu/glm-5.2",
-];
+pub(crate) const WPS_DEFAULT_MODEL: &str = "zhipu/glm-5.2";
 
 fn login_wps_codingplan(
     prompter: &mut dyn AuthPrompter,
@@ -125,14 +116,6 @@ fn login_wps_codingplan(
         _ => (ProviderKind::OpenAi, WPS_CODEPLAN_OPENAI_BASE_URL),
     };
 
-    let model_index = prompter
-        .select("Select model", WPS_MODELS)?
-        .ok_or(AuthError::Cancelled)?;
-    let model = WPS_MODELS
-        .get(model_index)
-        .ok_or(AuthError::Cancelled)?
-        .to_string();
-
     let key = prompter
         .read_secret("API key: ")?
         .ok_or(AuthError::Cancelled)?;
@@ -141,7 +124,7 @@ fn login_wps_codingplan(
         provider_id: "wps".to_string(),
         provider_kind,
         base_url: Some(base_url.to_string()),
-        model,
+        model: WPS_DEFAULT_MODEL.to_string(),
     };
 
     Ok((patch, "wps".to_string(), key))
@@ -1099,13 +1082,11 @@ mod tests {
     }
 
     #[test]
-    fn login_wps_codingplan_openai_first_model_returns_expected_patch() {
-        use super::{
-            login_wps_codingplan, WPS_CODEPLAN_OPENAI_BASE_URL, WPS_MODELS,
-        };
+    fn login_wps_codingplan_openai_protocol_returns_expected_patch() {
+        use super::{login_wps_codingplan, WPS_CODEPLAN_OPENAI_BASE_URL, WPS_DEFAULT_MODEL};
 
         let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-wps".to_string())])
-            .with_select_script(vec![Some(0), Some(0)]);
+            .with_select_script(vec![Some(0)]);
 
         let (patch, credential_key, key) = login_wps_codingplan(&mut prompter).unwrap();
 
@@ -1115,7 +1096,7 @@ mod tests {
             patch.base_url.as_deref(),
             Some(WPS_CODEPLAN_OPENAI_BASE_URL)
         );
-        assert_eq!(patch.model, WPS_MODELS[0]);
+        assert_eq!(patch.model, WPS_DEFAULT_MODEL);
         assert_eq!(credential_key, "wps");
         assert_eq!(key.expose_secret(), "sk-wps");
     }
@@ -1123,11 +1104,11 @@ mod tests {
     #[test]
     fn login_wps_codingplan_anthropic_protocol_uses_anthropic_endpoint() {
         use super::{
-            login_wps_codingplan, WPS_CODEPLAN_ANTHROPIC_BASE_URL, WPS_MODELS,
+            login_wps_codingplan, WPS_CODEPLAN_ANTHROPIC_BASE_URL, WPS_DEFAULT_MODEL,
         };
 
         let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-wps2".to_string())])
-            .with_select_script(vec![Some(1), Some(0)]);
+            .with_select_script(vec![Some(1)]);
 
         let (patch, credential_key, key) = login_wps_codingplan(&mut prompter).unwrap();
 
@@ -1137,22 +1118,9 @@ mod tests {
             patch.base_url.as_deref(),
             Some(WPS_CODEPLAN_ANTHROPIC_BASE_URL)
         );
-        assert_eq!(patch.model, WPS_MODELS[0]);
+        assert_eq!(patch.model, WPS_DEFAULT_MODEL);
         assert_eq!(credential_key, "wps");
         assert_eq!(key.expose_secret(), "sk-wps2");
-    }
-
-    #[test]
-    fn login_wps_codingplan_selects_nth_model_from_catalog() {
-        use super::{login_wps_codingplan, WPS_MODELS};
-
-        let model_index = 3usize;
-        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-wps".to_string())])
-            .with_select_script(vec![Some(0), Some(model_index)]);
-
-        let (patch, _, _) = login_wps_codingplan(&mut prompter).unwrap();
-
-        assert_eq!(patch.model, WPS_MODELS[model_index]);
     }
 
     #[test]
@@ -1169,24 +1137,11 @@ mod tests {
     }
 
     #[test]
-    fn login_wps_codingplan_cancelled_at_model_returns_cancelled() {
-        use super::login_wps_codingplan;
-
-        let mut prompter =
-            ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![Some(0), None]);
-
-        assert_eq!(
-            login_wps_codingplan(&mut prompter).unwrap_err(),
-            AuthError::Cancelled
-        );
-    }
-
-    #[test]
     fn login_wps_codingplan_cancelled_at_key_returns_cancelled() {
         use super::login_wps_codingplan;
 
         let mut prompter = ScriptedAuthPrompter::new(vec![], vec![None])
-            .with_select_script(vec![Some(0), Some(0)]);
+            .with_select_script(vec![Some(0)]);
 
         assert_eq!(
             login_wps_codingplan(&mut prompter).unwrap_err(),
@@ -1214,7 +1169,7 @@ mod tests {
 
     #[test]
     fn run_auth_login_wps_codingplan_writes_config_and_credential() {
-        use super::{WPS_CODEPLAN_OPENAI_BASE_URL, WPS_MODELS};
+        use super::{WPS_CODEPLAN_OPENAI_BASE_URL, WPS_DEFAULT_MODEL};
 
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
@@ -1224,7 +1179,7 @@ mod tests {
             credentials: credentials_path.clone(),
         };
         let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-wps".to_string())])
-            .with_select_script(vec![Some(3), Some(1), Some(0), Some(0)]);
+            .with_select_script(vec![Some(3), Some(1), Some(0)]);
 
         run_auth_login(&paths, &mut prompter).unwrap();
 
@@ -1238,7 +1193,7 @@ mod tests {
             profile.base_url.as_deref(),
             Some(WPS_CODEPLAN_OPENAI_BASE_URL)
         );
-        assert_eq!(profile.model.as_deref(), Some(WPS_MODELS[0]));
+        assert_eq!(profile.model.as_deref(), Some(WPS_DEFAULT_MODEL));
 
         let source = FileCredentialSource::new(&credentials_path);
         assert_eq!(source.resolve("wps").unwrap().expose_secret(), "sk-wps");
