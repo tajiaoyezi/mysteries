@@ -54,10 +54,15 @@ TBD - created by archiving change add-openai-live-transport. Update Purpose afte
 - **WHEN** 注入的尝试连续返回可重试结果(如 `429` → `RateLimited`)再返回成功
 - **THEN** 经指数退避重试后返回成功的 `ModelResponse`,尝试次数 = 失败次数 + 1
 
-#### Scenario: 鉴权失败不重试
+#### Scenario: 401 鉴权失败不重试
 
-- **WHEN** 注入的尝试返回 `401`/`403`(分类为 `Auth`)
+- **WHEN** 注入的尝试返回 `401`(分类为 `Auth`)
 - **THEN** 立即返回 `Err(ProviderError::Auth)`,只尝试一次、不重试
+
+#### Scenario: 403 forbidden 不重试且非 Auth
+
+- **WHEN** 注入的尝试返回 `403`
+- **THEN** 立即返回 fatal `ProviderError::Transport`,message 含 `forbidden (403)` 及模型/配额提示;**不**映射为 `Auth`;只尝试一次、不重试
 
 #### Scenario: 重试耗尽返回最后错误
 
