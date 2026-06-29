@@ -833,14 +833,16 @@ mod tests {
         run_auth_login(&paths, &mut prompter).unwrap();
 
         let raw = parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(raw.model.as_deref(), Some("deepseek-v4-pro"));
-        let provider = raw.provider.as_ref().unwrap();
-        assert_eq!(provider.id.as_deref(), Some("deepseek"));
-        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+        assert_eq!(raw.active.as_deref(), Some("deepseek"));
+        assert_eq!(raw.provider, None);
+        assert_eq!(raw.model, None);
+        let profile = raw.providers.as_ref().unwrap().get("deepseek").unwrap();
+        assert_eq!(profile.kind, Some(ProviderKind::OpenAi));
         assert_eq!(
-            provider.base_url.as_deref(),
+            profile.base_url.as_deref(),
             Some("https://api.deepseek.com")
         );
+        assert_eq!(profile.model.as_deref(), Some("deepseek-v4-pro"));
 
         let source = FileCredentialSource::new(&credentials_path);
         assert_eq!(
@@ -871,11 +873,13 @@ mod tests {
         run_auth_login(&paths, &mut prompter).unwrap();
 
         let raw = parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(raw.model.as_deref(), Some("my-model"));
-        let provider = raw.provider.as_ref().unwrap();
-        assert_eq!(provider.id.as_deref(), Some("myllm"));
-        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
-        assert_eq!(provider.base_url.as_deref(), Some("https://my.example/v1"));
+        assert_eq!(raw.active.as_deref(), Some("myllm"));
+        assert_eq!(raw.provider, None);
+        assert_eq!(raw.model, None);
+        let profile = raw.providers.as_ref().unwrap().get("myllm").unwrap();
+        assert_eq!(profile.kind, Some(ProviderKind::OpenAi));
+        assert_eq!(profile.base_url.as_deref(), Some("https://my.example/v1"));
+        assert_eq!(profile.model.as_deref(), Some("my-model"));
 
         let source = FileCredentialSource::new(&credentials_path);
         assert_eq!(source.resolve("myllm").unwrap().expose_secret(), "sk-my");
@@ -1225,14 +1229,16 @@ mod tests {
         run_auth_login(&paths, &mut prompter).unwrap();
 
         let raw = parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(raw.model.as_deref(), Some(WPS_MODELS[0]));
-        let provider = raw.provider.as_ref().unwrap();
-        assert_eq!(provider.id.as_deref(), Some("wps"));
-        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+        assert_eq!(raw.active.as_deref(), Some("wps"));
+        assert_eq!(raw.provider, None);
+        assert_eq!(raw.model, None);
+        let profile = raw.providers.as_ref().unwrap().get("wps").unwrap();
+        assert_eq!(profile.kind, Some(ProviderKind::OpenAi));
         assert_eq!(
-            provider.base_url.as_deref(),
+            profile.base_url.as_deref(),
             Some(WPS_CODEPLAN_OPENAI_BASE_URL)
         );
+        assert_eq!(profile.model.as_deref(), Some(WPS_MODELS[0]));
 
         let source = FileCredentialSource::new(&credentials_path);
         assert_eq!(source.resolve("wps").unwrap().expose_secret(), "sk-wps");
