@@ -96,7 +96,13 @@ impl Agent {
     }
 
     pub fn set_model(&mut self, model: String) {
-        self.model = model;
+        self.model = model.clone();
+        self.strategy.set_model(model);
+    }
+
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider.clone();
+        self.strategy.set_provider(provider);
     }
 
     pub fn set_strategy(&mut self, strategy: Box<dyn ContextStrategy>) {
@@ -251,7 +257,7 @@ mod tests {
     use crate::error::{AgentError, ProviderError};
     use crate::permission::{PermissionDecider, PermissionDecision};
     use crate::provider::mock::MockProvider;
-    use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall, Usage};
+    use crate::provider::{DeltaSink, FinishReason, ModelResponse, Provider, ToolCall, Usage};
     use crate::tool::edit::WriteFileTool;
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome, ToolRegistry};
     use async_trait::async_trait;
@@ -392,6 +398,61 @@ mod tests {
 
     struct RecordingStrategy {
         recorder: Arc<LastUsageRecorder>,
+    }
+
+    #[derive(Default)]
+    struct StrategySwitchRecorder {
+        provider_names: Mutex<Vec<String>>,
+        models: Mutex<Vec<String>>,
+    }
+
+    struct RecordingSwitchStrategy {
+        recorder: Arc<StrategySwitchRecorder>,
+    }
+
+    struct NamedProvider(&'static str);
+
+    #[async_trait]
+    impl Provider for NamedProvider {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        async fn complete(
+            &self,
+            _req: crate::provider::ModelRequest,
+            _sink: &dyn DeltaSink,
+        ) -> Result<ModelResponse, ProviderError> {
+            Ok(ModelResponse {
+                text: String::new(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ContextStrategy for RecordingSwitchStrategy {
+        async fn prepare(
+            &self,
+            history: &[Message],
+            _last_usage: Option<&Usage>,
+        ) -> Result<Vec<Message>, crate::agent::ContextError> {
+            Ok(history.to_vec())
+        }
+
+        fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+            self.recorder
+                .provider_names
+                .lock()
+                .unwrap()
+                .push(provider.name().to_string());
+        }
+
+        fn set_model(&mut self, model: String) {
+            self.recorder.models.lock().unwrap().push(model);
+        }
     }
 
     #[async_trait]
@@ -694,6 +755,79 @@ mod tests {
         assert_eq!(text, "after switch");
         let recorded = provider.recorded_requests();
         assert_eq!(recorded[0].model, "m2");
+    }
+
+    #[tokio::test]
+    async fn set_provider_and_set_model_propagate_to_context_strategy() {
+        let initial_provider = Arc::new(NamedProvider("initial"));
+        let new_provider = Arc::new(NamedProvider("switched"));
+        let recorder = Arc::new(StrategySwitchRecorder::default());
+        let mut agent = Agent::new(
+            initial_provider,
+            ToolRegistry::new(),
+            Box::new(AllowAll),
+            "m1".to_string(),
+            4,
+        );
+        agent.set_strategy(Box::new(RecordingSwitchStrategy {
+            recorder: recorder.clone(),
+        }));
+
+        agent.set_provider(new_provider);
+        agent.set_model("m2".to_string());
+
+        assert_eq!(
+            recorder.provider_names.lock().unwrap().as_slice(),
+            &["switched"],
+            "set_provider should propagate to context strategy"
+        );
+        assert_eq!(
+            recorder.models.lock().unwrap().as_slice(),
+            &["m2"],
+            "set_model should propagate to context strategy"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_provider_routes_next_run_to_new_provider() {
+        let old_provider = Arc::new(MockProvider::new(vec![response("old")]));
+        let new_provider = Arc::new(MockProvider::new(vec![response("new")]));
+        let mut agent = Agent::new(
+            old_provider.clone(),
+            ToolRegistry::new(),
+            Box::new(AllowAll),
+            "m1".to_string(),
+            4,
+        );
+        agent.set_provider(new_provider.clone());
+        let sink = NoopSink;
+        let mut history = vec![Message::User("hello".to_string())];
+
+        let text = agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        assert_eq!(text, "new");
+        assert!(old_provider.recorded_requests().is_empty());
+        assert_eq!(new_provider.recorded_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_provider_on_passthrough_strategy_is_no_op() {
+        let old_provider = Arc::new(MockProvider::new(vec![response("ok")]));
+        let new_provider = Arc::new(MockProvider::new(vec![response("ok")]));
+        let mut agent = Agent::new(
+            old_provider.clone(),
+            ToolRegistry::new(),
+            Box::new(AllowAll),
+            "m1".to_string(),
+            4,
+        );
+        agent.set_provider(new_provider.clone());
+        let sink = NoopSink;
+        let mut history = vec![Message::User("hello".to_string())];
+        let text = agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        assert_eq!(text, "ok");
+        assert_eq!(new_provider.recorded_requests().len(), 1);
     }
 
     #[tokio::test]

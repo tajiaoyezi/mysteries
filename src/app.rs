@@ -32,10 +32,27 @@ pub fn load_config(
     user_path: impl AsRef<Path>,
     project_path: impl AsRef<Path>,
 ) -> Result<Config, AssemblyError> {
+    Ok(config::resolve(load_merged_raw(user_path, project_path)?)?)
+}
+
+pub fn load_merged_raw(
+    user_path: impl AsRef<Path>,
+    project_path: impl AsRef<Path>,
+) -> Result<RawConfig, AssemblyError> {
     let user = read_config_layer(user_path.as_ref())?;
     let project = read_config_layer(project_path.as_ref())?;
+    Ok(config::merge(user, project))
+}
 
-    Ok(config::resolve(config::merge(user, project))?)
+pub fn provider_profiles_from_paths(
+    user_path: impl AsRef<Path>,
+    project_path: impl AsRef<Path>,
+) -> Result<std::collections::BTreeMap<String, config::ProviderProfile>, AssemblyError> {
+    let raw = load_merged_raw(user_path, project_path)?;
+    Ok(config::resolve_provider_profiles(&raw)
+        .into_iter()
+        .map(|profile| (profile.id.clone(), profile))
+        .collect())
 }
 
 fn read_config_layer(path: &Path) -> Result<RawConfig, AssemblyError> {

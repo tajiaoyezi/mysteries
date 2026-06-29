@@ -1,7 +1,8 @@
 use crate::agent::message::Message;
-use crate::provider::Usage;
+use crate::provider::{Provider, Usage};
 use async_trait::async_trait;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ContextError {
@@ -25,6 +26,10 @@ pub trait ContextStrategy: Send + Sync {
         history: &[Message],
         last_usage: Option<&Usage>,
     ) -> Result<Vec<Message>, ContextError>;
+
+    fn set_provider(&mut self, _provider: Arc<dyn Provider>) {}
+
+    fn set_model(&mut self, _model: String) {}
 }
 
 /// 默认策略：原样返回 history 克隆。
@@ -47,6 +52,7 @@ mod tests {
     use crate::agent::message::Message;
     use crate::provider::{ToolCall, Usage};
     use serde_json::json;
+    use std::sync::Arc;
 
     fn sample_history() -> Vec<Message> {
         vec![
@@ -102,5 +108,15 @@ mod tests {
         assert_eq!(with_usage, history);
         assert_eq!(without_usage, history);
         assert_eq!(with_usage, without_usage);
+    }
+
+    #[test]
+    fn passthrough_set_provider_and_set_model_hooks_are_no_ops() {
+        use crate::provider::mock::MockProvider;
+
+        let mut strategy = Passthrough;
+        let provider = Arc::new(MockProvider::new(vec![]));
+        strategy.set_provider(provider);
+        strategy.set_model("m2".to_string());
     }
 }

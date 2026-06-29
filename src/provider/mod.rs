@@ -11,6 +11,7 @@ pub mod anthropic_stream;
 pub mod anthropic_wire;
 pub mod mock;
 pub mod openai;
+pub mod registry;
 pub mod stream;
 pub mod transport;
 pub mod wire;

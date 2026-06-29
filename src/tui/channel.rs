@@ -36,6 +36,7 @@ pub enum AgentEvent {
 pub enum UserInput {
     Prompt(String),
     SetModel(String),
+    SetProvider { id: String, model: String },
     Compact,
     Interrupt,
 }

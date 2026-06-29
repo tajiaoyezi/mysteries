@@ -156,16 +156,13 @@ fn migrate_legacy_into_providers(raw: &mut RawConfig) {
     };
     let legacy_model = raw.model.take();
     let mut providers = raw.providers.take().unwrap_or_default();
-    let legacy_id = legacy_provider
-        .id
-        .clone()
-        .unwrap_or_else(|| {
-            legacy_provider
-                .kind
-                .as_ref()
-                .map(|kind| default_provider_id_for_kind(kind).to_string())
-                .unwrap_or_else(|| "openai".to_string())
-        });
+    let legacy_id = legacy_provider.id.clone().unwrap_or_else(|| {
+        legacy_provider
+            .kind
+            .as_ref()
+            .map(|kind| default_provider_id_for_kind(kind).to_string())
+            .unwrap_or_else(|| "openai".to_string())
+    });
 
     if providers.contains_key(&legacy_id) {
         raw.provider = Some(legacy_provider);
@@ -233,7 +230,8 @@ fn merge_providers(
             for (id, project_profile) in project {
                 user.entry(id)
                     .and_modify(|existing| {
-                        *existing = merge_provider_profile(existing.clone(), project_profile.clone());
+                        *existing =
+                            merge_provider_profile(existing.clone(), project_profile.clone());
                     })
                     .or_insert(project_profile);
             }
@@ -297,10 +295,8 @@ fn resolve_multi_provider(
             (active_id, profile.clone())
         }
         None if providers.len() == 1 => {
-            let (provider_id, profile) = providers
-                .iter()
-                .next()
-                .expect("providers map is non-empty");
+            let (provider_id, profile) =
+                providers.iter().next().expect("providers map is non-empty");
             (provider_id.clone(), profile.clone())
         }
         None => return Err(ConfigError::MissingField("active")),
@@ -339,6 +335,62 @@ fn resolve_legacy_provider(
     };
 
     Ok((provider, model))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderProfile {
+    pub id: String,
+    pub kind: ProviderKind,
+    pub base_url: Option<String>,
+    pub model: String,
+    pub auth_type: AuthType,
+}
+
+pub fn resolve_provider_profiles(raw: &RawConfig) -> Vec<ProviderProfile> {
+    if raw
+        .providers
+        .as_ref()
+        .is_some_and(|providers| !providers.is_empty())
+    {
+        let mut profiles = Vec::new();
+        for (id, profile) in raw.providers.as_ref().unwrap() {
+            let Some(kind) = profile.kind.clone() else {
+                continue;
+            };
+            let Some(model) = profile.model.as_ref().filter(|model| !model.is_empty()) else {
+                continue;
+            };
+            profiles.push(ProviderProfile {
+                id: id.clone(),
+                kind,
+                base_url: profile.base_url.clone(),
+                model: model.clone(),
+                auth_type: profile.auth_type.clone().unwrap_or(AuthType::ApiKey),
+            });
+        }
+        return profiles;
+    }
+
+    let Some(provider) = raw.provider.as_ref() else {
+        return Vec::new();
+    };
+    let Some(kind) = provider.kind.clone() else {
+        return Vec::new();
+    };
+    let Some(model) = raw.model.as_ref().filter(|model| !model.is_empty()) else {
+        return Vec::new();
+    };
+
+    vec![ProviderProfile {
+        id: provider
+            .id
+            .clone()
+            .unwrap_or_else(|| default_provider_id_for_kind(&kind).to_string()),
+        kind,
+        base_url: provider.base_url.clone(),
+        model: model.clone(),
+        auth_type: provider.auth_type.clone().unwrap_or(AuthType::ApiKey),
+    }]
 }
 
 fn default_provider_id_for_kind(kind: &ProviderKind) -> &'static str {
@@ -1070,10 +1122,7 @@ model = "c-model"
             providers.get("a").unwrap().model.as_deref(),
             Some("a-model")
         );
-        assert_eq!(
-            providers.get("b").unwrap().model.as_deref(),
-            Some("p-b")
-        );
+        assert_eq!(providers.get("b").unwrap().model.as_deref(), Some("p-b"));
         assert_eq!(
             providers.get("c").unwrap().model.as_deref(),
             Some("c-model")
@@ -1188,6 +1237,92 @@ base_url = "https://api.deepseek.com"
             deepseek.base_url.as_deref(),
             Some("https://api.deepseek.com")
         );
-        assert_eq!(providers.get("wps").unwrap().model.as_deref(), Some("m-wps"));
+        assert_eq!(
+            providers.get("wps").unwrap().model.as_deref(),
+            Some("m-wps")
+        );
+    }
+
+    #[test]
+    fn resolve_provider_profiles_returns_all_new_schema_entries() {
+        use super::resolve_provider_profiles;
+
+        let raw = parse(
+            r#"
+active = "anthropic"
+
+[providers.anthropic]
+kind = "anthropic"
+model = "claude-opus-4-8"
+
+[providers.wps]
+kind = "openai"
+base_url = "https://ai-kas.kso.net/codeplan/v1"
+model = "zhipu/glm-5.2"
+"#,
+        )
+        .unwrap();
+
+        let profiles = resolve_provider_profiles(&raw);
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].id, "anthropic");
+        assert_eq!(profiles[0].kind, ProviderKind::Anthropic);
+        assert_eq!(profiles[0].model, "claude-opus-4-8");
+        assert_eq!(profiles[1].id, "wps");
+        assert_eq!(profiles[1].kind, ProviderKind::OpenAi);
+        assert_eq!(profiles[1].model, "zhipu/glm-5.2");
+    }
+
+    #[test]
+    fn resolve_provider_profiles_falls_back_to_legacy_single_provider() {
+        use super::resolve_provider_profiles;
+
+        let raw = parse(
+            r#"
+model = "gpt-4o"
+
+[provider]
+kind = "openai"
+"#,
+        )
+        .unwrap();
+
+        let profiles = resolve_provider_profiles(&raw);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "openai");
+        assert_eq!(profiles[0].kind, ProviderKind::OpenAi);
+        assert_eq!(profiles[0].model, "gpt-4o");
+    }
+
+    #[test]
+    fn resolve_provider_profiles_returns_empty_without_any_provider() {
+        use super::resolve_provider_profiles;
+
+        let raw = parse("max_iterations = 8").unwrap();
+        assert!(resolve_provider_profiles(&raw).is_empty());
+    }
+
+    #[test]
+    fn resolve_provider_profiles_skips_incomplete_entries() {
+        use super::resolve_provider_profiles;
+
+        let raw = parse(
+            r#"
+[providers.good]
+kind = "anthropic"
+model = "claude-opus-4-8"
+
+[providers.missing-kind]
+model = "orphan-model"
+
+[providers.missing-model]
+kind = "openai"
+"#,
+        )
+        .unwrap();
+
+        let profiles = resolve_provider_profiles(&raw);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "good");
     }
 }

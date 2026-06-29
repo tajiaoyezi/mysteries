@@ -34,6 +34,14 @@ impl Compacting {
         }
     }
 
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+
     /// 手动 `/compact`:无视阈值,立即压缩一次。
     pub async fn compact_now(&self, history: &[Message]) -> Result<Vec<Message>, ContextError> {
         self.compact_history(history, None, true).await
@@ -198,6 +206,14 @@ impl ContextStrategy for Compacting {
         last_usage: Option<&Usage>,
     ) -> Result<Vec<Message>, ContextError> {
         self.compact_history(history, last_usage, false).await
+    }
+
+    fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+    }
+
+    fn set_model(&mut self, model: String) {
+        self.model = model;
     }
 }
 
@@ -707,5 +723,24 @@ mod tests {
             "disabled notice should explain config requirement: {}",
             outcome.notice
         );
+    }
+
+    #[tokio::test]
+    async fn compacting_set_provider_and_set_model_apply_to_compact_now() {
+        let old_provider = Arc::new(MockProvider::new(vec![summary_response()]));
+        let new_provider = Arc::new(MockProvider::new(vec![summary_response()]));
+        let mut compacting = compacting_with_provider(old_provider.clone());
+        compacting.set_provider(new_provider.clone());
+        compacting.set_model("m2".to_string());
+
+        let _ = compacting
+            .compact_now(&multi_turn_history())
+            .await
+            .expect("compact_now should succeed");
+
+        assert!(old_provider.recorded_requests().is_empty());
+        let recorded = new_provider.recorded_requests();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].model, "m2");
     }
 }

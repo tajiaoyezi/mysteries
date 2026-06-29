@@ -2,15 +2,19 @@ use crate::agent::message::Message;
 use crate::agent::run_compact_command;
 use crate::agent::DEFAULT_SYSTEM_PROMPT;
 use crate::agent::{Agent, AgentStatus, Compacting};
+use crate::app::select_provider;
 use crate::cli::{load_config_or_onboard, CliError, CliPaths, StdinAuthPrompter};
+use crate::config::{Config, ProviderConfig, ProviderKind, ProviderProfile};
 use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSource};
 use crate::error::AgentError;
 use crate::provider::Usage;
 use crate::tool::ToolContext;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
@@ -24,9 +28,20 @@ pub mod terminal;
 pub mod theme;
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+pub struct RunAgentTaskConfig {
+    pub profiles: BTreeMap<String, ProviderProfile>,
+    pub startup_config: Config,
+    pub credentials_path: PathBuf,
+    pub tool_ctx: ToolContext,
+}
+
 pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let mut prompter = StdinAuthPrompter;
     let config = load_config_or_onboard(&paths, &mut prompter)?;
+    let profiles =
+        crate::app::provider_profiles_from_paths(&paths.user_config, &paths.project_config)
+            .map_err(CliError::from)?;
     let credentials = CredentialChain::new(vec![
         Box::new(EnvCredentialSource::new()),
         Box::new(FileCredentialSource::new(paths.credentials.clone())),
@@ -51,14 +66,20 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
         cwd: cwd.clone(),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
     };
+    let task_config = RunAgentTaskConfig {
+        profiles,
+        startup_config: config.clone(),
+        credentials_path: paths.credentials.clone(),
+        tool_ctx: ctx,
+    };
     let agent_handle = tokio::spawn(run_agent_task(
         agent,
         agent_history.clone(),
         compacting,
+        task_config,
         input_rx,
         interrupt_rx,
         ui_tx,
-        ctx,
     ));
     let mut terminal = terminal::TerminalGuard::new()?;
     let mut state = app::AppState::with_session_and_history(
@@ -374,15 +395,34 @@ fn is_key_press(key: KeyEvent) -> bool {
 pub async fn run_agent_task(
     mut agent: Agent,
     agent_history: Arc<Mutex<Vec<Message>>>,
-    compacting: Option<Compacting>,
+    mut compacting: Option<Compacting>,
+    task_config: RunAgentTaskConfig,
     mut input_rx: mpsc::UnboundedReceiver<channel::UserInput>,
     mut interrupt_rx: mpsc::UnboundedReceiver<channel::UserInput>,
     ui_tx: mpsc::UnboundedSender<channel::AgentEvent>,
-    ctx: ToolContext,
 ) {
+    let RunAgentTaskConfig {
+        profiles,
+        startup_config,
+        credentials_path,
+        tool_ctx: ctx,
+    } = task_config;
     while let Some(input) = input_rx.recv().await {
         match input {
             channel::UserInput::SetModel(model) => agent.set_model(model),
+            channel::UserInput::SetProvider { id, model } => {
+                if let Err(notice) = apply_set_provider(
+                    &profiles,
+                    &startup_config,
+                    &credentials_path,
+                    &id,
+                    &model,
+                    &mut agent,
+                    compacting.as_mut(),
+                ) {
+                    let _ = ui_tx.send(channel::AgentEvent::Notice(notice));
+                }
+            }
             channel::UserInput::Interrupt => {}
             channel::UserInput::Compact => {
                 let mut history = agent_history.lock().await;
@@ -423,6 +463,57 @@ pub async fn run_agent_task(
     }
 }
 
+fn build_credential_chain(credentials_path: &std::path::Path) -> CredentialChain {
+    CredentialChain::new(vec![
+        Box::new(EnvCredentialSource::new()),
+        Box::new(FileCredentialSource::new(credentials_path.to_path_buf())),
+    ])
+}
+
+fn apply_set_provider(
+    profiles: &BTreeMap<String, ProviderProfile>,
+    startup_config: &Config,
+    credentials_path: &std::path::Path,
+    id: &str,
+    model: &str,
+    agent: &mut Agent,
+    compacting: Option<&mut Compacting>,
+) -> Result<(), String> {
+    let Some(profile) = profiles.get(id) else {
+        return Err(format!("未知 provider: {id}"));
+    };
+
+    let credentials = build_credential_chain(credentials_path);
+    if profile.kind != ProviderKind::Mock && credentials.resolve(id).is_none() {
+        return Err(format!("缺少 provider `{id}` 的凭据,无法切换"));
+    }
+
+    let transient = Config {
+        provider: ProviderConfig {
+            id: profile.id.clone(),
+            kind: profile.kind.clone(),
+            base_url: profile.base_url.clone(),
+            auth_type: profile.auth_type.clone(),
+        },
+        model: model.to_string(),
+        max_iterations: startup_config.max_iterations,
+        timeout_secs: startup_config.timeout_secs,
+        model_context_window: startup_config.model_context_window,
+        compact_trigger_ratio: startup_config.compact_trigger_ratio,
+        keep_recent_turns: startup_config.keep_recent_turns,
+    };
+
+    let provider = select_provider(&transient, credentials).map_err(|err| err.to_string())?;
+    agent.set_provider(provider.clone());
+    agent.set_model(model.to_string());
+    if let Some(compacting) = compacting {
+        compacting.set_provider(provider);
+        compacting.set_model(model.to_string());
+    }
+
+    Ok(())
+}
+
 async fn wait_for_interrupt(input: &mut mpsc::UnboundedReceiver<channel::UserInput>) {
     loop {
         match input.recv().await {
@@ -442,14 +533,14 @@ mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
     use super::{
         arrows_route_to_completion, run_agent_task, scroll_action_for_key, should_exit,
-        DEFAULT_SYSTEM_PROMPT,
+        RunAgentTaskConfig, DEFAULT_SYSTEM_PROMPT,
     };
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
     use crate::app::assemble_agent;
     use crate::config::{
-        AuthType, Config, ProviderConfig, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
-        DEFAULT_KEEP_RECENT_TURNS,
+        AuthType, Config, ProviderConfig, ProviderKind, ProviderProfile,
+        DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS,
     };
     use crate::error::ProviderError;
     use crate::permission::PermissionDecision;
@@ -465,6 +556,7 @@ mod tests {
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -497,7 +589,7 @@ mod tests {
     fn config() -> Config {
         Config {
             provider: ProviderConfig {
-                id: String::new(),
+                id: "mock".to_string(),
                 kind: ProviderKind::Mock,
                 base_url: None,
                 auth_type: AuthType::ApiKey,
@@ -508,6 +600,21 @@ mod tests {
             model_context_window: None,
             compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
             keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
+        }
+    }
+
+    fn task_hotswap(
+        temp: &tempfile::TempDir,
+        profiles: BTreeMap<String, ProviderProfile>,
+    ) -> RunAgentTaskConfig {
+        RunAgentTaskConfig {
+            profiles,
+            startup_config: config(),
+            credentials_path: temp.path().join("credentials"),
+            tool_ctx: ToolContext {
+                cwd: temp.path().to_path_buf(),
+                max_output_bytes: 4096,
+            },
         }
     }
 
@@ -801,19 +908,15 @@ mod tests {
             &config(),
             Box::new(ChannelDecider::new(ui_tx.clone())),
         );
-        let ctx = ToolContext {
-            cwd: temp.path().to_path_buf(),
-            max_output_bytes: 4096,
-        };
-
+        let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
             None,
+            task_config,
             input_rx,
             interrupt_rx,
             ui_tx,
-            ctx,
         ));
         input_tx
             .send(UserInput::Prompt("write note".to_string()))
@@ -922,19 +1025,15 @@ mod tests {
             &config(),
             Box::new(ChannelDecider::new(ui_tx.clone())),
         );
-        let ctx = ToolContext {
-            cwd: temp.path().to_path_buf(),
-            max_output_bytes: 4096,
-        };
-
+        let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
             None,
+            task_config,
             input_rx,
             interrupt_rx,
             ui_tx,
-            ctx,
         ));
         input_tx
             .send(UserInput::Prompt("write note".to_string()))
@@ -996,19 +1095,15 @@ mod tests {
             &config(),
             Box::new(ChannelDecider::new(ui_tx.clone())),
         );
-        let ctx = ToolContext {
-            cwd: temp.path().to_path_buf(),
-            max_output_bytes: 4096,
-        };
-
+        let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
             None,
+            task_config,
             input_rx,
             interrupt_rx,
             ui_tx,
-            ctx,
         ));
         input_tx
             .send(UserInput::SetModel("tui-next-model".to_string()))
@@ -1056,19 +1151,15 @@ mod tests {
             &config(),
             Box::new(ChannelDecider::new(ui_tx.clone())),
         );
-        let ctx = ToolContext {
-            cwd: temp.path().to_path_buf(),
-            max_output_bytes: 4096,
-        };
-
+        let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             history.clone(),
             None,
+            task_config,
             input_rx,
             interrupt_rx,
             ui_tx,
-            ctx,
         ));
 
         for prompt in ["round one", "round two"] {
@@ -1136,19 +1227,15 @@ mod tests {
             &config(),
             Box::new(ChannelDecider::new(ui_tx.clone())),
         );
-        let ctx = ToolContext {
-            cwd: temp.path().to_path_buf(),
-            max_output_bytes: 4096,
-        };
-
+        let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
             None,
+            task_config,
             input_rx,
             interrupt_rx,
             ui_tx,
-            ctx,
         ));
         input_tx
             .send(UserInput::Prompt("hang".to_string()))
@@ -1203,19 +1290,15 @@ mod tests {
             &config(),
             Box::new(ChannelDecider::new(ui_tx.clone())),
         );
-        let ctx = ToolContext {
-            cwd: temp.path().to_path_buf(),
-            max_output_bytes: 4096,
-        };
-
+        let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
             None,
+            task_config,
             input_rx,
             interrupt_rx,
             ui_tx,
-            ctx,
         ));
         input_tx
             .send(UserInput::Prompt("first".to_string()))
@@ -1260,5 +1343,288 @@ mod tests {
         drop(interrupt_tx);
         handle.abort();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn run_agent_task_applies_set_provider_to_next_prompt_without_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_provider = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "old".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        }]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "alt".to_string(),
+            ProviderProfile {
+                id: "alt".to_string(),
+                kind: ProviderKind::Mock,
+                base_url: None,
+                model: "alt-model".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        let assembled = assemble_agent(
+            old_provider.clone(),
+            &config(),
+            Box::new(ChannelDecider::new(ui_tx.clone())),
+        );
+        let task_config = task_hotswap(&temp, profiles);
+        let history = agent_history();
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            None,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx
+            .send(UserInput::SetProvider {
+                id: "alt".to_string(),
+                model: "alt-model".to_string(),
+            })
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt("hello".to_string()))
+            .unwrap();
+
+        loop {
+            if let Some(AgentEvent::TurnComplete) = ui_rx.recv().await {
+                break;
+            }
+        }
+
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert!(old_provider.recorded_requests().is_empty());
+        let locked = history.lock().await;
+        assert!(locked
+            .iter()
+            .any(|msg| matches!(msg, Message::User(text) if text == "hello")));
+    }
+
+    #[tokio::test]
+    async fn run_agent_task_set_provider_unknown_id_emits_notice_and_keeps_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "still old".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        }]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config(),
+            Box::new(ChannelDecider::new(ui_tx.clone())),
+        );
+        let task_config = task_hotswap(&temp, BTreeMap::new());
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            None,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx
+            .send(UserInput::SetProvider {
+                id: "missing".to_string(),
+                model: "m1".to_string(),
+            })
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt("hello".to_string()))
+            .unwrap();
+
+        let mut saw_notice = false;
+        loop {
+            match ui_rx.recv().await.expect("ui event") {
+                AgentEvent::Notice(text) if text.contains("未知 provider") => {
+                    saw_notice = true;
+                }
+                AgentEvent::TurnComplete => break,
+                _ => {}
+            }
+        }
+
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert!(saw_notice);
+        assert_eq!(provider.recorded_requests().len(), 1);
+        assert_eq!(provider.recorded_requests()[0].model, "tui-test-model");
+    }
+
+    #[tokio::test]
+    async fn run_agent_task_set_provider_missing_credentials_emits_notice_and_keeps_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "still old".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        }]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "wps".to_string(),
+            ProviderProfile {
+                id: "wps".to_string(),
+                kind: ProviderKind::OpenAi,
+                base_url: Some("https://ai-kas.kso.net/codeplan/v1".to_string()),
+                model: "zhipu/glm-5.2".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config(),
+            Box::new(ChannelDecider::new(ui_tx.clone())),
+        );
+        let task_config = task_hotswap(&temp, profiles);
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            None,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx
+            .send(UserInput::SetProvider {
+                id: "wps".to_string(),
+                model: "zhipu/glm-5.2".to_string(),
+            })
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt("hello".to_string()))
+            .unwrap();
+
+        let mut saw_notice = false;
+        loop {
+            match ui_rx.recv().await.expect("ui event") {
+                AgentEvent::Notice(text) if text.contains("凭据") => {
+                    saw_notice = true;
+                }
+                AgentEvent::TurnComplete => break,
+                _ => {}
+            }
+        }
+
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert!(saw_notice);
+        assert_eq!(provider.recorded_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_agent_task_hotswap_smoke_anthropic_to_wps_from_config_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+active = "anthropic"
+
+[providers.anthropic]
+kind = "mock"
+model = "claude-opus-4-8"
+
+[providers.wps]
+kind = "mock"
+model = "zhipu/glm-5.2"
+"#,
+        )
+        .unwrap();
+        let credentials_path = temp.path().join("credentials");
+        fs::write(
+            &credentials_path,
+            "anthropic = sk-test-anthropic\nwps = sk-test-wps\n",
+        )
+        .unwrap();
+
+        let profiles = crate::app::provider_profiles_from_paths(&config_path, &config_path)
+            .unwrap();
+        assert_eq!(profiles.len(), 2);
+
+        let old_provider = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "old".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        }]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            old_provider.clone(),
+            &config(),
+            Box::new(ChannelDecider::new(ui_tx.clone())),
+        );
+        let task_config = RunAgentTaskConfig {
+            profiles,
+            startup_config: config(),
+            credentials_path: credentials_path.clone(),
+            tool_ctx: ToolContext {
+                cwd: temp.path().to_path_buf(),
+                max_output_bytes: 4096,
+            },
+        };
+        let history = agent_history();
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            None,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx
+            .send(UserInput::SetProvider {
+                id: "wps".to_string(),
+                model: "zhipu/glm-5.2".to_string(),
+            })
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt("after hotswap".to_string()))
+            .unwrap();
+
+        loop {
+            if let Some(AgentEvent::TurnComplete) = ui_rx.recv().await {
+                break;
+            }
+        }
+
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert!(
+            old_provider.recorded_requests().is_empty(),
+            "initial provider must not serve post-hotswap prompt"
+        );
+        let locked = history.lock().await;
+        assert!(locked.iter().any(|msg| {
+            matches!(msg, Message::Assistant { text, .. } if text == "mock response")
+        }));
     }
 }
