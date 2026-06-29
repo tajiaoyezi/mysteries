@@ -423,15 +423,6 @@ TUI agent task SHALL 维护跨 prompt 累积的会话 history(`System` + 历轮 
 - **WHEN** 输入框为 `"/model gpt"`(已进入参数)或 `"hello"`(非 `/` 起头)
 - **THEN** 不显示补全浮层
 
-### Requirement: 终端原生复制(不捕获鼠标)
-
-TUI MUST NOT 启用鼠标捕获(`EnableMouseCapture`),以使终端**原生的文本选择 / 复制与 scrollback 滚动**可用。transcript 滚动改由键盘(`↑↓` / `PageUp` / `PageDown` / `Home` / `End`)承担(既有能力,保持不变)。背景:鼠标滚轮在 Windows Terminal / ConPTY 实测不可用(见 `improve-tui-interaction`),放弃程序内鼠标事件以换取终端原生复制为更优权衡。
-
-#### Scenario: 进入 TUI 不置入鼠标捕获
-
-- **WHEN** 构造终端 guard 进入 alternate screen
-- **THEN** 终端**未**被置入鼠标捕获模式(`TerminalGuard` setup 不发 `EnableMouseCapture`),用户可用终端原生选择复制;键盘滚动仍生效
-
 ### Requirement: 活动状态行(输入框上方)
 
 `render` SHALL 在**输入框上方**渲染单行**活动状态行**,承载动态工作状态,由左到右:`spinner`(running 态依 `AppState.spinner_frame` 取帧;`Ready`/`WaitingForPermission` 用静态 glyph)+ phase 文案(见「全 phase 状态行 C10」)+ 运行中(phase 非 `Ready` 且非 `WaitingForPermission`)的 **esc 中断提示** + **token 速率** `↓ N tok · X t/s`(见「token 用量累计与速率呈现」)。活动状态行 MUST **恒占 1 行**(不随 `Ready`/running 改变其行高,避免 transcript 视口高度跳动)。`Ready`/`Idle` 态 MUST **简显**(不显 spinner 动画与 esc 提示)。配色沿用 `设计规范/02` 状态机(running=`accent.primary`、`WaitingForPermission`=`warning.fg`、idle / 速率=`text.muted`)。phase label MUST 出现在活动状态行、MUST NOT 出现在底部状态行。渲染 MUST 可经 `TestBackend` / `insta` 带色快照验证。
@@ -625,4 +616,29 @@ TUI MUST NOT 启用鼠标捕获(`EnableMouseCapture`),以使终端**原生的文
 
 - **WHEN** pill 显示 `2 条新消息 (ctrl+End) ↓`,按 `Ctrl+End`
 - **THEN** transcript 回底并恢复跟随,pill 隐藏,计数清零
+
+### Requirement: 鼠标滚轮滚动(捕获鼠标)
+
+TUI SHALL 启用鼠标捕获:`TerminalGuard` 进入 alternate screen 时发 `EnableMouseCapture`,退出 / panic 时经 `restore_terminal` 发 `DisableMouseCapture`,使鼠标滚轮以 `Event::Mouse` 到达程序而非被终端翻译为 `↑/↓` 方向键。`MouseEventKind::ScrollUp` / `ScrollDown` SHALL 经 `scroll_up` / `scroll_down` 原语驱动 transcript 上 / 下滚动(每事件固定行数);其余 mouse kind MUST 被忽略(不改交互)。键盘 `↑↓` MUST NOT 受影响(仍归输入历史)。鼠标捕获 MUST 在退出 TUI / panic 时正确解除(沿用 `restore_terminal` 单一路径,不残留鼠标模式)。终端原生框选复制让位于 Shift+拖选。
+
+**降级**:部分 Windows ConPTY 构建即便捕获也可能不转发滚轮事件——此时滚轮无效,但 MUST NOT 影响键盘滚动(`PageUp` / `PageDown` / `Home` / `End`)与 `↑↓` 历史(键盘全覆盖不受损)。
+
+#### Scenario: 进入 TUI 启用鼠标捕获、退出解除
+
+- **WHEN** 构造 `TerminalGuard` 进入 alternate screen
+- **THEN** 终端被置入鼠标捕获模式(setup 发 `EnableMouseCapture`)
+- **WHEN** TUI 退出或 panic,经 `restore_terminal`
+- **THEN** `DisableMouseCapture` 被发出,终端恢复原生鼠标行为(无残留)
+
+#### Scenario: 滚轮事件驱动 transcript 滚动
+
+- **WHEN** 收到 `Event::Mouse` 且 kind 为 `ScrollUp`
+- **THEN** 经 `scroll_up` 原语上滚 transcript(固定行数)
+- **WHEN** 收到 `Event::Mouse` 且 kind 为 `ScrollDown`
+- **THEN** 经 `scroll_down` 原语下滚 transcript
+
+#### Scenario: 键盘 ↑↓ 不受滚轮捕获影响
+
+- **WHEN** 鼠标捕获已启用,主输入态按键盘 `↑`
+- **THEN** 仍召回输入历史(滚轮捕获不改键盘 `↑↓` 语义)
 
