@@ -52,7 +52,12 @@ pub trait SseAccumulator {
 
 pub fn classify(failure: TransportFailure, provider_label: &str) -> ErrorClassification {
     match failure {
-        TransportFailure::Status(401 | 403) => ErrorClassification::Fatal(ProviderError::Auth),
+        TransportFailure::Status(401) => ErrorClassification::Fatal(ProviderError::Auth),
+        TransportFailure::Status(403) => ErrorClassification::Fatal(ProviderError::Transport(
+            format!(
+                "{provider_label} forbidden (403) — 模型无权限或配额,换模型或检查 key 权限"
+            ),
+        )),
         TransportFailure::Status(429) => ErrorClassification::Retryable(ProviderError::RateLimited),
         TransportFailure::Status(status) if (500..=599).contains(&status) => {
             ErrorClassification::Retryable(ProviderError::RateLimited)

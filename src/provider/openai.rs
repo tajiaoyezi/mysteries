@@ -284,15 +284,19 @@ mod tests {
     }
 
     #[test]
-    fn classify_auth_statuses_as_fatal_auth() {
+    fn classify_401_as_fatal_auth_and_403_as_forbidden_transport() {
         assert_eq!(
             classify(TransportFailure::Status(401), PROVIDER_LABEL),
             ErrorClassification::Fatal(ProviderError::Auth)
         );
-        assert_eq!(
-            classify(TransportFailure::Status(403), PROVIDER_LABEL),
-            ErrorClassification::Fatal(ProviderError::Auth)
-        );
+        match classify(TransportFailure::Status(403), PROVIDER_LABEL) {
+            ErrorClassification::Fatal(ProviderError::Transport(message)) => {
+                assert!(message.contains("forbidden (403)"));
+                assert!(message.contains("模型无权限或配额"));
+                assert!(!message.contains("authentication"));
+            }
+            other => panic!("403 should be fatal transport, got {other:?}"),
+        }
     }
 
     #[test]
