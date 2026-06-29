@@ -2,7 +2,7 @@ use crate::agent::message::Message;
 use crate::agent::run_compact_command;
 use crate::agent::DEFAULT_SYSTEM_PROMPT;
 use crate::agent::{Agent, AgentStatus, Compacting};
-use crate::cli::{CliError, CliPaths};
+use crate::cli::{load_config_or_onboard, CliError, CliPaths, StdinAuthPrompter};
 use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSource};
 use crate::error::AgentError;
 use crate::provider::Usage;
@@ -25,7 +25,8 @@ pub mod theme;
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
-    let config = crate::app::load_config(&paths.user_config, &paths.project_config)?;
+    let mut prompter = StdinAuthPrompter;
+    let config = load_config_or_onboard(&paths, &mut prompter)?;
     let credentials = CredentialChain::new(vec![
         Box::new(EnvCredentialSource::new()),
         Box::new(FileCredentialSource::new(paths.credentials.clone())),

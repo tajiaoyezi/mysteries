@@ -1,7 +1,7 @@
 use crate::agent::message::Message;
 use crate::agent::DEFAULT_SYSTEM_PROMPT;
 use crate::app::{assemble_agent, load_config, select_provider, AssemblyError};
-use crate::config::{write_config, ConfigError, ConfigWritePatch, ProviderKind};
+use crate::config::{write_config, Config, ConfigError, ConfigWritePatch, ProviderKind};
 use crate::credential::{
     collect_credential_sources, list_credential_providers, remove_credential, write_credential,
     CredentialChain, CredentialError, CredentialOrigin, EnvCredentialSource, FileCredentialSource,
@@ -29,7 +29,7 @@ pub struct CliPaths {
     pub cwd: PathBuf,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum CliError {
     #[error(transparent)]
     Assembly(#[from] AssemblyError),
@@ -39,6 +39,8 @@ pub enum CliError {
     Io(String),
     #[error(transparent)]
     Auth(#[from] AuthError),
+    #[error("未配置 provider。请先运行: mysteries auth login")]
+    NotConfigured,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -89,8 +91,8 @@ pub enum ProviderPreset {
     DeepSeek,
 }
 
-const OPENAI_DEFAULT_MODEL: &str = "gpt-5.5";
-const ANTHROPIC_DEFAULT_MODEL: &str = "claude-opus-4-8";
+pub(crate) const OPENAI_DEFAULT_MODEL: &str = "gpt-5.5";
+pub(crate) const ANTHROPIC_DEFAULT_MODEL: &str = "claude-opus-4-8";
 const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-pro";
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 
@@ -462,7 +464,30 @@ impl PermissionDecider for StdinDecider {
     }
 }
 
+pub fn is_first_run(paths: &CliPaths) -> bool {
+    !paths.user_config.exists() && !paths.project_config.exists()
+}
+
+pub fn load_config_or_onboard(
+    paths: &CliPaths,
+    prompter: &mut dyn AuthPrompter,
+) -> Result<Config, CliError> {
+    if is_first_run(paths) {
+        run_auth_login(
+            &AuthPaths {
+                user_config: paths.user_config.clone(),
+                credentials: paths.credentials.clone(),
+            },
+            prompter,
+        )?;
+    }
+    load_config(&paths.user_config, &paths.project_config).map_err(Into::into)
+}
+
 pub async fn run_cli(paths: CliPaths, prompt: &str) -> Result<(), CliError> {
+    if is_first_run(&paths) {
+        return Err(CliError::NotConfigured);
+    }
     let config = load_config(&paths.user_config, &paths.project_config)?;
     let credentials = CredentialChain::new(vec![
         Box::new(EnvCredentialSource::new()),
@@ -507,7 +532,7 @@ mod tests {
     };
     use crate::agent::message::Message;
     use crate::agent::DEFAULT_SYSTEM_PROMPT;
-    use crate::config::{parse, ProviderKind};
+    use crate::config::{parse, write_config, ConfigError, ProviderKind};
     use crate::credential::{CredentialSource, FileCredentialSource};
     use crate::permission::PermissionDecision;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -852,5 +877,147 @@ mod tests {
         run_auth_logout(&paths, &mut prompter).unwrap();
 
         assert!(!credentials_path.exists());
+    }
+
+    struct PanicAuthPrompter;
+
+    impl AuthPrompter for PanicAuthPrompter {
+        fn read_line(&mut self, _prompt: &str) -> Result<Option<String>, AuthError> {
+            panic!("AuthPrompter must not be called");
+        }
+
+        fn read_secret(&mut self, _prompt: &str) -> Result<Option<SecretString>, AuthError> {
+            panic!("AuthPrompter must not be called");
+        }
+
+        fn select(&mut self, _prompt: &str, _options: &[&str]) -> Result<Option<usize>, AuthError> {
+            panic!("AuthPrompter must not be called");
+        }
+    }
+
+    fn temp_cli_paths(temp: &tempfile::TempDir) -> super::CliPaths {
+        super::CliPaths {
+            user_config: temp.path().join("config.toml"),
+            project_config: temp.path().join("mysteries.toml"),
+            credentials: temp.path().join("credentials"),
+            cwd: temp.path().to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn load_config_or_onboard_first_run_openai_preset_writes_config_and_returns_ok() {
+        use super::{load_config_or_onboard, OPENAI_DEFAULT_MODEL};
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = temp_cli_paths(&temp);
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-openai".to_string())])
+            .with_select_script(vec![Some(0)]);
+
+        let config = load_config_or_onboard(&paths, &mut prompter).unwrap();
+
+        assert_eq!(config.model, OPENAI_DEFAULT_MODEL);
+        assert_eq!(config.provider.kind, ProviderKind::OpenAi);
+        assert!(paths.user_config.exists());
+        assert!(paths.credentials.exists());
+
+        let source = FileCredentialSource::new(&paths.credentials);
+        assert_eq!(
+            source.resolve("openai").unwrap().expose_secret(),
+            "sk-openai"
+        );
+    }
+
+    #[test]
+    fn load_config_or_onboard_skips_onboarding_when_config_exists() {
+        use super::{load_config_or_onboard, preset_patch, ANTHROPIC_DEFAULT_MODEL, ProviderPreset};
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = temp_cli_paths(&temp);
+        let (patch, _) = preset_patch(ProviderPreset::Anthropic);
+        write_config(&paths.user_config, &patch).unwrap();
+        let mut prompter = PanicAuthPrompter;
+
+        let config = load_config_or_onboard(&paths, &mut prompter).unwrap();
+
+        assert_eq!(config.model, ANTHROPIC_DEFAULT_MODEL);
+        assert_eq!(config.provider.kind, ProviderKind::Anthropic);
+    }
+
+    #[test]
+    fn load_config_or_onboard_broken_config_skips_onboarding_and_returns_load_error() {
+        use super::{load_config_or_onboard, CliError};
+        use crate::app::AssemblyError;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = temp_cli_paths(&temp);
+        fs::write(&paths.user_config, "model = \"only-model\"\n").unwrap();
+        let mut prompter = PanicAuthPrompter;
+
+        let err = load_config_or_onboard(&paths, &mut prompter).unwrap_err();
+
+        assert_eq!(
+            err,
+            CliError::Assembly(AssemblyError::Config(ConfigError::MissingField(
+                "provider.kind"
+            )))
+        );
+    }
+
+    #[test]
+    fn load_config_or_onboard_cancelled_on_first_run_writes_nothing() {
+        use super::{load_config_or_onboard, CliError};
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = temp_cli_paths(&temp);
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![None]);
+
+        let err = load_config_or_onboard(&paths, &mut prompter).unwrap_err();
+
+        assert_eq!(err, CliError::Auth(AuthError::Cancelled));
+        assert!(!paths.user_config.exists());
+        assert!(!paths.credentials.exists());
+    }
+
+    #[tokio::test]
+    async fn run_cli_headless_first_run_returns_not_configured() {
+        use super::{run_cli, CliError};
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = temp_cli_paths(&temp);
+
+        let err = run_cli(paths, "hi").await.unwrap_err();
+
+        assert_eq!(err, CliError::NotConfigured);
+    }
+
+    #[test]
+    fn cli_error_not_configured_display_contains_auth_login_command() {
+        use super::CliError;
+
+        assert!(
+            CliError::NotConfigured
+                .to_string()
+                .contains("mysteries auth login")
+        );
+    }
+
+    #[test]
+    fn config_error_missing_field_display_is_readable() {
+        assert_eq!(
+            ConfigError::MissingField("model").to_string(),
+            "missing required config field: model"
+        );
+    }
+
+    #[test]
+    fn cli_error_assembly_transparent_passthrough_missing_field() {
+        use super::CliError;
+        use crate::app::AssemblyError;
+
+        assert_eq!(
+            CliError::Assembly(AssemblyError::Config(ConfigError::MissingField("model")))
+                .to_string(),
+            "missing required config field: model"
+        );
     }
 }

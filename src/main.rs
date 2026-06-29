@@ -6,9 +6,20 @@ use mysteries::tui::run_tui;
 use std::env;
 use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 #[tokio::main]
-async fn main() -> Result<(), CliError> {
+async fn main() -> ExitCode {
+    match real_main().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn real_main() -> Result<(), CliError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let paths = default_paths()?;
 
