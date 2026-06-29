@@ -1,11 +1,14 @@
 use crate::agent::message::Message;
 use crate::agent::AgentStatus;
+use crate::config::ProviderProfile;
 use crate::permission::PermissionDecision;
+use crate::provider::registry::models_for;
 use crate::provider::Usage;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
 use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,6 +100,232 @@ pub struct CommandCompletion {
     pub selected: usize,
 }
 
+/// models picker 行:provider 标题(不可选)或缩进模型行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelsPickerRowKind {
+    ProviderHeader,
+    Model,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelsPickerRow {
+    pub provider_id: String,
+    pub model: Option<String>,
+    pub kind: ModelsPickerRowKind,
+    pub is_current: bool,
+}
+
+/// `/models` 浮层纯逻辑状态机(与 ratatui 解耦,见 tui-shell spec)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelsPicker {
+    rows: Vec<ModelsPickerRow>,
+    filter: String,
+    visible_indices: Vec<usize>,
+    highlight_visible_index: usize,
+}
+
+pub fn build_rows(
+    profiles: &BTreeMap<String, ProviderProfile>,
+    active: (&str, &str),
+) -> Vec<ModelsPickerRow> {
+    let mut rows = Vec::new();
+    for (id, profile) in profiles {
+        rows.push(ModelsPickerRow {
+            provider_id: id.clone(),
+            model: None,
+            kind: ModelsPickerRowKind::ProviderHeader,
+            is_current: false,
+        });
+        let models: Vec<String> = if let Some(catalog) = models_for(id) {
+            catalog.iter().map(|model| (*model).to_string()).collect()
+        } else {
+            vec![profile.model.clone()]
+        };
+        for model in models {
+            rows.push(ModelsPickerRow {
+                provider_id: id.clone(),
+                model: Some(model.clone()),
+                kind: ModelsPickerRowKind::Model,
+                is_current: id.as_str() == active.0 && model == active.1,
+            });
+        }
+    }
+    rows
+}
+
+/// 从 session 字段推断当前 active `(provider_id, model)`。
+pub fn resolve_active_provider<'a>(
+    session_provider: &'a str,
+    session_model: &'a str,
+    profiles: &'a BTreeMap<String, ProviderProfile>,
+) -> (&'a str, &'a str) {
+    if profiles.contains_key(session_provider) {
+        return (session_provider, session_model);
+    }
+
+    let model_matches: Vec<&str> = profiles
+        .iter()
+        .filter(|(id, profile)| {
+            if profile.model == session_model {
+                return true;
+            }
+            models_for(id)
+                .is_some_and(|catalog| catalog.contains(&session_model))
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+
+    if model_matches.len() == 1 {
+        return (model_matches[0], session_model);
+    }
+
+    if let Some((id, _)) = profiles
+        .iter()
+        .find(|(_, profile)| default_provider_id_for_kind(&profile.kind) == session_provider)
+    {
+        return (id.as_str(), session_model);
+    }
+
+    profiles
+        .iter()
+        .next()
+        .map(|(id, _)| (id.as_str(), session_model))
+        .unwrap_or((session_provider, session_model))
+}
+
+fn default_provider_id_for_kind(kind: &crate::config::ProviderKind) -> &'static str {
+    match kind {
+        crate::config::ProviderKind::OpenAi => "openai",
+        crate::config::ProviderKind::Anthropic => "anthropic",
+        crate::config::ProviderKind::Mock => "mock",
+    }
+}
+
+impl ModelsPicker {
+    pub fn new(profiles: &BTreeMap<String, ProviderProfile>, active: (&str, &str)) -> Self {
+        let rows = build_rows(profiles, active);
+        let mut picker = Self {
+            rows,
+            filter: String::new(),
+            visible_indices: Vec::new(),
+            highlight_visible_index: 0,
+        };
+        picker.recompute_visible();
+        picker.highlight_visible_index = picker.initial_highlight_model_index();
+        picker
+    }
+
+    pub fn rows(&self) -> &[ModelsPickerRow] {
+        &self.rows
+    }
+
+    pub fn filter_text(&self) -> &str {
+        &self.filter
+    }
+
+    pub fn visible_rows(&self) -> Vec<&ModelsPickerRow> {
+        self.visible_indices
+            .iter()
+            .map(|index| &self.rows[*index])
+            .collect()
+    }
+
+    pub fn highlighted_row(&self) -> Option<&ModelsPickerRow> {
+        let model_indices = self.visible_model_indices();
+        let row_index = *model_indices.get(self.highlight_visible_index)?;
+        Some(&self.rows[row_index])
+    }
+
+    pub fn push_filter_char(&mut self, ch: char) {
+        self.filter.push(ch);
+        self.recompute_visible();
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        self.filter.pop();
+        self.recompute_visible();
+    }
+
+    pub fn move_highlight(&mut self, delta: isize) {
+        let model_indices = self.visible_model_indices();
+        if model_indices.is_empty() {
+            return;
+        }
+        let len = model_indices.len() as isize;
+        let current = self.highlight_visible_index as isize;
+        self.highlight_visible_index = ((current + delta).rem_euclid(len)) as usize;
+    }
+
+    pub fn selected(&self) -> Option<(String, String)> {
+        if self.shows_empty_hint() {
+            return None;
+        }
+        let row = self.highlighted_row()?;
+        Some((row.provider_id.clone(), row.model.clone()?))
+    }
+
+    pub fn shows_empty_hint(&self) -> bool {
+        !self.filter.is_empty() && self.visible_model_indices().is_empty()
+    }
+
+    fn visible_model_indices(&self) -> Vec<usize> {
+        self.visible_indices
+            .iter()
+            .copied()
+            .filter(|index| self.rows[*index].kind == ModelsPickerRowKind::Model)
+            .collect()
+    }
+
+    fn initial_highlight_model_index(&self) -> usize {
+        let model_indices = self.visible_model_indices();
+        if model_indices.is_empty() {
+            return 0;
+        }
+        model_indices
+            .iter()
+            .position(|index| self.rows[*index].is_current)
+            .unwrap_or(0)
+    }
+
+    fn recompute_visible(&mut self) {
+        let needle = self.filter.to_lowercase();
+        if needle.is_empty() {
+            self.visible_indices = (0..self.rows.len()).collect();
+            self.highlight_visible_index = self
+                .initial_highlight_model_index()
+                .min(self.visible_model_indices().len().saturating_sub(1));
+            return;
+        }
+
+        let mut visible = Vec::new();
+        let mut index = 0;
+        while index < self.rows.len() {
+            if self.rows[index].kind != ModelsPickerRowKind::ProviderHeader {
+                index += 1;
+                continue;
+            }
+            let header_index = index;
+            let provider_id = self.rows[index].provider_id.clone();
+            index += 1;
+            let mut matching = Vec::new();
+            while index < self.rows.len() && self.rows[index].kind == ModelsPickerRowKind::Model {
+                let model = self.rows[index].model.as_deref().unwrap_or("");
+                let haystack = format!("{provider_id}/{model}").to_lowercase();
+                if haystack.contains(&needle) {
+                    matching.push(index);
+                }
+                index += 1;
+            }
+            if !matching.is_empty() {
+                visible.push(header_index);
+                visible.extend(matching);
+            }
+        }
+        self.visible_indices = visible;
+        self.highlight_visible_index = 0;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffKind {
     Add,
@@ -156,6 +385,8 @@ pub struct AppState {
     pub transcript: Vec<TranscriptBlock>,
     pub tools_expanded: bool,
     pub command_completion: Option<CommandCompletion>,
+    pub models_picker: Option<ModelsPicker>,
+    pub provider_profiles: BTreeMap<String, ProviderProfile>,
     pub input: String,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
@@ -197,6 +428,8 @@ impl AppState {
             transcript: Vec::new(),
             tools_expanded: false,
             command_completion: None,
+            models_picker: None,
+            provider_profiles: BTreeMap::new(),
             input: String::new(),
             phase: Phase::Ready,
             pending_permission: None,
@@ -412,6 +645,80 @@ impl AppState {
         self.close_command_completion();
     }
 
+    fn close_models_picker(&mut self) {
+        self.models_picker = None;
+    }
+
+    fn open_models_picker(&mut self) {
+        if self.provider_profiles.is_empty() {
+            self.transcript
+                .push(TranscriptBlock::Notice("无已配 provider".to_string()));
+            return;
+        }
+        let active = resolve_active_provider(
+            &self.session.provider,
+            &self.session.model,
+            &self.provider_profiles,
+        );
+        self.models_picker = Some(ModelsPicker::new(&self.provider_profiles, active));
+    }
+
+    fn handle_models_picker_key(
+        &mut self,
+        key: KeyEvent,
+        input_tx: &mpsc::UnboundedSender<UserInput>,
+    ) -> bool {
+        if self.models_picker.is_none() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                if let Some(picker) = self.models_picker.as_mut() {
+                    picker.move_highlight(-1);
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(picker) = self.models_picker.as_mut() {
+                    picker.move_highlight(1);
+                }
+                true
+            }
+            KeyCode::Enter => {
+                if let Some(picker) = self.models_picker.as_ref() {
+                    if let Some((id, model)) = picker.selected() {
+                        let _ = input_tx.send(UserInput::SetProvider {
+                            id: id.clone(),
+                            model: model.clone(),
+                        });
+                        self.session.provider = id;
+                        self.session.model = model;
+                    }
+                }
+                self.close_models_picker();
+                true
+            }
+            KeyCode::Esc => {
+                self.close_models_picker();
+                true
+            }
+            KeyCode::Char(ch) => {
+                if let Some(picker) = self.models_picker.as_mut() {
+                    picker.push_filter_char(ch);
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = self.models_picker.as_mut() {
+                    picker.pop_filter_char();
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
     fn handle_command_completion_key(&mut self, key: KeyEvent) -> bool {
         if self.command_completion.is_none() {
             return false;
@@ -569,6 +876,10 @@ impl AppState {
             return;
         }
 
+        if self.handle_models_picker_key(key, input_tx) {
+            return;
+        }
+
         if self.handle_command_completion_key(key) {
             return;
         }
@@ -638,6 +949,7 @@ impl AppState {
             Command::Compact => {
                 let _ = _input_tx.send(UserInput::Compact);
             }
+            Command::Models => self.open_models_picker(),
         }
     }
 
@@ -690,17 +1002,20 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_diff, estimate_streaming_rate_tps, estimate_tokens_from_chars, AppState, DiffKind,
-        DiffLine, Phase, SessionSnapshot, StatusSnapshot, ToolCard, ToolCardStatus,
-        TranscriptBlock,
+        build_rows, compute_diff, estimate_streaming_rate_tps, estimate_tokens_from_chars,
+        AppState, DiffKind, DiffLine, ModelsPicker, ModelsPickerRowKind, Phase,
+        SessionSnapshot, StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
     };
     use crate::agent::AgentStatus;
+    use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::PermissionDecision;
     use crate::provider::Usage;
     use crate::tool::ToolOutcome;
     use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
+    use crate::tui::command::Command;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
@@ -736,6 +1051,211 @@ mod tests {
             cwd: PathBuf::from("workspace"),
             tools: 7,
         }
+    }
+
+    fn test_profile(id: &str, model: &str, kind: ProviderKind) -> ProviderProfile {
+        ProviderProfile {
+            id: id.to_string(),
+            kind,
+            base_url: None,
+            model: model.to_string(),
+            auth_type: AuthType::ApiKey,
+        }
+    }
+
+    fn wps_openai_profiles() -> BTreeMap<String, ProviderProfile> {
+        BTreeMap::from([
+            (
+                "wps".to_string(),
+                test_profile("wps", "zhipu/glm-5.2", ProviderKind::OpenAi),
+            ),
+            (
+                "openai".to_string(),
+                test_profile("openai", "gpt-5.5", ProviderKind::OpenAi),
+            ),
+        ])
+    }
+
+    // --- ModelsPicker §2.1 (卡点 A) ---
+
+    #[test]
+    fn build_rows_groups_providers_marks_current_and_headers_not_selectable() {
+        let profiles = wps_openai_profiles();
+        let rows = build_rows(&profiles, ("wps", "zhipu/glm-5.2"));
+
+        let wps_header = rows
+            .iter()
+            .find(|row| row.provider_id == "wps" && row.kind == ModelsPickerRowKind::ProviderHeader)
+            .expect("wps header");
+        assert_eq!(wps_header.model, None);
+        assert!(!wps_header.is_current);
+
+        let wps_models: Vec<_> = rows
+            .iter()
+            .filter(|row| row.provider_id == "wps" && row.kind == ModelsPickerRowKind::Model)
+            .collect();
+        assert_eq!(wps_models.len(), 8, "wps catalog has 8 models");
+        assert!(wps_models
+            .iter()
+            .any(|row| row.model.as_deref() == Some("zhipu/glm-5.2") && row.is_current));
+        assert_eq!(
+            wps_models
+                .iter()
+                .filter(|row| row.is_current)
+                .count(),
+            1
+        );
+
+        let openai_header = rows
+            .iter()
+            .find(|row| {
+                row.provider_id == "openai" && row.kind == ModelsPickerRowKind::ProviderHeader
+            })
+            .expect("openai header");
+        assert_eq!(openai_header.model, None);
+
+        let openai_models: Vec<_> = rows
+            .iter()
+            .filter(|row| row.provider_id == "openai" && row.kind == ModelsPickerRowKind::Model)
+            .collect();
+        assert_eq!(openai_models.len(), 1);
+        assert_eq!(openai_models[0].model.as_deref(), Some("gpt-5.5"));
+        assert!(!openai_models[0].is_current);
+    }
+
+    #[test]
+    fn build_rows_custom_provider_lists_configured_model_only() {
+        let profiles = BTreeMap::from([(
+            "my-llm".to_string(),
+            test_profile("my-llm", "x-1", ProviderKind::OpenAi),
+        )]);
+        let rows = build_rows(&profiles, ("my-llm", "x-1"));
+
+        let headers: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == ModelsPickerRowKind::ProviderHeader)
+            .collect();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].provider_id, "my-llm");
+
+        let models: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == ModelsPickerRowKind::Model)
+            .collect();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model.as_deref(), Some("x-1"));
+    }
+
+    #[test]
+    fn move_highlight_skips_headers_wraps_on_model_rows_only() {
+        let profiles = wps_openai_profiles();
+        let mut picker = ModelsPicker::new(&profiles, ("wps", "zhipu/glm-5.2"));
+
+        let first = picker
+            .highlighted_row()
+            .expect("initial highlight")
+            .clone();
+        assert_eq!(first.kind, ModelsPickerRowKind::Model);
+
+        picker.move_highlight(1);
+        assert_eq!(picker.highlighted_row().unwrap().kind, ModelsPickerRowKind::Model);
+        assert_ne!(picker.highlighted_row().unwrap().model, first.model);
+
+        for _ in 0..8 {
+            picker.move_highlight(1);
+            assert_eq!(
+                picker.highlighted_row().unwrap().kind,
+                ModelsPickerRowKind::Model
+            );
+        }
+
+        let all_models: Vec<_> = build_rows(&profiles, ("wps", "zhipu/glm-5.2"))
+            .into_iter()
+            .filter(|row| row.kind == ModelsPickerRowKind::Model)
+            .collect();
+        let first_in_list = all_models.first().unwrap().model.clone();
+        let last_in_list = all_models.last().unwrap().model.clone();
+
+        while picker.highlighted_row().unwrap().model != last_in_list {
+            picker.move_highlight(1);
+        }
+        assert_eq!(picker.highlighted_row().unwrap().model, last_in_list);
+
+        picker.move_highlight(1);
+        assert_eq!(picker.highlighted_row().unwrap().model, first_in_list);
+
+        while picker.highlighted_row().unwrap().model != first_in_list {
+            picker.move_highlight(-1);
+        }
+        picker.move_highlight(-1);
+        assert_eq!(picker.highlighted_row().unwrap().model, last_in_list);
+    }
+
+    #[test]
+    fn filter_substring_resets_highlight_to_first_visible_model() {
+        let profiles = wps_openai_profiles();
+        let mut picker = ModelsPicker::new(&profiles, ("wps", "zhipu/glm-5.2"));
+
+        for c in "glm".chars() {
+            picker.push_filter_char(c);
+        }
+        assert_eq!(picker.filter_text(), "glm");
+
+        let visible = picker.visible_rows();
+        assert!(
+            visible
+                .iter()
+                .all(|row| row.kind != ModelsPickerRowKind::ProviderHeader
+                    || row.provider_id == "wps"),
+            "only wps group should remain when filtering glm"
+        );
+        assert!(
+            visible
+                .iter()
+                .filter(|row| row.kind == ModelsPickerRowKind::Model)
+                .all(|row| {
+                    let haystack = format!("{}/{}", row.provider_id, row.model.as_deref().unwrap_or(""));
+                    haystack.to_lowercase().contains("glm")
+                })
+        );
+
+        let highlighted = picker.highlighted_row().expect("highlight after filter");
+        assert_eq!(highlighted.kind, ModelsPickerRowKind::Model);
+        let first_model = visible
+            .iter()
+            .find(|row| row.kind == ModelsPickerRowKind::Model)
+            .expect("first visible model");
+        assert_eq!(highlighted.provider_id, first_model.provider_id);
+        assert_eq!(highlighted.model, first_model.model);
+    }
+
+    #[test]
+    fn filter_no_match_shows_empty_hint_and_enter_is_no_op() {
+        let profiles = wps_openai_profiles();
+        let mut picker = ModelsPicker::new(&profiles, ("wps", "zhipu/glm-5.2"));
+
+        for c in "zzznomatch".chars() {
+            picker.push_filter_char(c);
+        }
+        assert!(picker.shows_empty_hint());
+        assert_eq!(picker.selected(), None);
+    }
+
+    #[test]
+    fn selected_returns_highlighted_provider_and_model_on_enter() {
+        let profiles = wps_openai_profiles();
+        let mut picker = ModelsPicker::new(&profiles, ("wps", "zhipu/glm-5.2"));
+
+        while picker.highlighted_row().is_none_or(|row| {
+            row.provider_id != "wps" || row.model.as_deref() != Some("zhipu/glm-5")
+        }) {
+            picker.move_highlight(1);
+        }
+
+        assert_eq!(
+            picker.selected(),
+            Some(("wps".to_string(), "zhipu/glm-5".to_string()))
+        );
     }
 
     #[test]
@@ -1362,7 +1882,15 @@ mod tests {
         state.on_key(key(KeyCode::Char('/')), &tx);
         assert_eq!(
             completion_names(&state),
-            vec!["/help", "/clear", "/model", "/status", "/exit", "/compact"]
+            vec![
+                "/help",
+                "/clear",
+                "/model",
+                "/models",
+                "/status",
+                "/exit",
+                "/compact"
+            ]
         );
         assert_eq!(selected_completion_name(&state), "/help");
 
@@ -1379,6 +1907,50 @@ mod tests {
         state.on_key(key(KeyCode::Tab), &tx);
         assert_eq!(state.input, "/clear");
         assert!(state.command_completion.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn models_command_opens_picker_and_enter_sends_set_provider() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.provider_profiles = wps_openai_profiles();
+        state.session.provider = "wps".to_string();
+        state.session.model = "zhipu/glm-5.2".to_string();
+
+        state.input = "/models".to_string();
+        state.on_key(key(KeyCode::Enter), &tx);
+        assert!(state.models_picker.is_some());
+
+        state.on_key(key(KeyCode::Enter), &tx);
+
+        assert!(state.models_picker.is_none());
+        assert_eq!(state.session.provider, "wps");
+        assert_eq!(state.session.model, "zhipu/glm-5.2");
+        match rx.try_recv() {
+            Ok(UserInput::SetProvider { id, model }) => {
+                assert_eq!(id, "wps");
+                assert_eq!(model, "zhipu/glm-5.2");
+            }
+            other => panic!("expected SetProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn models_picker_escape_closes_without_set_provider() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.provider_profiles = wps_openai_profiles();
+        state.session.provider = "wps".to_string();
+        state.session.model = "zhipu/glm-5.2".to_string();
+        state.execute_command(Command::Models, &tx);
+        assert!(state.models_picker.is_some());
+
+        state.on_key(key(KeyCode::Esc), &tx);
+
+        assert!(state.models_picker.is_none());
+        assert_eq!(state.session.model, "zhipu/glm-5.2");
+        assert_eq!(state.session.provider, "wps");
         assert!(rx.try_recv().is_err());
     }
 

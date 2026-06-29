@@ -3,6 +3,7 @@ pub enum Command {
     Help,
     Clear,
     Model(Option<String>),
+    Models,
     Status,
     Exit,
     Compact,
@@ -14,6 +15,7 @@ enum BuiltinCommand {
     Help,
     Clear,
     Model,
+    Models,
     Status,
     Exit,
     Compact,
@@ -27,7 +29,7 @@ pub struct CommandMetadata {
     command: BuiltinCommand,
 }
 
-const COMMANDS: [CommandMetadata; 6] = [
+const COMMANDS: [CommandMetadata; 7] = [
     CommandMetadata {
         name: "/help",
         description: "查看内置命令",
@@ -45,6 +47,12 @@ const COMMANDS: [CommandMetadata; 6] = [
         description: "查看或切换后续请求 model",
         usage: "/model [name]",
         command: BuiltinCommand::Model,
+    },
+    CommandMetadata {
+        name: "/models",
+        description: "浏览 / 切换 provider 与模型",
+        usage: "/models",
+        command: BuiltinCommand::Models,
     },
     CommandMetadata {
         name: "/status",
@@ -90,6 +98,7 @@ pub fn parse_command(input: &str) -> Option<Command> {
         BuiltinCommand::Clear => Command::Clear,
         BuiltinCommand::Model if args.is_empty() => Command::Model(None),
         BuiltinCommand::Model => Command::Model(Some(args.to_string())),
+        BuiltinCommand::Models => Command::Models,
         BuiltinCommand::Status => Command::Status,
         BuiltinCommand::Exit => Command::Exit,
         BuiltinCommand::Compact => Command::Compact,
@@ -112,6 +121,7 @@ mod tests {
                 "/model claude-haiku",
                 Some(Command::Model(Some("claude-haiku".to_string()))),
             ),
+            ("/models", Some(Command::Models)),
             ("/status", Some(Command::Status)),
             ("/compact", Some(Command::Compact)),
             ("/exit", Some(Command::Exit)),
@@ -127,8 +137,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_models_does_not_collide_with_model_prefix() {
+        assert_eq!(parse_command("/models"), Some(Command::Models));
+        assert_eq!(parse_command("/model"), Some(Command::Model(None)));
+        assert_eq!(
+            parse_command("/model claude"),
+            Some(Command::Model(Some("claude".to_string())))
+        );
+    }
+
+    #[test]
     fn command_metadata_covers_all_builtin_commands_and_matches_parser() {
-        let expected = ["/help", "/clear", "/model", "/status", "/exit", "/compact"];
+        let expected = [
+            "/help",
+            "/clear",
+            "/model",
+            "/models",
+            "/status",
+            "/exit",
+            "/compact",
+        ];
         let metadata = command_metadata();
         let names = metadata
             .iter()

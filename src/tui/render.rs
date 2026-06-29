@@ -1,12 +1,12 @@
 use crate::tui::app::{
-    compute_diff, AppState, DiffKind, DiffLine, Phase, StatusSnapshot, ToolCard, ToolCardStatus,
-    TranscriptBlock,
+    compute_diff, AppState, DiffKind, DiffLine, ModelsPickerRowKind, Phase, StatusSnapshot,
+    ToolCard, ToolCardStatus, TranscriptBlock,
 };
 use crate::tui::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 const STATUS_TOP_GAP_LINES: u16 = 2;
@@ -29,6 +29,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     render_input(frame, rows[5], state, theme);
     render_command_completion(frame, rows[5], state, theme);
     render_status(frame, rows[6], state, theme);
+    render_models_picker(frame, rows[6], state, theme);
 }
 
 pub(crate) fn transcript_line_count(state: &AppState, theme: &Theme, width: usize) -> usize {
@@ -369,6 +370,7 @@ fn help_block_lines(theme: &Theme, width: usize) -> Vec<Line<'static>> {
         ("/clear", "清空当前 transcript"),
         ("/model", "查看当前 model"),
         ("/model <name>", "切换后续请求 model"),
+        ("/models", "浏览 / 切换 provider 与模型"),
         ("/status", "当前会话快照"),
         ("/exit", "退出 TUI"),
     ];
@@ -1100,6 +1102,137 @@ fn render_command_completion(
     frame.render_widget(paragraph, area);
 }
 
+fn render_models_picker(
+    frame: &mut Frame<'_>,
+    status_area: Rect,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let Some(picker) = &state.models_picker else {
+        return;
+    };
+
+    let visible = picker.visible_rows();
+    let highlighted = picker.highlighted_row().map(|row| {
+        (
+            row.provider_id.as_str(),
+            row.model.as_deref().unwrap_or(""),
+        )
+    });
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        "模型",
+        Style::default()
+            .fg(theme.accent_primary)
+            .bg(theme.bg_surface)
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    if picker.shows_empty_hint() {
+        lines.push(Line::from(Span::styled(
+            "无匹配模型",
+            Style::default()
+                .fg(theme.text_secondary)
+                .bg(theme.bg_surface),
+        )));
+    } else {
+        for row in visible {
+            match row.kind {
+                ModelsPickerRowKind::ProviderHeader => {
+                    lines.push(Line::from(Span::styled(
+                        row.provider_id.clone(),
+                        Style::default()
+                            .fg(theme.text_secondary)
+                            .bg(theme.bg_surface)
+                            .add_modifier(Modifier::DIM),
+                    )));
+                }
+                ModelsPickerRowKind::Model => {
+                    let model = row.model.as_deref().unwrap_or("");
+                    let is_highlighted = highlighted
+                        .is_some_and(|(id, name)| id == row.provider_id && name == model);
+                    let mut spans = vec![Span::styled(
+                        "  ".to_string(),
+                        Style::default().bg(theme.bg_surface),
+                    )];
+                    if row.is_current {
+                        spans.push(Span::styled(
+                            "● ".to_string(),
+                            Style::default()
+                                .fg(theme.accent_primary)
+                                .bg(theme.bg_surface),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            "  ".to_string(),
+                            Style::default().bg(theme.bg_surface),
+                        ));
+                    }
+                    let mut style = Style::default().bg(theme.bg_surface);
+                    if is_highlighted {
+                        style = style
+                            .fg(theme.accent_primary)
+                            .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+                    } else {
+                        style = style.fg(theme.text_body);
+                    }
+                    spans.push(Span::styled(model.to_string(), style));
+                    lines.push(Line::from(spans));
+                }
+            }
+        }
+    }
+
+    if !picker.filter_text().is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "过滤: ",
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .bg(theme.bg_surface),
+            ),
+            Span::styled(
+                picker.filter_text().to_string(),
+                Style::default()
+                    .fg(theme.accent_primary)
+                    .bg(theme.bg_surface),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "↑↓ 选 · Enter 切 · Esc 取消",
+        Style::default()
+            .fg(theme.text_secondary)
+            .bg(theme.bg_surface),
+    )));
+
+    let list_height = lines.len() as u16 + 2;
+    let width = status_area.width.min(56);
+    let area = Rect {
+        x: status_area.x,
+        y: status_area.y.saturating_sub(list_height + 1),
+        width,
+        height: list_height,
+    };
+
+    frame.render_widget(Clear, area);
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(
+                    Style::default()
+                        .fg(theme.border_strong)
+                        .bg(theme.bg_surface),
+                )
+                .style(Style::default().fg(theme.text_primary).bg(theme.bg_surface)),
+        )
+        .style(Style::default().fg(theme.text_primary).bg(theme.bg_surface));
+    frame.render_widget(paragraph, area);
+}
+
 fn input_cursor_position(area: Rect, input: &str) -> Position {
     const INPUT_PROMPT: &str = "mysteries ▸ ";
 
@@ -1118,8 +1251,9 @@ fn input_cursor_position(area: Rect, input: &str) -> Position {
 mod tests {
     use super::{render, transcript_line_count};
     use crate::provider::Usage;
+    use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::tui::app::{
-        AppState, Phase, SessionSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
+        AppState, ModelsPicker, Phase, SessionSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
     };
     use crate::tui::channel::{AgentEvent, PermissionRequest};
     use crate::tui::theme::Theme;
@@ -1130,6 +1264,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
     use ratatui::Terminal;
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
@@ -1364,6 +1499,55 @@ mod tests {
         }
     }
 
+    fn wps_openai_profiles() -> BTreeMap<String, ProviderProfile> {
+        BTreeMap::from([
+            (
+                "wps".to_string(),
+                ProviderProfile {
+                    id: "wps".to_string(),
+                    kind: ProviderKind::OpenAi,
+                    base_url: None,
+                    model: "zhipu/glm-5.2".to_string(),
+                    auth_type: AuthType::ApiKey,
+                },
+            ),
+            (
+                "openai".to_string(),
+                ProviderProfile {
+                    id: "openai".to_string(),
+                    kind: ProviderKind::OpenAi,
+                    base_url: None,
+                    model: "gpt-5.5".to_string(),
+                    auth_type: AuthType::ApiKey,
+                },
+            ),
+        ])
+    }
+
+    fn models_picker_state() -> AppState {
+        let profiles = wps_openai_profiles();
+        let mut state = AppState::with_session(SessionSnapshot {
+            provider: "wps".to_string(),
+            model: "zhipu/glm-5.2".to_string(),
+            max_iterations: 8,
+            cwd: PathBuf::from("workspace"),
+            tools: 7,
+        });
+        state.provider_profiles = profiles.clone();
+        state.models_picker = Some(ModelsPicker::new(&profiles, ("wps", "zhipu/glm-5.2")));
+        state
+    }
+
+    fn models_picker_filtered_state() -> AppState {
+        let mut state = models_picker_state();
+        if let Some(picker) = state.models_picker.as_mut() {
+            for ch in "glm".chars() {
+                picker.push_filter_char(ch);
+            }
+        }
+        state
+    }
+
     #[test]
     fn welcome_state_snapshot() {
         let state = AppState::new();
@@ -1394,7 +1578,7 @@ mod tests {
         state.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), &tx);
         let text = render_to_styled(&state, &Theme::midnight());
 
-        for command in ["/help", "/compact"] {
+        for command in ["/help", "/models", "/compact"] {
             assert!(
                 text.contains(command),
                 "completion popup should list {command}"
@@ -1404,6 +1588,27 @@ mod tests {
             "\n--- command completion frame ---\n{text}\n--- end command completion frame ---"
         );
         insta::assert_snapshot!("tui_command_completion", text);
+    }
+
+    #[test]
+    fn models_picker_open_snapshot() {
+        let state = models_picker_state();
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        assert!(text.contains("模型"));
+        assert!(text.contains("wps"));
+        assert!(text.contains("zhipu/glm-5.2"));
+        assert!(text.contains("↑↓ 选 · Enter 切 · Esc 取消"));
+        println!("\n--- models picker open ---\n{text}\n--- end models picker open ---");
+        insta::assert_snapshot!("tui_models_picker_open", text);
+    }
+
+    #[test]
+    fn models_picker_filtered_snapshot() {
+        let state = models_picker_filtered_state();
+        let text = render_to_styled(&state, &Theme::midnight());
+        println!("\n--- models picker filtered ---\n{text}\n--- end models picker filtered ---");
+        insta::assert_snapshot!("tui_models_picker_filtered", text);
     }
 
     #[test]

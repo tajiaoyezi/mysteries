@@ -47,7 +47,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
         Box::new(FileCredentialSource::new(paths.credentials.clone())),
     ]);
     let provider = crate::app::select_provider(&config, credentials)?;
-    let provider_name = provider.name().to_string();
+    let provider_id = config.provider.id.clone();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
@@ -67,7 +67,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
     };
     let task_config = RunAgentTaskConfig {
-        profiles,
+        profiles: profiles.clone(),
         startup_config: config.clone(),
         credentials_path: paths.credentials.clone(),
         tool_ctx: ctx,
@@ -84,7 +84,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let mut terminal = terminal::TerminalGuard::new()?;
     let mut state = app::AppState::with_session_and_history(
         app::SessionSnapshot {
-            provider: provider_name,
+            provider: provider_id,
             model: config.model.clone(),
             max_iterations: config.max_iterations,
             cwd,
@@ -92,6 +92,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
         },
         agent_history,
     );
+    state.provider_profiles = profiles;
     let mut events = EventStream::new();
     let theme = theme::Theme::midnight();
     let debug_events = debug_events_enabled();
@@ -121,7 +122,9 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                                 if should_exit(&state, key) {
                                     break;
                                 }
-                                let scroll_handled = if arrows_route_to_completion(&state, key) {
+                                let scroll_handled = if arrows_route_to_models_picker(&state, key)
+                                    || arrows_route_to_completion(&state, key)
+                                {
                                     false
                                 } else {
                                     handle_scroll_key(&mut terminal, &mut state, key, &theme)?
@@ -240,6 +243,10 @@ fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
         return false;
     }
 
+    if state.models_picker.is_some() && key.code == KeyCode::Esc {
+        return false;
+    }
+
     if state.command_completion.is_some() && key.code == KeyCode::Esc {
         return false;
     }
@@ -249,6 +256,12 @@ fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
     }
 
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn arrows_route_to_models_picker(state: &app::AppState, key: KeyEvent) -> bool {
+    is_key_press(key)
+        && state.models_picker.is_some()
+        && matches!(key.code, KeyCode::Up | KeyCode::Down)
 }
 
 fn arrows_route_to_completion(state: &app::AppState, key: KeyEvent) -> bool {

@@ -1,0 +1,28 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+
+
+
+‹text.primary›                                  ‹/›‹text.title +bold›✦ MYSTERIES‹/›
+‹border.strong bg=bg.surface›┌──────────────────────────────────────────────────────┐‹/›
+‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›模型‹/›‹text.primary bg=bg.surface›                                                  ‹/›‹border.strong bg=bg.surface›│‹/›‹text.body› diff 摊给你,等‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.secondary bg=bg.surface +dim›openai‹/›‹text.primary bg=bg.surface›                                                ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.primary bg=bg.surface›    ‹/›‹text.body bg=bg.surface›gpt-5.5‹/›‹text.primary bg=bg.surface›                                           ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.secondary bg=bg.surface +dim›wps‹/›‹text.primary bg=bg.surface›                                                   ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.primary bg=bg.surface›  ‹/›‹accent.primary bg=bg.surface›● ‹/›‹accent.primary bg=bg.surface +bold +reversed›zhipu/glm-5.2‹/›‹text.primary bg=bg.surface›                                     ‹/›‹border.strong bg=bg.surface›│‹/›‹text.primary›段‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.primary bg=bg.surface›    ‹/›‹text.body bg=bg.surface›zhipu/glm-5‹/›‹text.primary bg=bg.surface›                                       ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.primary bg=bg.surface›    ‹/›‹text.body bg=bg.surface›moonshot/kimi-k2.5‹/›‹text.primary bg=bg.surface›                                ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.primary bg=bg.surface›    ‹/›‹text.body bg=bg.surface›deepseek/deepseek-v4-pro‹/›‹text.primary bg=bg.surface›                          ‹/›‹border.strong bg=bg.surface›│‹/›‹text.primary›Loop)‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.primary bg=bg.surface›    ‹/›‹text.body bg=bg.surface›deepseek/deepseek-v4-flash‹/›‹text.primary bg=bg.surface›                        ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.primary bg=bg.surface›    ‹/›‹text.body bg=bg.surface›ali/qwen3.7-max‹/›‹text.primary bg=bg.surface›                                   ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.primary bg=bg.surface›    ‹/›‹text.body bg=bg.surface›xiaomi/mimo-v2.5-pro‹/›‹text.primary bg=bg.surface›                              ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.primary bg=bg.surface›    ‹/›‹text.body bg=bg.surface›google/gemini-3.5-flash‹/›‹text.primary bg=bg.surface›                           ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹text.secondary bg=bg.surface›↑↓ 选 · Enter 切 · Esc 取消‹/›‹text.primary bg=bg.surface›                           ‹/›‹border.strong bg=bg.surface›│‹/›‹border.subtle›───────────────────────┐‹/›
+‹border.strong bg=bg.surface›└──────────────────────────────────────────────────────┘‹/›‹text.primary›                       ‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›wps · zhipu/glm-5.2 · iter 0/8 · 0 msgs · workspace‹/›

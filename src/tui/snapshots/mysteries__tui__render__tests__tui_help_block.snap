@@ -8,9 +8,9 @@ expression: text
 ‹border.subtle›┌─ ‹/›‹info.fg +bold›帮助‹/›‹border.subtle› ────────────────────────────────────────────────────────────────────────‹/›
 ‹border.subtle›│ ‹/›‹accent.primary +bold›/help         ‹/›‹text.body›查看内置命令               ‹/›‹accent.primary +bold›/clear        ‹/›‹text.body›清空当前 transcript‹/›
 ‹border.subtle›│ ‹/›‹accent.primary +bold›/model        ‹/›‹text.body›查看当前 model           ‹/›‹accent.primary +bold›/model <name> ‹/›‹text.body›切换后续请求 model‹/›
-‹border.subtle›│ ‹/›‹accent.primary +bold›/status       ‹/›‹text.body›当前会话快照               ‹/›‹accent.primary +bold›/exit         ‹/›‹text.body›退出 TUI‹/›
+‹border.subtle›│ ‹/›‹accent.primary +bold›/models       ‹/›‹text.body›浏览 / 切换 provider 与模型   ‹/›‹accent.primary +bold›/status       ‹/›‹text.body›当前会话快照‹/›
+‹border.subtle›│ ‹/›‹accent.primary +bold›/exit         ‹/›‹text.body›退出 TUI‹/›
 ‹border.subtle›└───────────────────────────────────────────────────────────────────────────────‹/›
-
 
 
 
