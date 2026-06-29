@@ -1,7 +1,9 @@
+use crate::permission::{permission_mode_label, PermissionMode};
 use crate::tui::app::{
     compute_diff, AppState, DiffKind, DiffLine, ModelsPickerRowKind, Phase, StatusSnapshot,
     ToolCard, ToolCardStatus, TranscriptBlock,
 };
+use crate::tui::jump_to_bottom::jump_to_bottom_pill_text;
 use crate::tui::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -22,6 +24,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
 
     render_header(frame, rows[0], theme);
     render_transcript(frame, rows[1], state, theme);
+    render_jump_to_bottom_pill(frame, rows[1], state, theme);
     if state.pending_permission.is_some() {
         render_permission(frame, rows[2], state, theme);
     }
@@ -30,6 +33,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     render_command_completion(frame, rows[5], state, theme);
     render_status(frame, rows[6], state, theme);
     render_models_picker(frame, rows[6], state, theme);
+    render_mode_line(frame, rows[7], state, theme);
 }
 
 pub(crate) fn transcript_line_count(state: &AppState, theme: &Theme, width: usize) -> usize {
@@ -50,6 +54,7 @@ fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
             Constraint::Length(status_top_gap_height(state)),
             Constraint::Length(1),
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area)
@@ -99,6 +104,37 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         .block(Block::default().borders(Borders::NONE))
         .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
     frame.render_widget(paragraph, area);
+}
+
+fn render_jump_to_bottom_pill(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+    if state.follows_bottom() || area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let text = jump_to_bottom_pill_text(state.new_message_count);
+    let content_width = display_width(&text);
+    let pill_width = (content_width + 2).min(area.width as usize) as u16;
+    if pill_width == 0 {
+        return;
+    }
+
+    let pill_area = Rect {
+        x: area.x + (area.width.saturating_sub(pill_width)) / 2,
+        y: area.y + area.height.saturating_sub(1),
+        width: pill_width,
+        height: 1,
+    };
+
+    frame.render_widget(Clear, pill_area);
+
+    let pill_style = Style::default()
+        .fg(theme.accent_primary)
+        .bg(theme.bg_surface);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, pill_style)))
+            .style(Style::default().bg(theme.bg_surface)),
+        pill_area,
+    );
 }
 
 fn transcript_content_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
@@ -952,17 +988,15 @@ fn token_rate_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
-    let meta = status_meta(state);
-    let paragraph = Paragraph::new(Line::from(vec![Span::styled(
-        meta,
-        Style::default().fg(theme.text_muted).bg(theme.bg_base),
-    )]))
-    .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
+    let spans = status_meta_spans(state, theme);
+    let paragraph = Paragraph::new(Line::from(spans))
+        .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
     frame.render_widget(paragraph, area);
 }
 
-fn status_meta(state: &AppState) -> String {
-    format!(
+fn status_meta_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
+    let base = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+    let meta = format!(
         "{} · {} · iter {}/{} · {} msgs · {}",
         state.session.provider,
         state.session.model,
@@ -970,7 +1004,41 @@ fn status_meta(state: &AppState) -> String {
         state.session.max_iterations,
         state.dialog_message_count(),
         state.session.cwd.display()
-    )
+    );
+    vec![Span::styled(meta, base)]
+}
+
+fn mode_glyph_and_style(mode: PermissionMode, theme: &Theme) -> (&'static str, Style) {
+    match mode {
+        PermissionMode::Normal => (
+            "▸",
+            Style::default().fg(theme.text_muted).bg(theme.bg_base),
+        ),
+        PermissionMode::AcceptEdits => (
+            "▸▸",
+            Style::default()
+                .fg(theme.accent_primary)
+                .bg(theme.bg_base),
+        ),
+        PermissionMode::Yolo => (
+            "▲",
+            Style::default().fg(theme.warning_fg).bg(theme.bg_base),
+        ),
+    }
+}
+
+fn render_mode_line(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+    let mode = state.current_permission_mode();
+    let label = permission_mode_label(mode);
+    let (glyph, mode_style) = mode_glyph_and_style(mode, theme);
+    let tail_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+    let paragraph = Paragraph::new(Line::from(vec![
+        Span::styled(glyph, mode_style),
+        Span::styled(format!(" {label}"), mode_style),
+        Span::styled(" · shift+tab 切换", tail_style),
+    ]))
+    .style(Style::default().bg(theme.bg_base));
+    frame.render_widget(paragraph, area);
 }
 
 fn display_width(text: &str) -> usize {
@@ -1009,7 +1077,8 @@ fn is_zero_width(ch: char) -> bool {
 fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
     const INPUT_PROMPT: &str = "mysteries ▸ ";
 
-    let content = if state.input.is_empty() {
+    let input_text = state.input();
+    let content = if input_text.is_empty() {
         Line::from(vec![
             Span::styled(
                 INPUT_PROMPT,
@@ -1027,7 +1096,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
                 Style::default().fg(theme.accent_primary).bg(theme.bg_base),
             ),
             Span::styled(
-                state.input.clone(),
+                input_text.to_string(),
                 Style::default().fg(theme.text_primary).bg(theme.bg_base),
             ),
         ])
@@ -1041,7 +1110,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
         )
         .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
     frame.render_widget(paragraph, area);
-    frame.set_cursor_position(input_cursor_position(area, &state.input));
+    frame.set_cursor_position(input_cursor_position(area, input_text));
 }
 
 fn render_command_completion(
@@ -1250,6 +1319,7 @@ fn input_cursor_position(area: Rect, input: &str) -> Position {
 #[cfg(test)]
 mod tests {
     use super::{render, transcript_line_count};
+    use crate::permission::PermissionMode;
     use crate::provider::Usage;
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::tui::app::{
@@ -1430,6 +1500,38 @@ mod tests {
             .to_string()
     }
 
+    fn mode_line(text: &str) -> String {
+        text.lines()
+            .find(|line| line.contains("shift+tab 切换"))
+            .unwrap()
+            .to_string()
+    }
+
+    fn jump_to_bottom_pill_line(text: &str) -> String {
+        text.lines()
+            .find(|line| line.contains("ctrl+End"))
+            .map(|line| line.to_string())
+            .unwrap_or_default()
+    }
+
+    fn scrolled_away_state() -> AppState {
+        let mut state = AppState::new();
+        state.transcript.push(TranscriptBlock::Assistant(
+            "first line\nsecond line\nthird line".to_string(),
+        ));
+        state.scroll_to_top(100, 20);
+        state
+    }
+
+    fn state_with_permission_mode(mode: PermissionMode) -> AppState {
+        let state = AppState::new();
+        *state
+            .permission_mode
+            .lock()
+            .expect("permission mode mutex poisoned") = mode;
+        state
+    }
+
     #[test]
     fn display_width_treats_common_emoji_as_wide() {
         assert_eq!(super::display_width("a"), 1);
@@ -1457,7 +1559,7 @@ mod tests {
     #[test]
     fn input_render_sets_cursor_at_input_end() {
         let mut state = AppState::new();
-        state.input = "你好".to_string();
+        state.input_line.input = "你好".to_string();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1467,7 +1569,7 @@ mod tests {
 
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(17, 21));
+            .assert_cursor_position(Position::new(17, 20));
     }
 
     fn tool_card(
@@ -1609,6 +1711,63 @@ mod tests {
         let text = render_to_styled(&state, &Theme::midnight());
         println!("\n--- models picker filtered ---\n{text}\n--- end models picker filtered ---");
         insta::assert_snapshot!("tui_models_picker_filtered", text);
+    }
+
+    #[test]
+    fn jump_to_bottom_pill_hidden_when_following() {
+        let state = AppState::new();
+        let text = render_to_styled(&state, &Theme::midnight());
+        assert!(!text.contains("ctrl+End"));
+    }
+
+    #[test]
+    fn jump_to_bottom_pill_idle_snapshot() {
+        let state = scrolled_away_state();
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!("tui_jump_to_bottom_pill_idle", jump_to_bottom_pill_line(&text));
+    }
+
+    #[test]
+    fn jump_to_bottom_pill_with_new_messages_snapshot() {
+        let mut state = scrolled_away_state();
+        state.new_message_count = 2;
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!(
+            "tui_jump_to_bottom_pill_new_messages",
+            jump_to_bottom_pill_line(&text)
+        );
+    }
+
+    #[test]
+    fn mode_line_normal_snapshot() {
+        let state = state_with_permission_mode(PermissionMode::Normal);
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!("tui_mode_line_normal", mode_line(&text));
+    }
+
+    #[test]
+    fn mode_line_accept_edits_snapshot() {
+        let state = state_with_permission_mode(PermissionMode::AcceptEdits);
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!("tui_mode_line_accept_edits", mode_line(&text));
+    }
+
+    #[test]
+    fn mode_line_yolo_snapshot() {
+        let state = state_with_permission_mode(PermissionMode::Yolo);
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!("tui_mode_line_yolo", mode_line(&text));
+    }
+
+    #[test]
+    fn yolo_mode_shows_mode_line_without_permission_box() {
+        let state = state_with_permission_mode(PermissionMode::Yolo);
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        assert!(text.contains("▲ yolo"));
+        assert!(text.contains("shift+tab 切换"));
+        assert!(!text.contains("MODE:"));
+        assert!(!text.contains("需要授权"));
     }
 
     #[test]

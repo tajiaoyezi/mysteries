@@ -30,7 +30,7 @@ impl Tool for EditFileTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::RequiresConfirmation
+        PermissionLevel::Edit
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
@@ -89,7 +89,7 @@ impl Tool for WriteFileTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::RequiresConfirmation
+        PermissionLevel::Edit
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
@@ -164,7 +164,7 @@ mod tests {
         assert_eq!(tool.name(), "write_file");
         assert_eq!(
             tool.permission_level(),
-            PermissionLevel::RequiresConfirmation
+            PermissionLevel::Edit
         );
         assert!(!outcome.is_error);
         assert_eq!(outcome.exit, None);
@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(tool.name(), "edit_file");
         assert_eq!(
             tool.permission_level(),
-            PermissionLevel::RequiresConfirmation
+            PermissionLevel::Edit
         );
         assert!(!outcome.is_error);
         assert_eq!(outcome.exit, None);

@@ -8,6 +8,39 @@ pub enum PermissionDecision {
     Deny,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionMode {
+    Normal,
+    AcceptEdits,
+    Yolo,
+}
+
+pub fn auto_allows(mode: PermissionMode, level: PermissionLevel) -> bool {
+    match (mode, level) {
+        (PermissionMode::Normal, PermissionLevel::Edit | PermissionLevel::Execute) => false,
+        (PermissionMode::AcceptEdits, PermissionLevel::Edit) => true,
+        (PermissionMode::AcceptEdits, PermissionLevel::Execute) => false,
+        (PermissionMode::Yolo, PermissionLevel::Edit | PermissionLevel::Execute) => true,
+        (_, PermissionLevel::ReadOnly) => false,
+    }
+}
+
+pub fn cycle_permission_mode(mode: PermissionMode) -> PermissionMode {
+    match mode {
+        PermissionMode::Normal => PermissionMode::AcceptEdits,
+        PermissionMode::AcceptEdits => PermissionMode::Yolo,
+        PermissionMode::Yolo => PermissionMode::Normal,
+    }
+}
+
+pub fn permission_mode_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Normal => "normal",
+        PermissionMode::AcceptEdits => "accept-edits",
+        PermissionMode::Yolo => "yolo",
+    }
+}
+
 #[async_trait]
 pub trait PermissionDecider: Send + Sync {
     async fn decide(&self, call: &ToolCall, tool: &dyn Tool) -> PermissionDecision;
@@ -20,13 +53,13 @@ pub async fn gate(
 ) -> PermissionDecision {
     match tool.permission_level() {
         PermissionLevel::ReadOnly => PermissionDecision::Allow,
-        PermissionLevel::RequiresConfirmation => decider.decide(call, tool).await,
+        PermissionLevel::Edit | PermissionLevel::Execute => decider.decide(call, tool).await,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{gate, PermissionDecider, PermissionDecision};
+    use super::{auto_allows, cycle_permission_mode, gate, PermissionDecider, PermissionDecision, PermissionMode};
     use crate::provider::ToolCall;
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
     use async_trait::async_trait;
@@ -115,19 +148,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_uses_decider_for_tools_requiring_confirmation() {
-        let tool = MockTool {
-            permission_level: PermissionLevel::RequiresConfirmation,
-        };
-        let allow = StaticDecider::new(PermissionDecision::Allow);
-        let deny = StaticDecider::new(PermissionDecision::Deny);
+    async fn gate_uses_decider_for_edit_and_execute_tools() {
+        for level in [PermissionLevel::Edit, PermissionLevel::Execute] {
+            let tool = MockTool {
+                permission_level: level,
+            };
+            let allow = StaticDecider::new(PermissionDecision::Allow);
+            let deny = StaticDecider::new(PermissionDecision::Deny);
 
+            assert_eq!(
+                gate(&call(), &tool, &allow).await,
+                PermissionDecision::Allow
+            );
+            assert_eq!(allow.calls(), 1);
+            assert_eq!(gate(&call(), &tool, &deny).await, PermissionDecision::Deny);
+            assert_eq!(deny.calls(), 1);
+        }
+    }
+
+    // --- §1.1 PermissionMode × PermissionLevel 矩阵(卡点 A) ---
+
+    #[test]
+    fn auto_allows_normal_mode_never_auto_allows_edit_or_execute() {
+        assert!(!auto_allows(PermissionMode::Normal, PermissionLevel::Edit));
+        assert!(!auto_allows(PermissionMode::Normal, PermissionLevel::Execute));
+    }
+
+    #[test]
+    fn auto_allows_accept_edits_mode_allows_edit_not_execute() {
+        assert!(auto_allows(PermissionMode::AcceptEdits, PermissionLevel::Edit));
+        assert!(!auto_allows(PermissionMode::AcceptEdits, PermissionLevel::Execute));
+    }
+
+    #[test]
+    fn auto_allows_yolo_mode_allows_edit_and_execute() {
+        assert!(auto_allows(PermissionMode::Yolo, PermissionLevel::Edit));
+        assert!(auto_allows(PermissionMode::Yolo, PermissionLevel::Execute));
+    }
+
+    #[test]
+    fn cycle_permission_mode_rotates_normal_accept_edits_yolo() {
         assert_eq!(
-            gate(&call(), &tool, &allow).await,
-            PermissionDecision::Allow
+            cycle_permission_mode(PermissionMode::Normal),
+            PermissionMode::AcceptEdits
         );
-        assert_eq!(allow.calls(), 1);
-        assert_eq!(gate(&call(), &tool, &deny).await, PermissionDecision::Deny);
-        assert_eq!(deny.calls(), 1);
+        assert_eq!(
+            cycle_permission_mode(PermissionMode::AcceptEdits),
+            PermissionMode::Yolo
+        );
+        assert_eq!(
+            cycle_permission_mode(PermissionMode::Yolo),
+            PermissionMode::Normal
+        );
     }
 }

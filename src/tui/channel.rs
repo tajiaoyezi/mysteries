@@ -1,10 +1,10 @@
 use crate::agent::{AgentObserver, AgentStatus};
-use crate::permission::PermissionDecider;
-use crate::permission::PermissionDecision;
+use crate::permission::{auto_allows, PermissionDecider, PermissionDecision, PermissionMode};
 use crate::provider::{DeltaSink, ToolCall};
 use crate::tool::{Tool, ToolOutcome};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
@@ -109,17 +109,23 @@ impl AgentObserver for ChannelObserver {
 
 pub struct ChannelDecider {
     tx: mpsc::UnboundedSender<AgentEvent>,
+    mode: Arc<Mutex<PermissionMode>>,
 }
 
 impl ChannelDecider {
-    pub fn new(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
-        Self { tx }
+    pub fn new(tx: mpsc::UnboundedSender<AgentEvent>, mode: Arc<Mutex<PermissionMode>>) -> Self {
+        Self { tx, mode }
     }
 }
 
 #[async_trait]
 impl PermissionDecider for ChannelDecider {
     async fn decide(&self, call: &ToolCall, tool: &dyn Tool) -> PermissionDecision {
+        let mode = *self.mode.lock().expect("permission mode mutex poisoned");
+        if auto_allows(mode, tool.permission_level()) {
+            return PermissionDecision::Allow;
+        }
+
         let (tx, rx) = oneshot::channel();
         let request = PermissionRequest {
             tool_name: tool.name().to_string(),
@@ -143,13 +149,14 @@ impl PermissionDecider for ChannelDecider {
 mod tests {
     use super::{AgentEvent, ChannelDecider, ChannelObserver, ChannelSink};
     use crate::agent::{AgentObserver, AgentStatus};
-    use crate::permission::{PermissionDecider, PermissionDecision};
+    use crate::permission::{PermissionDecider, PermissionDecision, PermissionMode};
     use crate::provider::{DeltaSink, ToolCall};
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
     use async_trait::async_trait;
     use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{sleep, timeout, Duration};
 
     #[test]
     fn channel_sink_sends_text_delta_on_text() {
@@ -225,6 +232,151 @@ mod tests {
         }
     }
 
+    struct ExecuteTool;
+
+    #[async_trait]
+    impl Tool for ExecuteTool {
+        fn name(&self) -> &str {
+            "execute_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Requires execute confirmation"
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Execute
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
+            ToolOutcome {
+                content: "ok".to_string(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            }
+        }
+    }
+
+    struct EditTool;
+
+    #[async_trait]
+    impl Tool for EditTool {
+        fn name(&self) -> &str {
+            "edit_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Requires edit confirmation"
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Edit
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
+            ToolOutcome {
+                content: "ok".to_string(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            }
+        }
+    }
+
+    fn execute_call() -> ToolCall {
+        ToolCall {
+            id: "call-exec".to_string(),
+            name: "execute_tool".to_string(),
+            arguments: json!({ "command": "echo hi" }),
+        }
+    }
+
+    fn edit_call() -> ToolCall {
+        ToolCall {
+            id: "call-edit".to_string(),
+            name: "edit_tool".to_string(),
+            arguments: json!({ "path": "note.txt" }),
+        }
+    }
+
+    fn decider_with_mode(
+        mode: PermissionMode,
+    ) -> (
+        ChannelDecider,
+        mpsc::UnboundedReceiver<AgentEvent>,
+        Arc<Mutex<PermissionMode>>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mode = Arc::new(Mutex::new(mode));
+        (ChannelDecider::new(tx, mode.clone()), rx, mode)
+    }
+
+    // --- §2.1 ChannelDecider + PermissionMode(卡点 B) ---
+
+    #[tokio::test]
+    async fn channel_decider_yolo_auto_allows_execute_without_channel() {
+        let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::Yolo);
+
+        let decision = timeout(
+            Duration::from_millis(50),
+            decider.decide(&execute_call(), &ExecuteTool),
+        )
+        .await
+        .expect("Yolo + Execute must return Allow immediately without channel round-trip");
+
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert!(rx.try_recv().is_err(), "must not send PermissionRequired");
+    }
+
+    #[tokio::test]
+    async fn channel_decider_accept_edits_auto_allows_edit_without_channel() {
+        let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::AcceptEdits);
+
+        let decision = timeout(
+            Duration::from_millis(50),
+            decider.decide(&edit_call(), &EditTool),
+        )
+        .await
+        .expect("AcceptEdits + Edit must return Allow immediately without channel round-trip");
+
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert!(rx.try_recv().is_err(), "must not send PermissionRequired");
+    }
+
+    #[tokio::test]
+    async fn channel_decider_accept_edits_still_asks_for_execute_via_channel() {
+        let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::AcceptEdits);
+        let call = execute_call();
+        let tool = ExecuteTool;
+        let decision = decider.decide(&call, &tool);
+        tokio::pin!(decision);
+
+        let request = tokio::select! {
+            event = rx.recv() => event.expect("permission request should be sent"),
+            decision = &mut decision => panic!("decide returned before permission response: {decision:?}"),
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for permission request"),
+        };
+
+        match request {
+            AgentEvent::PermissionRequired(request) => {
+                assert_eq!(request.tool_name, "execute_tool");
+                request.responder.send(PermissionDecision::Allow).unwrap();
+            }
+            other => panic!("expected PermissionRequired, got {other:?}"),
+        }
+
+        assert_eq!(decision.await, PermissionDecision::Allow);
+    }
+
     struct ConfirmTool;
 
     #[async_trait]
@@ -242,7 +394,7 @@ mod tests {
         }
 
         fn permission_level(&self) -> PermissionLevel {
-            PermissionLevel::RequiresConfirmation
+            PermissionLevel::Execute
         }
 
         async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
@@ -265,8 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_decider_returns_allow_from_permission_responder() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let decider = ChannelDecider::new(tx);
+        let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::Normal);
         let call = call();
         let tool = ConfirmTool;
         let decision = decider.decide(&call, &tool);
@@ -292,8 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_decider_denies_when_permission_responder_is_dropped() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let decider = ChannelDecider::new(tx);
+        let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::Normal);
         let call = call();
         let tool = ConfirmTool;
         let decision = decider.decide(&call, &tool);

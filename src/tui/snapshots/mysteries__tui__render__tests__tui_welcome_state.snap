@@ -7,7 +7,6 @@ expression: text
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 
 
-
 ‹text.primary›                                  ‹/›‹text.title +bold›✦ MYSTERIES‹/›
 ‹text.primary›                          ‹/›‹accent.primary›AGENT · v1.0 · 终端编码助手‹/›
 ‹text.primary›        ‹/›‹text.body›读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等‹/›
@@ -26,3 +25,4 @@ expression: text
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

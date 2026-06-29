@@ -17,8 +17,7 @@ expression: text
 
 ‹accent.primary›> ‹/›‹text.primary›line 19‹/›
 
-‹accent.primary›> ‹/›‹text.primary›line 20‹/›
-
+‹accent.primary›> ‹/›‹text.primary›line 20                   ‹/›‹accent.primary bg=bg.surface›跳到底部 (ctrl+End) ↓‹/›
 
 
 ‹text.muted›◇ 就绪‹/›
@@ -26,3 +25,4 @@ expression: text
 ‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.primary›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹text.muted›mock · mock-model · iter 0/4 · 30 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

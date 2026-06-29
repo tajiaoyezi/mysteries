@@ -1,18 +1,20 @@
 use crate::agent::message::Message;
 use crate::agent::AgentStatus;
 use crate::config::ProviderProfile;
-use crate::permission::PermissionDecision;
+use crate::permission::{cycle_permission_mode, PermissionDecision, PermissionMode};
 use crate::provider::registry::models_for;
 use crate::provider::Usage;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
 use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
+use crate::tui::input_history::{reduce_input_history, InputHistoryAction, InputHistoryState};
+use crate::tui::jump_to_bottom::{bump_new_message_count, new_message_count_on_follow_bottom};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const ASCII_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
@@ -380,19 +382,21 @@ pub fn estimate_streaming_rate_tps(chars: u32, elapsed: Duration) -> Option<f64>
 
 pub struct AppState {
     pub session: SessionSnapshot,
-    pub agent_history: Arc<Mutex<Vec<Message>>>,
+    pub agent_history: Arc<AsyncMutex<Vec<Message>>>,
     pub iteration: u32,
     pub transcript: Vec<TranscriptBlock>,
     pub tools_expanded: bool,
     pub command_completion: Option<CommandCompletion>,
     pub models_picker: Option<ModelsPicker>,
     pub provider_profiles: BTreeMap<String, ProviderProfile>,
-    pub input: String,
+    pub input_line: InputHistoryState,
+    pub permission_mode: Arc<Mutex<PermissionMode>>,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
     pub scroll_offset: usize,
     pub spinner_frame: usize,
     pub should_exit: bool,
+    pub new_message_count: u32,
     follows_bottom: bool,
     turn_output_tokens: u32,
     last_rate_tps: Option<f64>,
@@ -411,7 +415,7 @@ impl AppState {
     pub fn with_session(session: SessionSnapshot) -> Self {
         Self::with_session_and_history(
             session,
-            Arc::new(Mutex::new(vec![Message::System(
+            Arc::new(AsyncMutex::new(vec![Message::System(
                 crate::agent::DEFAULT_SYSTEM_PROMPT.to_string(),
             )])),
         )
@@ -419,7 +423,7 @@ impl AppState {
 
     pub fn with_session_and_history(
         session: SessionSnapshot,
-        agent_history: Arc<Mutex<Vec<Message>>>,
+        agent_history: Arc<AsyncMutex<Vec<Message>>>,
     ) -> Self {
         Self {
             session,
@@ -430,12 +434,14 @@ impl AppState {
             command_completion: None,
             models_picker: None,
             provider_profiles: BTreeMap::new(),
-            input: String::new(),
+            input_line: InputHistoryState::default(),
+            permission_mode: Arc::new(Mutex::new(PermissionMode::Normal)),
             phase: Phase::Ready,
             pending_permission: None,
             scroll_offset: 0,
             spinner_frame: 0,
             should_exit: false,
+            new_message_count: 0,
             follows_bottom: true,
             turn_output_tokens: 0,
             last_rate_tps: None,
@@ -445,6 +451,39 @@ impl AppState {
             idle_rate_tps: None,
             idle_rate_is_approximate: false,
         }
+    }
+
+    pub fn follows_bottom(&self) -> bool {
+        self.follows_bottom
+    }
+
+    fn clear_new_message_count_if_following(&mut self) {
+        if self.follows_bottom {
+            self.new_message_count = new_message_count_on_follow_bottom();
+        }
+    }
+
+    pub fn input(&self) -> &str {
+        &self.input_line.input
+    }
+
+    pub fn current_permission_mode(&self) -> PermissionMode {
+        *self
+            .permission_mode
+            .lock()
+            .expect("permission mode mutex poisoned")
+    }
+
+    fn apply_input_action(&mut self, action: InputHistoryAction) {
+        self.input_line = reduce_input_history(&self.input_line, action);
+    }
+
+    fn cycle_permission_mode(&mut self) {
+        let mut guard = self
+            .permission_mode
+            .lock()
+            .expect("permission mode mutex poisoned");
+        *guard = cycle_permission_mode(*guard);
     }
 
     pub fn output_tokens_this_turn(&self) -> u32 {
@@ -551,6 +590,7 @@ impl AppState {
             .min(bottom);
         self.scroll_offset = next;
         self.follows_bottom = next == bottom;
+        self.clear_new_message_count_if_following();
     }
 
     pub fn scroll_to_top(&mut self, _total_lines: usize, _viewport_lines: usize) {
@@ -560,6 +600,7 @@ impl AppState {
 
     pub fn scroll_to_bottom(&mut self, _total_lines: usize, _viewport_lines: usize) {
         self.follows_bottom = true;
+        self.new_message_count = new_message_count_on_follow_bottom();
     }
 
     pub fn scroll_up(&mut self, total_lines: usize, viewport_lines: usize, lines: usize) {
@@ -576,6 +617,7 @@ impl AppState {
             .min(bottom);
         self.scroll_offset = next;
         self.follows_bottom = next == bottom;
+        self.clear_new_message_count_if_following();
     }
 
     pub fn advance_spinner(&mut self) {
@@ -597,7 +639,7 @@ impl AppState {
             .and_then(|completion| completion.candidates.get(completion.selected))
             .map(|command| command.name);
 
-        let Some(mut candidates) = command_completion_candidates(&self.input) else {
+        let Some(mut candidates) = command_completion_candidates(self.input()) else {
             self.command_completion = None;
             return;
         };
@@ -641,7 +683,7 @@ impl AppState {
             return;
         };
 
-        self.input = command.name.to_string();
+        self.input_line.input = command.name.to_string();
         self.close_command_completion();
     }
 
@@ -791,6 +833,7 @@ impl AppState {
                 }
             }
             AgentEvent::StatusChanged(status) => {
+                let was_busy = self.phase != Phase::Ready;
                 if status == AgentStatus::CallingModel {
                     self.iteration += 1;
                 }
@@ -800,6 +843,12 @@ impl AppState {
                     AgentStatus::ExecutingTool(name) => Phase::ExecutingTool(name),
                     AgentStatus::WaitingForPermission => Phase::WaitingForPermission,
                 };
+                if was_busy && self.phase == Phase::Ready {
+                    self.new_message_count = bump_new_message_count(
+                        self.follows_bottom,
+                        self.new_message_count,
+                    );
+                }
             }
             AgentEvent::PermissionRequired(request) => {
                 self.pending_permission = Some(request);
@@ -863,6 +912,11 @@ impl AppState {
             return;
         }
 
+        if key.code == KeyCode::BackTab {
+            self.cycle_permission_mode();
+            return;
+        }
+
         if self.pending_permission.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -892,21 +946,27 @@ impl AppState {
         }
 
         match key.code {
+            KeyCode::Up => {
+                self.apply_input_action(InputHistoryAction::HistoryUp);
+            }
+            KeyCode::Down => {
+                self.apply_input_action(InputHistoryAction::HistoryDown);
+            }
             KeyCode::Char(ch) => {
-                self.input.push(ch);
+                self.apply_input_action(InputHistoryAction::InsertChar(ch));
                 self.refresh_command_completion();
             }
             KeyCode::Backspace => {
-                self.input.pop();
+                self.apply_input_action(InputHistoryAction::Backspace);
                 self.refresh_command_completion();
             }
             KeyCode::Enter => {
                 self.close_command_completion();
-                let prompt = self.input.trim().to_string();
+                let prompt = self.input().trim().to_string();
                 if prompt.is_empty() {
                     return;
                 }
-                self.input.clear();
+                self.apply_input_action(InputHistoryAction::PushSubmitted(prompt.clone()));
                 if let Some(command) = parse_command(&prompt) {
                     self.execute_command(command, input_tx);
                     return;
@@ -1008,7 +1068,7 @@ mod tests {
     };
     use crate::agent::AgentStatus;
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
-    use crate::permission::PermissionDecision;
+    use crate::permission::{PermissionDecision, PermissionMode};
     use crate::provider::Usage;
     use crate::tool::ToolOutcome;
     use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
@@ -1391,7 +1451,7 @@ mod tests {
 
         state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
         assert_eq!(state.iteration, 1);
-        state.input = "next prompt".to_string();
+        state.input_line.input = "next prompt".to_string();
         state.on_key(key(KeyCode::Enter), &tx);
         assert_eq!(state.iteration, 0);
     }
@@ -1404,17 +1464,17 @@ mod tests {
             .transcript
             .push(TranscriptBlock::User("old".to_string()));
 
-        state.input = "/clear".to_string();
+        state.input_line.input = "/clear".to_string();
         state.on_key(key(KeyCode::Enter), &tx);
         assert!(state.transcript.is_empty());
         assert!(rx.try_recv().is_err());
 
-        state.input = "/help".to_string();
+        state.input_line.input = "/help".to_string();
         state.on_key(key(KeyCode::Enter), &tx);
         assert_eq!(state.transcript, vec![TranscriptBlock::Help]);
 
         state.iteration = 3;
-        state.input = "/status".to_string();
+        state.input_line.input = "/status".to_string();
         state.on_key(key(KeyCode::Enter), &tx);
         assert_eq!(
             state.transcript.last(),
@@ -1429,7 +1489,7 @@ mod tests {
             }))
         );
 
-        state.input = "/exit".to_string();
+        state.input_line.input = "/exit".to_string();
         state.on_key(key(KeyCode::Enter), &tx);
         assert!(state.should_exit);
         assert!(rx.try_recv().is_err());
@@ -1441,7 +1501,7 @@ mod tests {
         let mut state = AppState::with_session(session());
 
         for input in ["/login", "/logout", "/xyz"] {
-            state.input = input.to_string();
+            state.input_line.input = input.to_string();
             state.on_key(key(KeyCode::Enter), &tx);
         }
 
@@ -1495,7 +1555,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = AppState::with_session(session());
 
-        state.input = "/model".to_string();
+        state.input_line.input = "/model".to_string();
         state.on_key(key(KeyCode::Enter), &tx);
         assert!(matches!(
             state.transcript.last(),
@@ -1503,7 +1563,7 @@ mod tests {
                 if text.contains("claude-test") && text.contains("model")
         ));
 
-        state.input = "/model claude-next".to_string();
+        state.input_line.input = "/model claude-next".to_string();
         state.on_key(key(KeyCode::Enter), &tx);
         assert_eq!(state.session.model, "claude-next");
         assert_eq!(
@@ -1706,7 +1766,7 @@ mod tests {
         state.on_key(key(KeyCode::Char('!')), &tx);
         state.on_key(key(KeyCode::Enter), &tx);
 
-        assert_eq!(state.input, "");
+        assert_eq!(state.input(), "");
         assert_eq!(
             state.transcript,
             vec![TranscriptBlock::User("h!".to_string())]
@@ -1727,7 +1787,7 @@ mod tests {
         );
         state.on_key(key_with_kind(KeyCode::Char('a'), KeyEventKind::Repeat), &tx);
 
-        assert_eq!(state.input, "a");
+        assert_eq!(state.input(), "a");
     }
 
     #[test]
@@ -1751,7 +1811,7 @@ mod tests {
             "ctrl+o Press should expand folded tool cards"
         );
         assert_eq!(
-            state.input, "",
+            state.input(), "",
             "ctrl+o should toggle tool expansion instead of typing 'o'"
         );
         assert!(rx.try_recv().is_err());
@@ -1769,9 +1829,9 @@ mod tests {
             !state.tools_expanded,
             "second ctrl+o Press should fold tool cards again"
         );
-        assert_eq!(state.input, "");
+        assert_eq!(state.input(), "");
 
-        state.input = "keep".to_string();
+        state.input_line.input = "keep".to_string();
         state.on_key(
             key_with_modifiers_and_kind(
                 KeyCode::Char('o'),
@@ -1790,7 +1850,7 @@ mod tests {
         );
 
         assert!(!state.tools_expanded);
-        assert_eq!(state.input, "keep");
+        assert_eq!(state.input(), "keep");
     }
 
     #[test]
@@ -1905,7 +1965,7 @@ mod tests {
         assert_eq!(selected_completion_name(&state), "/clear");
 
         state.on_key(key(KeyCode::Tab), &tx);
-        assert_eq!(state.input, "/clear");
+        assert_eq!(state.input(), "/clear");
         assert!(state.command_completion.is_none());
         assert!(rx.try_recv().is_err());
     }
@@ -1918,7 +1978,7 @@ mod tests {
         state.session.provider = "wps".to_string();
         state.session.model = "zhipu/glm-5.2".to_string();
 
-        state.input = "/models".to_string();
+        state.input_line.input = "/models".to_string();
         state.on_key(key(KeyCode::Enter), &tx);
         assert!(state.models_picker.is_some());
 
@@ -1959,19 +2019,19 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = AppState::new();
 
-        state.input = "/model ".to_string();
+        state.input_line.input = "/model ".to_string();
         state.on_key(key(KeyCode::Char('g')), &tx);
         assert!(state.command_completion.is_none());
 
-        state.input = "hello".to_string();
+        state.input_line.input = "hello".to_string();
         state.on_key(key(KeyCode::Char('!')), &tx);
         assert!(state.command_completion.is_none());
 
-        state.input.clear();
+        state.input_line.input.clear();
         state.on_key(key(KeyCode::Char('/')), &tx);
         assert!(state.command_completion.is_some());
         state.on_key(key(KeyCode::Esc), &tx);
-        assert_eq!(state.input, "/");
+        assert_eq!(state.input(), "/");
         assert!(state.command_completion.is_none());
     }
 
@@ -2134,12 +2194,75 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(state.output_tokens_this_turn(), 40);
-        state.input = "hello".to_string();
+        state.input_line.input = "hello".to_string();
 
         state.on_key(key(KeyCode::Enter), &input_tx);
 
         assert_eq!(state.output_tokens_this_turn(), 0);
         assert_eq!(state.last_rate_tps(), None);
+    }
+
+    #[test]
+    fn assistant_completion_increments_new_message_count_when_not_following_bottom() {
+        let mut state = AppState::new();
+        state.page_up(100, 10);
+
+        state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
+        state.apply(AgentEvent::StatusChanged(AgentStatus::ExecutingTool(
+            "read_file".to_string(),
+        )));
+        state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
+        state.apply(AgentEvent::StatusChanged(AgentStatus::Idle));
+
+        assert_eq!(state.new_message_count, 1);
+    }
+
+    #[test]
+    fn assistant_completion_does_not_increment_when_following_bottom() {
+        let mut state = AppState::new();
+
+        state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
+        state.apply(AgentEvent::StatusChanged(AgentStatus::Idle));
+
+        assert_eq!(state.new_message_count, 0);
+    }
+
+    #[test]
+    fn user_notice_and_tool_events_do_not_increment_new_message_count() {
+        let mut state = AppState::new();
+        state.page_up(100, 10);
+
+        state.transcript.push(TranscriptBlock::User("hi".to_string()));
+        state.apply(AgentEvent::Notice("saved".to_string()));
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            args: json!({ "path": "note.txt" }),
+            readonly: true,
+        });
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "call-1".to_string(),
+            outcome: ToolOutcome {
+                content: "ok".to_string(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            },
+        });
+
+        assert_eq!(state.new_message_count, 0);
+    }
+
+    #[test]
+    fn scroll_to_bottom_clears_new_message_count() {
+        let mut state = AppState::new();
+        state.page_up(100, 10);
+        state.new_message_count = 3;
+
+        state.scroll_to_bottom(100, 10);
+
+        assert!(state.follows_bottom());
+        assert_eq!(state.new_message_count, 0);
     }
 
     #[test]
@@ -2175,5 +2298,132 @@ mod tests {
         assert!(!state.last_rate_is_approximate());
         assert_eq!(state.last_rate_tps(), Some(60.0));
         assert_eq!(state.output_tokens_this_turn(), 120);
+    }
+
+    #[test]
+    fn backtab_cycles_permission_mode_normal_accept_edits_yolo() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        assert_eq!(state.current_permission_mode(), PermissionMode::Normal);
+
+        state.on_key(key(KeyCode::BackTab), &tx);
+        assert_eq!(state.current_permission_mode(), PermissionMode::AcceptEdits);
+
+        state.on_key(key(KeyCode::BackTab), &tx);
+        assert_eq!(state.current_permission_mode(), PermissionMode::Yolo);
+
+        state.on_key(key(KeyCode::BackTab), &tx);
+        assert_eq!(state.current_permission_mode(), PermissionMode::Normal);
+    }
+
+    #[test]
+    fn backtab_cycles_during_pending_permission_without_answering() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (allow_tx, mut allow_rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "write_file".to_string(),
+            args: json!({}),
+            responder: allow_tx,
+        }));
+
+        state.on_key(key(KeyCode::BackTab), &input_tx);
+
+        assert_eq!(state.current_permission_mode(), PermissionMode::AcceptEdits);
+        assert!(state.pending_permission.is_some());
+        assert!(allow_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn input_history_up_down_in_main_input_state() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.on_key(key(KeyCode::Char('a')), &tx);
+        state.on_key(key(KeyCode::Enter), &tx);
+        state.on_key(key(KeyCode::Char('b')), &tx);
+        state.on_key(key(KeyCode::Enter), &tx);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+
+        state.on_key(key(KeyCode::Up), &tx);
+        assert_eq!(state.input(), "b");
+        state.on_key(key(KeyCode::Up), &tx);
+        assert_eq!(state.input(), "a");
+        state.on_key(key(KeyCode::Down), &tx);
+        assert_eq!(state.input(), "b");
+    }
+
+    #[test]
+    fn history_arrows_do_not_apply_when_command_completion_open() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.on_key(key(KeyCode::Char('h')), &tx);
+        state.on_key(key(KeyCode::Enter), &tx);
+        for ch in "/cl".chars() {
+            state.on_key(key(KeyCode::Char(ch)), &tx);
+        }
+        assert!(state.command_completion.is_some());
+
+        state.on_key(key(KeyCode::Up), &tx);
+        assert_eq!(state.input(), "/cl", "↑ should move completion, not history");
+        assert_eq!(state.input_line.input_history.len(), 1);
+    }
+
+    #[test]
+    fn history_arrows_do_not_apply_when_models_picker_open() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.provider_profiles.insert(
+            "mock".to_string(),
+            test_profile("mock", "mock-model", ProviderKind::Mock),
+        );
+
+        state.on_key(key(KeyCode::Char('x')), &tx);
+        state.on_key(key(KeyCode::Enter), &tx);
+        state.execute_command(Command::Models, &tx);
+        assert!(state.models_picker.is_some());
+
+        state.on_key(key(KeyCode::Up), &tx);
+        assert_eq!(state.input(), "", "↑ should move picker highlight, not history");
+        assert_eq!(state.input_line.input_history.len(), 1);
+    }
+
+    #[test]
+    fn history_arrows_do_not_apply_while_pending_permission() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (allow_tx, _allow_rx) = oneshot::channel();
+        let mut state = AppState::new();
+
+        state.on_key(key(KeyCode::Char('p')), &input_tx);
+        state.on_key(key(KeyCode::Enter), &input_tx);
+        assert_eq!(state.input_line.input_history.len(), 1);
+
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "run_shell".to_string(),
+            args: json!({ "command": "echo" }),
+            responder: allow_tx,
+        }));
+
+        state.on_key(key(KeyCode::Up), &input_tx);
+        assert_eq!(state.input(), "");
+        assert_eq!(state.input_line.input_history.len(), 1);
+    }
+
+    #[test]
+    fn backspace_exits_history_in_on_key() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.on_key(key(KeyCode::Char('a')), &tx);
+        state.on_key(key(KeyCode::Enter), &tx);
+        state.on_key(key(KeyCode::Up), &tx);
+        assert_eq!(state.input_line.history_cursor, Some(0));
+
+        state.on_key(key(KeyCode::Backspace), &tx);
+        assert_eq!(state.input_line.history_cursor, None);
+        assert_eq!(state.input(), "");
     }
 }

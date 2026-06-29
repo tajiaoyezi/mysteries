@@ -1,0 +1,5 @@
+---
+source: src/tui/render.rs
+expression: jump_to_bottom_pill_line(&text)
+---
+‹text.primary›                           ‹/›‹accent.primary bg=bg.surface›2 条新消息 (ctrl+End) ↓‹/›

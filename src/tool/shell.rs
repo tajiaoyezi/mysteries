@@ -29,7 +29,7 @@ impl Tool for RunShellTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::RequiresConfirmation
+        PermissionLevel::Execute
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(tool.name(), "run_shell");
         assert_eq!(
             tool.permission_level(),
-            PermissionLevel::RequiresConfirmation
+            PermissionLevel::Execute
         );
         assert!(!outcome.is_error);
         assert_eq!(outcome.exit, Some(0));

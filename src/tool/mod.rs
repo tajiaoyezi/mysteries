@@ -84,7 +84,8 @@ pub struct ToolContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PermissionLevel {
     ReadOnly,
-    RequiresConfirmation,
+    Edit,
+    Execute,
 }
 
 #[cfg(test)]
@@ -182,7 +183,7 @@ mod tests {
             .register(Box::new(MockTool {
                 name: "write_mock",
                 description: "Write mock data",
-                permission_level: PermissionLevel::RequiresConfirmation,
+                permission_level: PermissionLevel::Edit,
             }))
             .unwrap();
 
@@ -217,7 +218,7 @@ mod tests {
         let second = registry.register(Box::new(MockTool {
             name: "same",
             description: "Second tool",
-            permission_level: PermissionLevel::RequiresConfirmation,
+            permission_level: PermissionLevel::Edit,
         }));
 
         assert_eq!(first, Ok(()));

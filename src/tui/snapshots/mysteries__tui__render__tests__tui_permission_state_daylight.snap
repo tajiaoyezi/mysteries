@@ -23,6 +23,6 @@ expression: text
 ‹warning.fg bg=warning.bg›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹warning.fg›▲ 等待授权…‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
-‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.title›                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹text.muted›mock · mock-model · iter 0/4 · 3 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

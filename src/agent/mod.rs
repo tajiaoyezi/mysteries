@@ -638,7 +638,7 @@ mod tests {
         }
 
         fn permission_level(&self) -> PermissionLevel {
-            PermissionLevel::RequiresConfirmation
+            PermissionLevel::Execute
         }
 
         async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {

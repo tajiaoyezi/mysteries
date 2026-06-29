@@ -7,9 +7,12 @@ use crate::cli::{load_config_or_onboard, CliError, CliPaths, StdinAuthPrompter};
 use crate::config::{Config, ProviderConfig, ProviderKind, ProviderProfile};
 use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSource};
 use crate::error::AgentError;
+use crate::permission::PermissionMode;
 use crate::provider::Usage;
 use crate::tool::ToolContext;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use futures_util::StreamExt;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -23,6 +26,8 @@ use tokio::time::{Duration, MissedTickBehavior};
 pub mod app;
 pub mod channel;
 pub mod command;
+pub mod input_history;
+pub mod jump_to_bottom;
 pub mod render;
 pub mod terminal;
 pub mod theme;
@@ -51,10 +56,14 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+    let permission_mode = Arc::new(std::sync::Mutex::new(PermissionMode::Normal));
     let assembled = crate::app::assemble_agent(
         provider,
         &config,
-        Box::new(channel::ChannelDecider::new(ui_tx.clone())),
+        Box::new(channel::ChannelDecider::new(
+            ui_tx.clone(),
+            permission_mode.clone(),
+        )),
     );
     let compacting = assembled.compacting;
     let agent = assembled.agent;
@@ -93,6 +102,7 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
         agent_history,
     );
     state.provider_profiles = profiles;
+    state.permission_mode = permission_mode;
     let mut events = EventStream::new();
     let theme = theme::Theme::midnight();
     let debug_events = debug_events_enabled();
@@ -136,7 +146,9 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                                     }
                                 }
                             }
-                            Event::Mouse(_) => {}
+                            Event::Mouse(me) => {
+                                handle_mouse_wheel(&mut terminal, &mut state, &theme, me.kind)?;
+                            }
                             Event::Resize(_, _) => {}
                             Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
                         }
@@ -270,6 +282,60 @@ fn arrows_route_to_completion(state: &app::AppState, key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Up | KeyCode::Down)
 }
 
+fn handle_mouse_wheel(
+    terminal: &mut terminal::TerminalGuard,
+    state: &mut app::AppState,
+    theme: &theme::Theme,
+    kind: MouseEventKind,
+) -> Result<bool, CliError> {
+    let Some(action) = mouse_wheel_scroll_action(kind) else {
+        return Ok(false);
+    };
+    apply_mouse_wheel_scroll(terminal, state, theme, action)?;
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseWheelScrollAction {
+    Up { lines: usize },
+    Down { lines: usize },
+}
+
+const MOUSE_WHEEL_SCROLL_LINES: usize = 3;
+
+fn mouse_wheel_scroll_action(kind: MouseEventKind) -> Option<MouseWheelScrollAction> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(MouseWheelScrollAction::Up {
+            lines: MOUSE_WHEEL_SCROLL_LINES,
+        }),
+        MouseEventKind::ScrollDown => Some(MouseWheelScrollAction::Down {
+            lines: MOUSE_WHEEL_SCROLL_LINES,
+        }),
+        _ => None,
+    }
+}
+
+fn apply_mouse_wheel_scroll(
+    terminal: &mut terminal::TerminalGuard,
+    state: &mut app::AppState,
+    theme: &theme::Theme,
+    action: MouseWheelScrollAction,
+) -> Result<(), CliError> {
+    let size = terminal.terminal_mut().size()?;
+    let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+    let total_lines = render::transcript_line_count(state, theme, area.width as usize);
+    let viewport_lines = render::transcript_viewport_height(area, state);
+    match action {
+        MouseWheelScrollAction::Up { lines } => {
+            state.scroll_up(total_lines, viewport_lines, lines);
+        }
+        MouseWheelScrollAction::Down { lines } => {
+            state.scroll_down(total_lines, viewport_lines, lines);
+        }
+    }
+    Ok(())
+}
+
 fn handle_scroll_key(
     terminal: &mut terminal::TerminalGuard,
     state: &mut app::AppState,
@@ -293,8 +359,6 @@ fn scroll_action_for_key(key: KeyEvent) -> Option<fn(&mut app::AppState, usize, 
     }
 
     match key.code {
-        KeyCode::Up => Some(scroll_up_one_line),
-        KeyCode::Down => Some(scroll_down_one_line),
         KeyCode::PageUp => Some(app::AppState::page_up),
         KeyCode::PageDown => Some(app::AppState::page_down),
         KeyCode::Home => Some(app::AppState::scroll_to_top),
@@ -315,14 +379,6 @@ fn apply_scroll(
     let viewport_lines = render::transcript_viewport_height(area, state);
     scroll(state, total_lines, viewport_lines);
     Ok(())
-}
-
-fn scroll_up_one_line(state: &mut app::AppState, total_lines: usize, viewport_lines: usize) {
-    state.scroll_up(total_lines, viewport_lines, 1);
-}
-
-fn scroll_down_one_line(state: &mut app::AppState, total_lines: usize, viewport_lines: usize) {
-    state.scroll_down(total_lines, viewport_lines, 1);
 }
 
 fn debug_event_line(event: &Event) -> String {
@@ -556,7 +612,7 @@ mod tests {
         DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS,
     };
     use crate::error::ProviderError;
-    use crate::permission::PermissionDecision;
+    use crate::permission::{PermissionDecision, PermissionMode};
     use crate::provider::mock::MockProvider;
     use crate::provider::{
         DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, ToolCall,
@@ -575,6 +631,10 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot, Mutex};
     use tokio::time::{timeout, Duration};
+
+    fn normal_channel_decider(tx: mpsc::UnboundedSender<AgentEvent>) -> ChannelDecider {
+        ChannelDecider::new(tx, Arc::new(std::sync::Mutex::new(PermissionMode::Normal)))
+    }
 
     fn agent_history() -> Arc<Mutex<Vec<Message>>> {
         Arc::new(Mutex::new(vec![Message::System(
@@ -772,24 +832,41 @@ mod tests {
     }
 
     #[test]
-    fn scroll_key_routing_maps_line_and_boundary_keys_only_for_press() {
+    fn mouse_wheel_scroll_action_maps_scroll_kinds_and_ignores_others() {
+        use super::{mouse_wheel_scroll_action, MouseWheelScrollAction, MOUSE_WHEEL_SCROLL_LINES};
+        use crossterm::event::MouseButton;
+
+        assert_eq!(
+            mouse_wheel_scroll_action(MouseEventKind::ScrollUp),
+            Some(MouseWheelScrollAction::Up {
+                lines: MOUSE_WHEEL_SCROLL_LINES,
+            })
+        );
+        assert_eq!(
+            mouse_wheel_scroll_action(MouseEventKind::ScrollDown),
+            Some(MouseWheelScrollAction::Down {
+                lines: MOUSE_WHEEL_SCROLL_LINES,
+            })
+        );
+        assert_eq!(mouse_wheel_scroll_action(MouseEventKind::Moved), None);
+        assert_eq!(
+            mouse_wheel_scroll_action(MouseEventKind::Down(MouseButton::Left)),
+            None
+        );
+    }
+
+    #[test]
+    fn scroll_key_routing_maps_page_and_boundary_keys_only_for_press() {
         let mut state = super::app::AppState::new();
 
         assert!(
-            apply_scroll_key_for_test(&mut state, key(KeyCode::Up), 40, 5),
-            "Up should be handled as one-line scroll up"
+            scroll_action_for_key(key(KeyCode::Up)).is_none(),
+            "Up is reserved for input history, not transcript scroll"
         );
-        assert_eq!(state.visible_scroll_offset(40, 5), 34);
-        assert_eq!(state.visible_scroll_offset(50, 5), 34);
-
-        assert!(apply_scroll_key_for_test(
-            &mut state,
-            key(KeyCode::Down),
-            40,
-            5
-        ));
-        assert_eq!(state.visible_scroll_offset(40, 5), 35);
-        assert_eq!(state.visible_scroll_offset(50, 5), 45);
+        assert!(
+            scroll_action_for_key(key(KeyCode::Down)).is_none(),
+            "Down is reserved for input history, not transcript scroll"
+        );
 
         state.scroll_up(40, 5, 10);
         assert!(apply_scroll_key_for_test(
@@ -813,7 +890,7 @@ mod tests {
         let before = state.visible_scroll_offset(40, 5);
         assert!(!apply_scroll_key_for_test(
             &mut state,
-            KeyEvent::new_with_kind(KeyCode::Up, KeyModifiers::NONE, KeyEventKind::Release),
+            KeyEvent::new_with_kind(KeyCode::PageUp, KeyModifiers::NONE, KeyEventKind::Release),
             40,
             5
         ));
@@ -824,6 +901,26 @@ mod tests {
             5
         ));
         assert_eq!(state.visible_scroll_offset(40, 5), before);
+    }
+
+    #[test]
+    fn end_and_ctrl_end_map_to_scroll_to_bottom_and_clear_new_message_count() {
+        for scroll_key in [
+            key(KeyCode::End),
+            KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
+        ] {
+            assert!(
+                scroll_action_for_key(scroll_key).is_some(),
+                "expected scroll action for {scroll_key:?}"
+            );
+            let mut state = super::app::AppState::new();
+            state.page_up(40, 5);
+            state.new_message_count = 2;
+
+            assert!(apply_scroll_key_for_test(&mut state, scroll_key, 40, 5));
+            assert!(state.follows_bottom());
+            assert_eq!(state.new_message_count, 0);
+        }
     }
 
     #[test]
@@ -919,7 +1016,7 @@ mod tests {
         let assembled = assemble_agent(
             provider,
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -1036,7 +1133,7 @@ mod tests {
         let assembled = assemble_agent(
             provider.clone(),
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -1106,7 +1203,7 @@ mod tests {
         let assembled = assemble_agent(
             provider.clone(),
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -1162,7 +1259,7 @@ mod tests {
         let assembled = assemble_agent(
             provider.clone(),
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -1238,7 +1335,7 @@ mod tests {
                 calls: calls.clone(),
             }),
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -1301,7 +1398,7 @@ mod tests {
                 calls: calls.clone(),
             }),
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -1384,7 +1481,7 @@ mod tests {
         let assembled = assemble_agent(
             old_provider.clone(),
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = task_hotswap(&temp, profiles);
         let history = agent_history();
@@ -1439,7 +1536,7 @@ mod tests {
         let assembled = assemble_agent(
             provider.clone(),
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -1507,7 +1604,7 @@ mod tests {
         let assembled = assemble_agent(
             provider.clone(),
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = task_hotswap(&temp, profiles);
         let handle = tokio::spawn(run_agent_task(
@@ -1590,7 +1687,7 @@ model = "zhipu/glm-5.2"
         let assembled = assemble_agent(
             old_provider.clone(),
             &config(),
-            Box::new(ChannelDecider::new(ui_tx.clone())),
+            Box::new(normal_channel_decider(ui_tx.clone())),
         );
         let task_config = RunAgentTaskConfig {
             profiles,

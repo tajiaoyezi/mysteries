@@ -1,0 +1,5 @@
+---
+source: src/tui/render.rs
+expression: mode_line(&text)
+---
+‹text.muted›▸ normal · shift+tab 切换‹/›

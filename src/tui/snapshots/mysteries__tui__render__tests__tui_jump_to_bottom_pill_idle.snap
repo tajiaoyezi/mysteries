@@ -1,0 +1,5 @@
+---
+source: src/tui/render.rs
+expression: jump_to_bottom_pill_line(&text)
+---
+‹text.primary›                            ‹/›‹accent.primary bg=bg.surface›跳到底部 (ctrl+End) ↓‹/›
