@@ -96,6 +96,74 @@ pub(crate) const ANTHROPIC_DEFAULT_MODEL: &str = "claude-opus-4-8";
 const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-pro";
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 
+pub(crate) const WPS_CODEPLAN_OPENAI_BASE_URL: &str = "https://ai-kas.kso.net/codeplan/v1";
+pub(crate) const WPS_CODEPLAN_ANTHROPIC_BASE_URL: &str =
+    "https://ai-kas.kso.net/codeplan/anthropic";
+pub(crate) const WPS_MODELS: &[&str] = &[
+    "moonshot/kimi-k2.5",
+    "deepseek/deepseek-v4-pro",
+    "xiaomi/mimo-v2.5-pro",
+    "ali/qwen3.7-max",
+    "deepseek/deepseek-v4-flash",
+    "google/gemini-3.5-flash",
+    "zhipu/glm-5",
+    "zhipu/glm-5.2",
+];
+
+fn login_wps_codingplan(
+    prompter: &mut dyn AuthPrompter,
+) -> Result<(ConfigWritePatch, String, SecretString), AuthError> {
+    let protocol_options = ["OpenAI", "Anthropic"];
+    let protocol_index = prompter
+        .select("Select protocol", &protocol_options)?
+        .ok_or(AuthError::Cancelled)?;
+    let (provider_kind, base_url) = match protocol_index {
+        1 => (
+            ProviderKind::Anthropic,
+            WPS_CODEPLAN_ANTHROPIC_BASE_URL,
+        ),
+        _ => (ProviderKind::OpenAi, WPS_CODEPLAN_OPENAI_BASE_URL),
+    };
+
+    let model_index = prompter
+        .select("Select model", WPS_MODELS)?
+        .ok_or(AuthError::Cancelled)?;
+    let model = WPS_MODELS
+        .get(model_index)
+        .ok_or(AuthError::Cancelled)?
+        .to_string();
+
+    let key = prompter
+        .read_secret("API key: ")?
+        .ok_or(AuthError::Cancelled)?;
+
+    let patch = ConfigWritePatch {
+        provider_id: "wps".to_string(),
+        provider_kind,
+        base_url: Some(base_url.to_string()),
+        model,
+    };
+
+    Ok((patch, "wps".to_string(), key))
+}
+
+fn login_wps(
+    prompter: &mut dyn AuthPrompter,
+) -> Result<Option<(ConfigWritePatch, String, SecretString)>, AuthError> {
+    let method_options = ["OAuth2 登录(暂不支持)", "WPS CodingPlan"];
+    let selected = prompter
+        .select("Select WPS AI login method", &method_options)?
+        .ok_or(AuthError::Cancelled)?;
+
+    match selected {
+        0 => {
+            eprintln!("WPS AI OAuth2 暂不支持，后续考虑支持。");
+            Ok(None)
+        }
+        _ => Ok(Some(login_wps_codingplan(prompter)?)),
+    }
+}
+
 pub fn preset_patch(preset: ProviderPreset) -> (ConfigWritePatch, &'static str) {
     match preset {
         ProviderPreset::OpenAi => (
@@ -162,16 +230,21 @@ pub fn run_auth_list(paths: &AuthPaths) -> Result<(), AuthError> {
 }
 
 pub fn run_auth_login(paths: &AuthPaths, prompter: &mut dyn AuthPrompter) -> Result<(), AuthError> {
-    let provider_options = ["OpenAI", "Anthropic", "DeepSeek", "Custom"];
+    let provider_options = ["OpenAI", "Anthropic", "DeepSeek", "WPS AI", "Custom"];
     let selected = prompter
         .select("Select provider", &provider_options)?
         .ok_or(AuthError::Cancelled)?;
 
-    let (patch, credential_key, key) = match selected {
-        0 => login_preset(prompter, ProviderPreset::OpenAi)?,
-        1 => login_preset(prompter, ProviderPreset::Anthropic)?,
-        2 => login_preset(prompter, ProviderPreset::DeepSeek)?,
-        _ => login_custom(prompter)?,
+    let outcome = match selected {
+        0 => Some(login_preset(prompter, ProviderPreset::OpenAi)?),
+        1 => Some(login_preset(prompter, ProviderPreset::Anthropic)?),
+        2 => Some(login_preset(prompter, ProviderPreset::DeepSeek)?),
+        3 => login_wps(prompter)?,
+        _ => Some(login_custom(prompter)?),
+    };
+
+    let Some((patch, credential_key, key)) = outcome else {
+        return Ok(());
     };
 
     write_config(&paths.user_config, &patch)?;
@@ -793,7 +866,7 @@ mod tests {
             ],
             vec![Some("sk-my".to_string())],
         )
-        .with_select_script(vec![Some(3), Some(0)]);
+        .with_select_script(vec![Some(4), Some(0)]);
 
         run_auth_login(&paths, &mut prompter).unwrap();
 
@@ -1018,6 +1091,199 @@ mod tests {
             CliError::Assembly(AssemblyError::Config(ConfigError::MissingField("model")))
                 .to_string(),
             "missing required config field: model"
+        );
+    }
+
+    #[test]
+    fn login_wps_codingplan_openai_first_model_returns_expected_patch() {
+        use super::{
+            login_wps_codingplan, WPS_CODEPLAN_OPENAI_BASE_URL, WPS_MODELS,
+        };
+
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-wps".to_string())])
+            .with_select_script(vec![Some(0), Some(0)]);
+
+        let (patch, credential_key, key) = login_wps_codingplan(&mut prompter).unwrap();
+
+        assert_eq!(patch.provider_id, "wps");
+        assert_eq!(patch.provider_kind, ProviderKind::OpenAi);
+        assert_eq!(
+            patch.base_url.as_deref(),
+            Some(WPS_CODEPLAN_OPENAI_BASE_URL)
+        );
+        assert_eq!(patch.model, WPS_MODELS[0]);
+        assert_eq!(credential_key, "wps");
+        assert_eq!(key.expose_secret(), "sk-wps");
+    }
+
+    #[test]
+    fn login_wps_codingplan_anthropic_protocol_uses_anthropic_endpoint() {
+        use super::{
+            login_wps_codingplan, WPS_CODEPLAN_ANTHROPIC_BASE_URL, WPS_MODELS,
+        };
+
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-wps2".to_string())])
+            .with_select_script(vec![Some(1), Some(0)]);
+
+        let (patch, credential_key, key) = login_wps_codingplan(&mut prompter).unwrap();
+
+        assert_eq!(patch.provider_id, "wps");
+        assert_eq!(patch.provider_kind, ProviderKind::Anthropic);
+        assert_eq!(
+            patch.base_url.as_deref(),
+            Some(WPS_CODEPLAN_ANTHROPIC_BASE_URL)
+        );
+        assert_eq!(patch.model, WPS_MODELS[0]);
+        assert_eq!(credential_key, "wps");
+        assert_eq!(key.expose_secret(), "sk-wps2");
+    }
+
+    #[test]
+    fn login_wps_codingplan_selects_nth_model_from_catalog() {
+        use super::{login_wps_codingplan, WPS_MODELS};
+
+        let model_index = 3usize;
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-wps".to_string())])
+            .with_select_script(vec![Some(0), Some(model_index)]);
+
+        let (patch, _, _) = login_wps_codingplan(&mut prompter).unwrap();
+
+        assert_eq!(patch.model, WPS_MODELS[model_index]);
+    }
+
+    #[test]
+    fn login_wps_codingplan_cancelled_at_protocol_returns_cancelled() {
+        use super::login_wps_codingplan;
+
+        let mut prompter =
+            ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![None]);
+
+        assert_eq!(
+            login_wps_codingplan(&mut prompter).unwrap_err(),
+            AuthError::Cancelled
+        );
+    }
+
+    #[test]
+    fn login_wps_codingplan_cancelled_at_model_returns_cancelled() {
+        use super::login_wps_codingplan;
+
+        let mut prompter =
+            ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![Some(0), None]);
+
+        assert_eq!(
+            login_wps_codingplan(&mut prompter).unwrap_err(),
+            AuthError::Cancelled
+        );
+    }
+
+    #[test]
+    fn login_wps_codingplan_cancelled_at_key_returns_cancelled() {
+        use super::login_wps_codingplan;
+
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![None])
+            .with_select_script(vec![Some(0), Some(0)]);
+
+        assert_eq!(
+            login_wps_codingplan(&mut prompter).unwrap_err(),
+            AuthError::Cancelled
+        );
+    }
+
+    #[test]
+    fn run_auth_login_wps_oauth2_placeholder_writes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let credentials_path = temp.path().join("credentials");
+        let paths = AuthPaths {
+            user_config: config_path.clone(),
+            credentials: credentials_path.clone(),
+        };
+        let mut prompter =
+            ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![Some(3), Some(0)]);
+
+        run_auth_login(&paths, &mut prompter).unwrap();
+
+        assert!(!config_path.exists());
+        assert!(!credentials_path.exists());
+    }
+
+    #[test]
+    fn run_auth_login_wps_codingplan_writes_config_and_credential() {
+        use super::{WPS_CODEPLAN_OPENAI_BASE_URL, WPS_MODELS};
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let credentials_path = temp.path().join("credentials");
+        let paths = AuthPaths {
+            user_config: config_path.clone(),
+            credentials: credentials_path.clone(),
+        };
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-wps".to_string())])
+            .with_select_script(vec![Some(3), Some(1), Some(0), Some(0)]);
+
+        run_auth_login(&paths, &mut prompter).unwrap();
+
+        let raw = parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(raw.model.as_deref(), Some(WPS_MODELS[0]));
+        let provider = raw.provider.as_ref().unwrap();
+        assert_eq!(provider.id.as_deref(), Some("wps"));
+        assert_eq!(provider.kind, Some(ProviderKind::OpenAi));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some(WPS_CODEPLAN_OPENAI_BASE_URL)
+        );
+
+        let source = FileCredentialSource::new(&credentials_path);
+        assert_eq!(source.resolve("wps").unwrap().expose_secret(), "sk-wps");
+    }
+
+    #[test]
+    fn run_auth_login_provider_menu_lists_wps_ai_before_custom() {
+        struct CaptureSelectPrompter {
+            captured: Option<Vec<String>>,
+        }
+
+        impl AuthPrompter for CaptureSelectPrompter {
+            fn read_line(&mut self, _prompt: &str) -> Result<Option<String>, AuthError> {
+                Ok(None)
+            }
+
+            fn read_secret(&mut self, _prompt: &str) -> Result<Option<SecretString>, AuthError> {
+                Ok(None)
+            }
+
+            fn select(
+                &mut self,
+                _prompt: &str,
+                options: &[&str],
+            ) -> Result<Option<usize>, AuthError> {
+                self.captured = Some(options.iter().map(|option| (*option).to_string()).collect());
+                Ok(None)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AuthPaths {
+            user_config: temp.path().join("config.toml"),
+            credentials: temp.path().join("credentials"),
+        };
+        let mut prompter = CaptureSelectPrompter { captured: None };
+
+        assert_eq!(
+            run_auth_login(&paths, &mut prompter),
+            Err(AuthError::Cancelled)
+        );
+        assert_eq!(
+            prompter.captured.as_deref(),
+            Some(vec![
+                "OpenAI".to_string(),
+                "Anthropic".to_string(),
+                "DeepSeek".to_string(),
+                "WPS AI".to_string(),
+                "Custom".to_string(),
+            ])
+            .as_deref()
         );
     }
 }
