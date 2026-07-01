@@ -22,7 +22,7 @@ expression: text
 
 ‹text.muted›◇ 就绪‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
-‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.primary›                                           ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹text.muted›anthropic · claude-test · iter 0/8 · 0 msgs · workspace‹/›
 ‹text.muted›▸ normal · shift+tab 切换‹/›

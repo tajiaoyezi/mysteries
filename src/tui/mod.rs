@@ -9,9 +9,9 @@ use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSour
 use crate::error::AgentError;
 use crate::permission::PermissionMode;
 use crate::provider::Usage;
+use crate::tool::ToolContext;
 use crate::tui::clipboard::{copy_selection, ArboardClipboard, Clipboard};
 use crate::tui::selection::{Point, SelectionAction};
-use crate::tool::ToolContext;
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
@@ -30,12 +30,14 @@ pub mod app;
 pub mod channel;
 pub mod clipboard;
 pub mod command;
-pub mod input_history;
+pub mod input_buffer;
+pub(crate) mod input_layout;
 pub mod jump_to_bottom;
 pub mod render;
 pub mod selection;
 pub mod terminal;
 pub mod theme;
+pub(crate) mod width;
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -493,8 +495,12 @@ fn scroll_action_for_key(key: KeyEvent) -> Option<fn(&mut app::AppState, usize, 
     match key.code {
         KeyCode::PageUp => Some(app::AppState::page_up),
         KeyCode::PageDown => Some(app::AppState::page_down),
-        KeyCode::Home => Some(app::AppState::scroll_to_top),
-        KeyCode::End => Some(app::AppState::scroll_to_bottom),
+        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(app::AppState::scroll_to_top)
+        }
+        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(app::AppState::scroll_to_bottom)
+        }
         _ => None,
     }
 }
@@ -743,10 +749,10 @@ fn error_message(err: AgentError) -> String {
 mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
     use super::{
-        arrows_route_to_completion, handle_mouse_selection_event, handle_resize, handle_selection_key,
-        run_agent_task, scroll_action_for_key, selection_key_action, should_exit,
-        SelectionKeyAction, MouseWheelScrollAction, apply_mouse_wheel_scroll_to_state,
-        RunAgentTaskConfig, DEFAULT_SYSTEM_PROMPT,
+        apply_mouse_wheel_scroll_to_state, arrows_route_to_completion,
+        handle_mouse_selection_event, handle_resize, handle_selection_key, run_agent_task,
+        scroll_action_for_key, selection_key_action, should_exit, MouseWheelScrollAction,
+        RunAgentTaskConfig, SelectionKeyAction, DEFAULT_SYSTEM_PROMPT,
     };
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
@@ -766,13 +772,14 @@ mod tests {
     use crate::tui::clipboard::Clipboard;
     use crate::tui::command::command_metadata;
     use crate::tui::selection::{Point, SelectionAction};
+    use async_trait::async_trait;
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Style;
-    use async_trait::async_trait;
-    use crossterm::event::{
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    };
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
@@ -793,6 +800,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     fn apply_scroll_key_for_test(
@@ -1043,8 +1054,14 @@ mod tests {
         let mut selected = super::app::AppState::new();
         create_selection(&mut selected);
 
-        assert_eq!(selection_key_action(&selected, ctrl_c()), Some(SelectionKeyAction::Copy));
-        assert_eq!(selection_key_action(&selected, key(KeyCode::Esc)), Some(SelectionKeyAction::Clear));
+        assert_eq!(
+            selection_key_action(&selected, ctrl_c()),
+            Some(SelectionKeyAction::Copy)
+        );
+        assert_eq!(
+            selection_key_action(&selected, key(KeyCode::Esc)),
+            Some(SelectionKeyAction::Clear)
+        );
         assert!(!should_exit(&selected, ctrl_c()));
         assert!(!should_exit(&selected, key(KeyCode::Esc)));
 
@@ -1061,13 +1078,23 @@ mod tests {
         create_selection(&mut copied);
         let mut clipboard = RecordingClipboard::new();
 
-        assert!(handle_selection_key(&mut copied, ctrl_c(), Some(&buffer), &mut clipboard));
+        assert!(handle_selection_key(
+            &mut copied,
+            ctrl_c(),
+            Some(&buffer),
+            &mut clipboard
+        ));
         assert_eq!(clipboard.calls, vec!["hello".to_string()]);
         assert!(copied.has_selection());
 
         let mut cleared = super::app::AppState::new();
         create_selection(&mut cleared);
-        assert!(handle_selection_key(&mut cleared, key(KeyCode::Esc), Some(&buffer), &mut clipboard));
+        assert!(handle_selection_key(
+            &mut cleared,
+            key(KeyCode::Esc),
+            Some(&buffer),
+            &mut clipboard
+        ));
         assert!(!cleared.has_selection());
     }
     #[test]
@@ -1150,11 +1177,13 @@ mod tests {
             scroll_action_for_key(key(KeyCode::Down)).is_none(),
             "Down is reserved for input history, not transcript scroll"
         );
+        assert!(scroll_action_for_key(key(KeyCode::Home)).is_none());
+        assert!(scroll_action_for_key(key(KeyCode::End)).is_none());
 
         state.scroll_up(40, 5, 10);
         assert!(apply_scroll_key_for_test(
             &mut state,
-            key(KeyCode::Home),
+            ctrl_key(KeyCode::Home),
             40,
             5
         ));
@@ -1163,7 +1192,7 @@ mod tests {
 
         assert!(apply_scroll_key_for_test(
             &mut state,
-            key(KeyCode::End),
+            ctrl_key(KeyCode::End),
             40,
             5
         ));
@@ -1179,7 +1208,7 @@ mod tests {
         ));
         assert!(!apply_scroll_key_for_test(
             &mut state,
-            KeyEvent::new_with_kind(KeyCode::End, KeyModifiers::NONE, KeyEventKind::Repeat),
+            KeyEvent::new_with_kind(KeyCode::End, KeyModifiers::CONTROL, KeyEventKind::Repeat),
             40,
             5
         ));
@@ -1190,7 +1219,12 @@ mod tests {
     fn keyboard_scroll_and_resize_clear_selection() {
         let mut scrolled = super::app::AppState::new();
         create_selection(&mut scrolled);
-        assert!(apply_scroll_key_for_test(&mut scrolled, key(KeyCode::PageUp), 40, 5));
+        assert!(apply_scroll_key_for_test(
+            &mut scrolled,
+            key(KeyCode::PageUp),
+            40,
+            5
+        ));
         assert!(!scrolled.has_selection());
 
         let mut resized = super::app::AppState::new();
@@ -1200,22 +1234,19 @@ mod tests {
     }
     #[test]
     fn end_and_ctrl_end_map_to_scroll_to_bottom_and_clear_new_message_count() {
-        for scroll_key in [
-            key(KeyCode::End),
-            KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
-        ] {
-            assert!(
-                scroll_action_for_key(scroll_key).is_some(),
-                "expected scroll action for {scroll_key:?}"
-            );
-            let mut state = super::app::AppState::new();
-            state.page_up(40, 5);
-            state.new_message_count = 2;
+        assert!(scroll_action_for_key(key(KeyCode::End)).is_none());
+        let scroll_key = ctrl_key(KeyCode::End);
+        assert!(
+            scroll_action_for_key(scroll_key).is_some(),
+            "expected scroll action for {scroll_key:?}"
+        );
+        let mut state = super::app::AppState::new();
+        state.page_up(40, 5);
+        state.new_message_count = 2;
 
-            assert!(apply_scroll_key_for_test(&mut state, scroll_key, 40, 5));
-            assert!(state.follows_bottom());
-            assert_eq!(state.new_message_count, 0);
-        }
+        assert!(apply_scroll_key_for_test(&mut state, scroll_key, 40, 5));
+        assert!(state.follows_bottom());
+        assert_eq!(state.new_message_count, 0);
     }
 
     #[test]
@@ -1224,7 +1255,7 @@ mod tests {
 
         assert!(apply_scroll_key_for_test(
             &mut state,
-            key(KeyCode::Home),
+            ctrl_key(KeyCode::Home),
             40,
             5
         ));
@@ -1232,12 +1263,12 @@ mod tests {
         assert_eq!(
             state.visible_scroll_offset(50, 5),
             0,
-            "Home should stop following bottom without relying on mouse events"
+            "Ctrl+Home should stop following bottom without relying on mouse events"
         );
 
         assert!(apply_scroll_key_for_test(
             &mut state,
-            key(KeyCode::End),
+            ctrl_key(KeyCode::End),
             40,
             5
         ));
@@ -1245,8 +1276,20 @@ mod tests {
         assert_eq!(
             state.visible_scroll_offset(50, 5),
             45,
-            "End should restore bottom following without relying on mouse events"
+            "Ctrl+End should restore bottom following without relying on mouse events"
         );
+    }
+
+    #[test]
+    fn bare_home_end_do_not_clear_or_intercept_selection() {
+        let mut state = super::app::AppState::new();
+        create_selection(&mut state);
+
+        for key_event in [key(KeyCode::Home), key(KeyCode::End)] {
+            assert_eq!(selection_key_action(&state, key_event), None);
+            assert!(scroll_action_for_key(key_event).is_none());
+        }
+        assert!(state.has_selection());
     }
 
     #[test]
@@ -1966,8 +2009,8 @@ model = "zhipu/glm-5.2"
         )
         .unwrap();
 
-        let profiles = crate::app::provider_profiles_from_paths(&config_path, &config_path)
-            .unwrap();
+        let profiles =
+            crate::app::provider_profiles_from_paths(&config_path, &config_path).unwrap();
         assert_eq!(profiles.len(), 2);
 
         let old_provider = Arc::new(MockProvider::new(vec![ModelResponse {

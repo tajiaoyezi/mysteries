@@ -6,7 +6,7 @@ use crate::provider::registry::models_for;
 use crate::provider::Usage;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
 use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
-use crate::tui::input_history::{reduce_input_history, InputHistoryAction, InputHistoryState};
+use crate::tui::input_buffer::{reduce_input_buffer, InputBufferAction, InputBufferState};
 use crate::tui::jump_to_bottom::{bump_new_message_count, new_message_count_on_follow_bottom};
 use crate::tui::selection::{reduce_selection, SelectionAction, SelectionState};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -172,8 +172,7 @@ pub fn resolve_active_provider<'a>(
             if profile.model == session_model {
                 return true;
             }
-            models_for(id)
-                .is_some_and(|catalog| catalog.contains(&session_model))
+            models_for(id).is_some_and(|catalog| catalog.contains(&session_model))
         })
         .map(|(id, _)| id.as_str())
         .collect();
@@ -390,7 +389,7 @@ pub struct AppState {
     pub command_completion: Option<CommandCompletion>,
     pub models_picker: Option<ModelsPicker>,
     pub provider_profiles: BTreeMap<String, ProviderProfile>,
-    pub input_line: InputHistoryState,
+    pub input_line: InputBufferState,
     pub selection: SelectionState,
     pub permission_mode: Arc<Mutex<PermissionMode>>,
     pub phase: Phase,
@@ -436,7 +435,7 @@ impl AppState {
             command_completion: None,
             models_picker: None,
             provider_profiles: BTreeMap::new(),
-            input_line: InputHistoryState::default(),
+            input_line: InputBufferState::default(),
             selection: SelectionState::default(),
             permission_mode: Arc::new(Mutex::new(PermissionMode::Normal)),
             phase: Phase::Ready,
@@ -467,7 +466,7 @@ impl AppState {
     }
 
     pub fn input(&self) -> &str {
-        &self.input_line.input
+        self.input_line.text()
     }
 
     pub fn apply_selection_action(&mut self, action: SelectionAction) {
@@ -489,8 +488,12 @@ impl AppState {
             .expect("permission mode mutex poisoned")
     }
 
-    fn apply_input_action(&mut self, action: InputHistoryAction) {
-        self.input_line = reduce_input_history(&self.input_line, action);
+    fn apply_input_action(&mut self, action: InputBufferAction) {
+        self.input_line = reduce_input_buffer(&self.input_line, action);
+    }
+
+    pub fn set_input_text(&mut self, text: impl Into<String>) {
+        self.apply_input_action(InputBufferAction::SetText(text.into()));
     }
 
     fn cycle_permission_mode(&mut self) {
@@ -698,7 +701,7 @@ impl AppState {
             return;
         };
 
-        self.input_line.input = command.name.to_string();
+        self.set_input_text(command.name.to_string());
         self.close_command_completion();
     }
 
@@ -859,10 +862,8 @@ impl AppState {
                     AgentStatus::WaitingForPermission => Phase::WaitingForPermission,
                 };
                 if was_busy && self.phase == Phase::Ready {
-                    self.new_message_count = bump_new_message_count(
-                        self.follows_bottom,
-                        self.new_message_count,
-                    );
+                    self.new_message_count =
+                        bump_new_message_count(self.follows_bottom, self.new_message_count);
                 }
             }
             AgentEvent::PermissionRequired(request) => {
@@ -960,32 +961,70 @@ impl AppState {
             return;
         }
 
+        let pure_control = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        let newline_key = match key.code {
+            KeyCode::Enter => {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SHIFT)
+            }
+            KeyCode::Char(ch) => ch.eq_ignore_ascii_case(&'j') && pure_control,
+            _ => false,
+        };
+        if newline_key {
+            self.apply_input_action(InputBufferAction::InsertNewline);
+            self.refresh_command_completion();
+            return;
+        }
+
         match key.code {
             KeyCode::Up => {
-                self.apply_input_action(InputHistoryAction::HistoryUp);
+                self.apply_input_action(InputBufferAction::Up);
             }
             KeyCode::Down => {
-                self.apply_input_action(InputHistoryAction::HistoryDown);
+                self.apply_input_action(InputBufferAction::Down);
+            }
+            KeyCode::Left => {
+                self.apply_input_action(InputBufferAction::MoveLeft);
+            }
+            KeyCode::Right => {
+                self.apply_input_action(InputBufferAction::MoveRight);
+            }
+            KeyCode::Home => {
+                self.apply_input_action(InputBufferAction::MoveLineStart);
+            }
+            KeyCode::End => {
+                self.apply_input_action(InputBufferAction::MoveLineEnd);
             }
             KeyCode::Char(ch) => {
-                self.apply_input_action(InputHistoryAction::InsertChar(ch));
+                if pure_control {
+                    return;
+                }
+                self.apply_input_action(InputBufferAction::InsertChar(ch));
                 self.refresh_command_completion();
             }
             KeyCode::Backspace => {
-                self.apply_input_action(InputHistoryAction::Backspace);
+                self.apply_input_action(InputBufferAction::Backspace);
+                self.refresh_command_completion();
+            }
+            KeyCode::Delete => {
+                self.apply_input_action(InputBufferAction::Delete);
                 self.refresh_command_completion();
             }
             KeyCode::Enter => {
                 self.close_command_completion();
+                let contains_newline = self.input().contains('\n');
                 let prompt = self.input().trim().to_string();
                 if prompt.is_empty() {
                     return;
                 }
                 self.clear_selection();
-                self.apply_input_action(InputHistoryAction::PushSubmitted(prompt.clone()));
-                if let Some(command) = parse_command(&prompt) {
-                    self.execute_command(command, input_tx);
-                    return;
+                self.apply_input_action(InputBufferAction::PushSubmitted(prompt.clone()));
+                if !contains_newline {
+                    if let Some(command) = parse_command(&prompt) {
+                        self.execute_command(command, input_tx);
+                        return;
+                    }
                 }
                 self.reset_turn_token_usage();
                 self.iteration = 0;
@@ -1082,8 +1121,8 @@ impl Default for AppState {
 mod tests {
     use super::{
         build_rows, compute_diff, estimate_streaming_rate_tps, estimate_tokens_from_chars,
-        AppState, DiffKind, DiffLine, ModelsPicker, ModelsPickerRowKind, Phase,
-        SessionSnapshot, StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
+        AppState, DiffKind, DiffLine, ModelsPicker, ModelsPickerRowKind, Phase, SessionSnapshot,
+        StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
     };
     use crate::agent::AgentStatus;
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
@@ -1114,6 +1153,11 @@ mod tests {
         kind: KeyEventKind,
     ) -> KeyEvent {
         KeyEvent::new_with_kind(code, modifiers, kind)
+    }
+
+    fn assert_input_state(state: &AppState, text: &str, cursor: usize) {
+        assert_eq!(state.input_line.text(), text);
+        assert_eq!(state.input_line.cursor, cursor);
     }
 
     fn selection_point(col: u16, row: u16) -> Point {
@@ -1190,7 +1234,7 @@ mod tests {
         let mut state = AppState::new();
         create_selection(&mut state);
         assert!(state.has_selection());
-        state.input_line.input = "hello".to_string();
+        state.set_input_text("hello");
 
         state.on_key(key(KeyCode::Enter), &tx);
 
@@ -1210,7 +1254,7 @@ mod tests {
             .push(TranscriptBlock::User("old".to_string()));
         create_selection(&mut state);
         assert!(state.has_selection());
-        state.input_line.input = "/clear".to_string();
+        state.set_input_text("/clear");
 
         state.on_key(key(KeyCode::Enter), &tx);
 
@@ -1238,13 +1282,7 @@ mod tests {
         assert!(wps_models
             .iter()
             .any(|row| row.model.as_deref() == Some("zhipu/glm-5.2") && row.is_current));
-        assert_eq!(
-            wps_models
-                .iter()
-                .filter(|row| row.is_current)
-                .count(),
-            1
-        );
+        assert_eq!(wps_models.iter().filter(|row| row.is_current).count(), 1);
 
         let openai_header = rows
             .iter()
@@ -1291,14 +1329,14 @@ mod tests {
         let profiles = wps_openai_profiles();
         let mut picker = ModelsPicker::new(&profiles, ("wps", "zhipu/glm-5.2"));
 
-        let first = picker
-            .highlighted_row()
-            .expect("initial highlight")
-            .clone();
+        let first = picker.highlighted_row().expect("initial highlight").clone();
         assert_eq!(first.kind, ModelsPickerRowKind::Model);
 
         picker.move_highlight(1);
-        assert_eq!(picker.highlighted_row().unwrap().kind, ModelsPickerRowKind::Model);
+        assert_eq!(
+            picker.highlighted_row().unwrap().kind,
+            ModelsPickerRowKind::Model
+        );
         assert_ne!(picker.highlighted_row().unwrap().model, first.model);
 
         for _ in 0..8 {
@@ -1349,15 +1387,14 @@ mod tests {
                     || row.provider_id == "wps"),
             "only wps group should remain when filtering glm"
         );
-        assert!(
-            visible
-                .iter()
-                .filter(|row| row.kind == ModelsPickerRowKind::Model)
-                .all(|row| {
-                    let haystack = format!("{}/{}", row.provider_id, row.model.as_deref().unwrap_or(""));
-                    haystack.to_lowercase().contains("glm")
-                })
-        );
+        assert!(visible
+            .iter()
+            .filter(|row| row.kind == ModelsPickerRowKind::Model)
+            .all(|row| {
+                let haystack =
+                    format!("{}/{}", row.provider_id, row.model.as_deref().unwrap_or(""));
+                haystack.to_lowercase().contains("glm")
+            }));
 
         let highlighted = picker.highlighted_row().expect("highlight after filter");
         assert_eq!(highlighted.kind, ModelsPickerRowKind::Model);
@@ -1531,7 +1568,7 @@ mod tests {
 
         state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
         assert_eq!(state.iteration, 1);
-        state.input_line.input = "next prompt".to_string();
+        state.set_input_text("next prompt");
         state.on_key(key(KeyCode::Enter), &tx);
         assert_eq!(state.iteration, 0);
     }
@@ -1544,17 +1581,17 @@ mod tests {
             .transcript
             .push(TranscriptBlock::User("old".to_string()));
 
-        state.input_line.input = "/clear".to_string();
+        state.set_input_text("/clear");
         state.on_key(key(KeyCode::Enter), &tx);
         assert!(state.transcript.is_empty());
         assert!(rx.try_recv().is_err());
 
-        state.input_line.input = "/help".to_string();
+        state.set_input_text("/help");
         state.on_key(key(KeyCode::Enter), &tx);
         assert_eq!(state.transcript, vec![TranscriptBlock::Help]);
 
         state.iteration = 3;
-        state.input_line.input = "/status".to_string();
+        state.set_input_text("/status");
         state.on_key(key(KeyCode::Enter), &tx);
         assert_eq!(
             state.transcript.last(),
@@ -1569,7 +1606,7 @@ mod tests {
             }))
         );
 
-        state.input_line.input = "/exit".to_string();
+        state.set_input_text("/exit");
         state.on_key(key(KeyCode::Enter), &tx);
         assert!(state.should_exit);
         assert!(rx.try_recv().is_err());
@@ -1581,7 +1618,7 @@ mod tests {
         let mut state = AppState::with_session(session());
 
         for input in ["/login", "/logout", "/xyz"] {
-            state.input_line.input = input.to_string();
+            state.set_input_text(input);
             state.on_key(key(KeyCode::Enter), &tx);
         }
 
@@ -1635,7 +1672,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = AppState::with_session(session());
 
-        state.input_line.input = "/model".to_string();
+        state.set_input_text("/model");
         state.on_key(key(KeyCode::Enter), &tx);
         assert!(matches!(
             state.transcript.last(),
@@ -1643,7 +1680,7 @@ mod tests {
                 if text.contains("claude-test") && text.contains("model")
         ));
 
-        state.input_line.input = "/model claude-next".to_string();
+        state.set_input_text("/model claude-next");
         state.on_key(key(KeyCode::Enter), &tx);
         assert_eq!(state.session.model, "claude-next");
         assert_eq!(
@@ -1856,6 +1893,180 @@ mod tests {
     }
 
     #[test]
+    fn newline_keys_insert_newline_without_submitting() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        for key_event in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            state.on_key(key_event, &tx);
+        }
+
+        assert_eq!(state.input(), "\n\n\n");
+        assert!(state.transcript.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn multiline_slash_text_submits_as_prompt_not_command() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(TranscriptBlock::User("old".to_string()));
+        state.set_input_text("/clear\nbody");
+
+        state.on_key(key(KeyCode::Enter), &tx);
+
+        assert_eq!(
+            state.transcript,
+            vec![
+                TranscriptBlock::User("old".to_string()),
+                TranscriptBlock::User("/clear\nbody".to_string())
+            ]
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            UserInput::Prompt("/clear\nbody".to_string())
+        );
+    }
+
+    #[test]
+    fn ctrl_chars_are_filtered_except_newline_and_altgr() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.on_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(state.input(), "");
+
+        state.on_key(
+            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(state.input(), "\n");
+
+        state.on_key(
+            KeyEvent::new(
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            &tx,
+        );
+        assert_eq!(state.input(), "\n@");
+    }
+
+    #[test]
+    fn cursor_keys_edit_at_cursor_and_line_boundaries() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.set_input_text("a你b");
+        state.on_key(key(KeyCode::Left), &tx);
+        assert_eq!(state.input_line.cursor, "a你".len());
+        state.on_key(key(KeyCode::Left), &tx);
+        assert_eq!(state.input_line.cursor, "a".len());
+        state.on_key(key(KeyCode::Right), &tx);
+        assert_eq!(state.input_line.cursor, "a你".len());
+        state.on_key(key(KeyCode::Left), &tx);
+        state.on_key(key(KeyCode::Delete), &tx);
+        assert_eq!(state.input(), "ab");
+        assert_eq!(state.input_line.cursor, "a".len());
+
+        state.set_input_text("ab\ncd你");
+        state.on_key(key(KeyCode::Left), &tx);
+        state.on_key(key(KeyCode::Left), &tx);
+        assert_eq!(state.input_line.cursor, "ab\nc".len());
+        state.on_key(key(KeyCode::Home), &tx);
+        assert_eq!(state.input_line.cursor, "ab\n".len());
+        state.on_key(key(KeyCode::End), &tx);
+        assert_eq!(state.input_line.cursor, "ab\ncd你".len());
+    }
+
+    #[test]
+    fn up_down_move_inside_multiline_before_history_in_app() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.set_input_text("old");
+        state.on_key(key(KeyCode::Enter), &tx);
+        state.set_input_text("aa\nbb");
+
+        state.on_key(key(KeyCode::Up), &tx);
+        assert_eq!(state.input(), "aa\nbb");
+        assert_eq!(state.input_line.cursor, "aa".len());
+        assert_eq!(state.input_line.history_cursor, None);
+
+        state.on_key(key(KeyCode::Up), &tx);
+        assert_eq!(state.input(), "old");
+        assert_eq!(state.input_line.history_cursor, Some(0));
+
+        state.on_key(key(KeyCode::Down), &tx);
+        assert_eq!(state.input(), "aa\nbb");
+        assert_eq!(state.input_line.cursor, "aa\nbb".len());
+        assert_eq!(state.input_line.history_cursor, None);
+    }
+
+    #[test]
+    fn pending_permission_blocks_newline_char_and_editing_keys() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let keys = [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            key(KeyCode::Char('x')),
+            key(KeyCode::Left),
+            key(KeyCode::Home),
+            key(KeyCode::Delete),
+        ];
+
+        for key_event in keys {
+            let (permission_tx, _permission_rx) = oneshot::channel();
+            let mut state = AppState::new();
+            state.set_input_text("keep");
+            state.input_line.cursor = "ke".len();
+            state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+                tool_name: "write_file".to_string(),
+                args: json!({}),
+                responder: permission_tx,
+            }));
+
+            state.on_key(key_event, &input_tx);
+
+            assert_input_state(&state, "keep", "ke".len());
+        }
+    }
+
+    #[test]
+    fn models_picker_blocks_newline_cursor_and_editing_keys_from_input_buffer() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let keys = [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            key(KeyCode::Char('z')),
+            key(KeyCode::Left),
+            key(KeyCode::Home),
+            key(KeyCode::Delete),
+        ];
+
+        for key_event in keys {
+            let mut state = AppState::new();
+            state.provider_profiles = wps_openai_profiles();
+            state.session.provider = "wps".to_string();
+            state.session.model = "zhipu/glm-5.2".to_string();
+            state.set_input_text("keep");
+            state.input_line.cursor = "ke".len();
+            state.execute_command(Command::Models, &input_tx);
+            assert!(state.models_picker.is_some());
+
+            state.on_key(key_event, &input_tx);
+
+            assert_input_state(&state, "keep", "ke".len());
+        }
+    }
+
+    #[test]
     fn on_key_ignores_non_press_events_to_avoid_duplicate_input() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = AppState::new();
@@ -1891,7 +2102,8 @@ mod tests {
             "ctrl+o Press should expand folded tool cards"
         );
         assert_eq!(
-            state.input(), "",
+            state.input(),
+            "",
             "ctrl+o should toggle tool expansion instead of typing 'o'"
         );
         assert!(rx.try_recv().is_err());
@@ -1911,7 +2123,7 @@ mod tests {
         );
         assert_eq!(state.input(), "");
 
-        state.input_line.input = "keep".to_string();
+        state.set_input_text("keep");
         state.on_key(
             key_with_modifiers_and_kind(
                 KeyCode::Char('o'),
@@ -2022,15 +2234,7 @@ mod tests {
         state.on_key(key(KeyCode::Char('/')), &tx);
         assert_eq!(
             completion_names(&state),
-            vec![
-                "/help",
-                "/clear",
-                "/model",
-                "/models",
-                "/status",
-                "/exit",
-                "/compact"
-            ]
+            vec!["/help", "/clear", "/model", "/models", "/status", "/exit", "/compact"]
         );
         assert_eq!(selected_completion_name(&state), "/help");
 
@@ -2051,6 +2255,25 @@ mod tests {
     }
 
     #[test]
+    fn command_completion_keeps_char_and_backspace_editing_soft() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.on_key(key(KeyCode::Char('/')), &tx);
+        state.on_key(key(KeyCode::Char('c')), &tx);
+        assert_eq!(state.input(), "/c");
+        assert_eq!(completion_names(&state), vec!["/clear", "/compact"]);
+
+        state.on_key(key(KeyCode::Char('o')), &tx);
+        assert_eq!(state.input(), "/co");
+        assert_eq!(completion_names(&state), vec!["/compact"]);
+
+        state.on_key(key(KeyCode::Backspace), &tx);
+        assert_eq!(state.input(), "/c");
+        assert_eq!(completion_names(&state), vec!["/clear", "/compact"]);
+    }
+
+    #[test]
     fn models_command_opens_picker_and_enter_sends_set_provider() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = AppState::new();
@@ -2058,7 +2281,7 @@ mod tests {
         state.session.provider = "wps".to_string();
         state.session.model = "zhipu/glm-5.2".to_string();
 
-        state.input_line.input = "/models".to_string();
+        state.set_input_text("/models");
         state.on_key(key(KeyCode::Enter), &tx);
         assert!(state.models_picker.is_some());
 
@@ -2099,15 +2322,15 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = AppState::new();
 
-        state.input_line.input = "/model ".to_string();
+        state.set_input_text("/model ");
         state.on_key(key(KeyCode::Char('g')), &tx);
         assert!(state.command_completion.is_none());
 
-        state.input_line.input = "hello".to_string();
+        state.set_input_text("hello");
         state.on_key(key(KeyCode::Char('!')), &tx);
         assert!(state.command_completion.is_none());
 
-        state.input_line.input.clear();
+        state.set_input_text("");
         state.on_key(key(KeyCode::Char('/')), &tx);
         assert!(state.command_completion.is_some());
         state.on_key(key(KeyCode::Esc), &tx);
@@ -2274,7 +2497,7 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(state.output_tokens_this_turn(), 40);
-        state.input_line.input = "hello".to_string();
+        state.set_input_text("hello");
 
         state.on_key(key(KeyCode::Enter), &input_tx);
 
@@ -2312,7 +2535,9 @@ mod tests {
         let mut state = AppState::new();
         state.page_up(100, 10);
 
-        state.transcript.push(TranscriptBlock::User("hi".to_string()));
+        state
+            .transcript
+            .push(TranscriptBlock::User("hi".to_string()));
         state.apply(AgentEvent::Notice("saved".to_string()));
         state.apply(AgentEvent::ToolCallStarted {
             id: "call-1".to_string(),
@@ -2448,7 +2673,11 @@ mod tests {
         assert!(state.command_completion.is_some());
 
         state.on_key(key(KeyCode::Up), &tx);
-        assert_eq!(state.input(), "/cl", "↑ should move completion, not history");
+        assert_eq!(
+            state.input(),
+            "/cl",
+            "↑ should move completion, not history"
+        );
         assert_eq!(state.input_line.input_history.len(), 1);
     }
 
@@ -2467,7 +2696,11 @@ mod tests {
         assert!(state.models_picker.is_some());
 
         state.on_key(key(KeyCode::Up), &tx);
-        assert_eq!(state.input(), "", "↑ should move picker highlight, not history");
+        assert_eq!(
+            state.input(),
+            "",
+            "↑ should move picker highlight, not history"
+        );
         assert_eq!(state.input_line.input_history.len(), 1);
     }
 

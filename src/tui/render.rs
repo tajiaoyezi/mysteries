@@ -3,9 +3,13 @@ use crate::tui::app::{
     compute_diff, AppState, DiffKind, DiffLine, ModelsPickerRowKind, Phase, StatusSnapshot,
     ToolCard, ToolCardStatus, TranscriptBlock,
 };
+use crate::tui::input_layout::{
+    input_content_height_cap, input_scroll_offset, visual_input_layout, InputVisualLayout,
+};
 use crate::tui::jump_to_bottom::jump_to_bottom_pill_text;
 use crate::tui::selection::{col_range_for_row, Selection};
 use crate::tui::theme::Theme;
+use crate::tui::width::{char_width, display_width};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -14,6 +18,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 const STATUS_TOP_GAP_LINES: u16 = 2;
+const INPUT_PROMPT: &str = "> ";
+const INPUT_MAX_CONTENT_ROWS: u16 = 10;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     let area = frame.area();
@@ -56,11 +62,24 @@ fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
             Constraint::Length(permission_height(state)),
             Constraint::Length(status_top_gap_height(state)),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(input_box_height(area, state)),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area)
+}
+
+fn input_box_height(area: Rect, state: &AppState) -> u16 {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let layout_width = inner_width.saturating_sub(display_width(INPUT_PROMPT));
+    let layout = visual_input_layout(state.input(), state.input_line.cursor, layout_width);
+    let cap = input_content_height_cap(
+        area.height,
+        status_top_gap_height(state),
+        permission_height(state),
+        INPUT_MAX_CONTENT_ROWS,
+    );
+    (layout.lines.len() as u16).clamp(1, cap).saturating_add(2)
 }
 
 fn status_top_gap_height(state: &AppState) -> u16 {
@@ -1013,20 +1032,12 @@ fn status_meta_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
 
 fn mode_glyph_and_style(mode: PermissionMode, theme: &Theme) -> (&'static str, Style) {
     match mode {
-        PermissionMode::Normal => (
-            "▸",
-            Style::default().fg(theme.text_muted).bg(theme.bg_base),
-        ),
+        PermissionMode::Normal => ("▸", Style::default().fg(theme.text_muted).bg(theme.bg_base)),
         PermissionMode::AcceptEdits => (
             "▸▸",
-            Style::default()
-                .fg(theme.accent_primary)
-                .bg(theme.bg_base),
+            Style::default().fg(theme.accent_primary).bg(theme.bg_base),
         ),
-        PermissionMode::Yolo => (
-            "▲",
-            Style::default().fg(theme.warning_fg).bg(theme.bg_base),
-        ),
+        PermissionMode::Yolo => ("▲", Style::default().fg(theme.warning_fg).bg(theme.bg_base)),
     }
 }
 
@@ -1043,73 +1054,40 @@ fn render_mode_line(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: 
     .style(Style::default().bg(theme.bg_base));
     frame.render_widget(paragraph, area);
 }
-
-fn display_width(text: &str) -> usize {
-    text.chars().map(char_width).sum()
-}
-
-fn char_width(ch: char) -> usize {
-    if is_zero_width(ch) {
-        return 0;
-    }
-
-    if matches!(
-        ch as u32,
-        0x2E80..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE10..=0xFE19
-            | 0xFE30..=0xFE6F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x1F000..=0x1FAFF
-    ) {
-        2
-    } else {
-        1
-    }
-}
-
-fn is_zero_width(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200D | 0xFE00..=0xFE0F
-    )
-}
-
 fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
-    const INPUT_PROMPT: &str = "mysteries ▸ ";
-
     let input_text = state.input();
-    let prompt_span = Span::styled(
-        INPUT_PROMPT,
-        Style::default().fg(theme.accent_primary).bg(theme.bg_base),
-    );
+    let prompt_style = Style::default().fg(theme.accent_primary).bg(theme.bg_base);
+    let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let layout_width = inner_width.saturating_sub(display_width(INPUT_PROMPT));
+    let layout = visual_input_layout(input_text, state.input_line.cursor, layout_width);
+    let content_rows = area.height.saturating_sub(2).max(1) as usize;
+    let scroll_offset = input_scroll_offset(layout.lines.len(), content_rows, layout.cursor.row);
+
     let content = if !input_text.is_empty() {
-        Line::from(vec![
-            prompt_span,
-            Span::styled(
-                input_text.to_string(),
-                Style::default().fg(theme.text_primary).bg(theme.bg_base),
-            ),
-        ])
+        input_content_lines(
+            &layout,
+            scroll_offset,
+            content_rows,
+            prompt_style,
+            text_style,
+        )
     } else if state.models_picker.is_some() {
         // 浮层活跃时不显示输入提示(浮层是焦点),也避免右对齐提示从浮层旁露出。
-        Line::from(vec![prompt_span])
+        vec![Line::from(vec![Span::styled(INPUT_PROMPT, prompt_style)])]
     } else {
         // 空态:提示右对齐,避开终端 IME 组合浮层(画在左侧光标处)。app 收不到
         // IME composition 事件,无法按组合状态隐藏提示,故靠版式让开碰撞区。
         let hint = "输入任务,或 / 执行命令…";
-        let inner_width = area.width.saturating_sub(2) as usize;
         let pad = inner_width.saturating_sub(display_width(INPUT_PROMPT) + display_width(hint));
-        Line::from(vec![
-            prompt_span,
+        vec![Line::from(vec![
+            Span::styled(INPUT_PROMPT, prompt_style),
             Span::styled(" ".repeat(pad), Style::default().bg(theme.bg_base)),
             Span::styled(
                 hint,
                 Style::default().fg(theme.text_muted).bg(theme.bg_base),
             ),
-        ])
+        ])]
     };
     let paragraph = Paragraph::new(content)
         .block(
@@ -1118,9 +1096,37 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
                 .border_style(Style::default().fg(theme.border_subtle).bg(theme.bg_base))
                 .style(Style::default().fg(theme.text_primary).bg(theme.bg_base)),
         )
-        .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
+        .style(text_style);
     frame.render_widget(paragraph, area);
-    frame.set_cursor_position(input_cursor_position(area, input_text));
+    frame.set_cursor_position(input_cursor_position(area, &layout, scroll_offset));
+}
+
+fn input_content_lines<'a>(
+    layout: &InputVisualLayout,
+    scroll_offset: usize,
+    content_rows: usize,
+    prompt_style: Style,
+    text_style: Style,
+) -> Vec<Line<'a>> {
+    let prompt_width = display_width(INPUT_PROMPT);
+    layout
+        .lines
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(content_rows)
+        .map(|(visual_row, text)| {
+            let gutter = if visual_row == 0 {
+                INPUT_PROMPT.to_string()
+            } else {
+                " ".repeat(prompt_width)
+            };
+            Line::from(vec![
+                Span::styled(gutter, prompt_style),
+                Span::styled(text.clone(), text_style),
+            ])
+        })
+        .collect()
 }
 
 fn render_command_completion(
@@ -1181,23 +1187,15 @@ fn render_command_completion(
     frame.render_widget(paragraph, area);
 }
 
-fn render_models_picker(
-    frame: &mut Frame<'_>,
-    status_area: Rect,
-    state: &AppState,
-    theme: &Theme,
-) {
+fn render_models_picker(frame: &mut Frame<'_>, status_area: Rect, state: &AppState, theme: &Theme) {
     let Some(picker) = &state.models_picker else {
         return;
     };
 
     let visible = picker.visible_rows();
-    let highlighted = picker.highlighted_row().map(|row| {
-        (
-            row.provider_id.as_str(),
-            row.model.as_deref().unwrap_or(""),
-        )
-    });
+    let highlighted = picker
+        .highlighted_row()
+        .map(|row| (row.provider_id.as_str(), row.model.as_deref().unwrap_or("")));
 
     let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
         "模型",
@@ -1384,32 +1382,37 @@ pub(crate) fn selection_text(buffer: &Buffer, selection: &Selection) -> String {
     lines.join("\n")
 }
 
-fn input_cursor_position(area: Rect, input: &str) -> Position {
-    const INPUT_PROMPT: &str = "mysteries ▸ ";
-
-    let content_width = display_width(INPUT_PROMPT) + display_width(input);
+fn input_cursor_position(area: Rect, layout: &InputVisualLayout, scroll_offset: usize) -> Position {
     let max_x = area.x.saturating_add(area.width.saturating_sub(2));
+    let max_y = area.y.saturating_add(area.height.saturating_sub(2));
     let x = area
         .x
         .saturating_add(1)
-        .saturating_add(content_width as u16)
+        .saturating_add(display_width(INPUT_PROMPT) as u16)
+        .saturating_add(layout.cursor.col as u16)
         .min(max_x);
-    let y = area.y.saturating_add(1);
+    let visible_row = layout.cursor.row.saturating_sub(scroll_offset) as u16;
+    let y = area
+        .y
+        .saturating_add(1)
+        .saturating_add(visible_row)
+        .min(max_y);
     Position::new(x, y)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{render, selection_text, transcript_line_count};
+    use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::PermissionMode;
     use crate::provider::Usage;
-    use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::tui::app::{
         AppState, ModelsPicker, Phase, SessionSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
     };
     use crate::tui::channel::{AgentEvent, PermissionRequest};
     use crate::tui::selection::{Point, Selection, SelectionState};
     use crate::tui::theme::Theme;
+    use crate::tui::width::display_width;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1465,7 +1468,7 @@ mod tests {
             while x < area.x + area.width {
                 let symbol = buffer[(x, y)].symbol().to_string();
                 line.push_str(&symbol);
-                x += super::display_width(&symbol).max(1) as u16;
+                x += display_width(&symbol).max(1) as u16;
             }
             lines.push(line.trim_end().to_string());
         }
@@ -1485,7 +1488,7 @@ mod tests {
                     symbol.clone(),
                     style_key(cell.fg, cell.bg, cell.modifier, theme),
                 ));
-                x += super::display_width(&symbol).max(1) as u16;
+                x += display_width(&symbol).max(1) as u16;
             }
 
             while matches!(cells.last(), Some((symbol, _)) if symbol == " ") {
@@ -1653,14 +1656,19 @@ mod tests {
     fn selection_highlight_snapshot() {
         let theme = Theme::midnight();
         let mut state = AppState::new();
-        state.transcript.push(TranscriptBlock::Assistant(
-            "alpha\n你好 beta".to_string(),
-        ));
+        state
+            .transcript
+            .push(TranscriptBlock::Assistant("alpha\n你好 beta".to_string()));
 
         let before = render_to_buffer(&state, &theme);
         let start = find_symbol(&before, "你");
         state.selection = SelectionState {
-            selection: Some(selection(start.x, start.y, start.x.saturating_add(3), start.y)),
+            selection: Some(selection(
+                start.x,
+                start.y,
+                start.x.saturating_add(3),
+                start.y,
+            )),
             dragging: false,
         };
 
@@ -1674,10 +1682,15 @@ mod tests {
         assert_eq!(leading.bg, theme.selection_bg);
         assert_eq!(continuation.bg, theme.selection_bg);
         assert_eq!(leading.fg, original.fg);
-        assert!(state.has_selection(), "released selection should remain highlighted");
+        assert!(
+            state.has_selection(),
+            "released selection should remain highlighted"
+        );
 
         let text = buffer_to_styled(&after, &theme);
-        println!("\n--- selection highlight frame ---\n{text}\n--- end selection highlight frame ---");
+        println!(
+            "\n--- selection highlight frame ---\n{text}\n--- end selection highlight frame ---"
+        );
         insta::assert_snapshot!("tui_selection_highlight", text);
     }
 
@@ -1723,10 +1736,10 @@ mod tests {
     }
     #[test]
     fn display_width_treats_common_emoji_as_wide() {
-        assert_eq!(super::display_width("a"), 1);
-        assert_eq!(super::display_width("你好"), 4);
-        assert_eq!(super::display_width("👋"), 2);
-        assert_eq!(super::display_width("😊"), 2);
+        assert_eq!(display_width("a"), 1);
+        assert_eq!(display_width("你好"), 4);
+        assert_eq!(display_width("👋"), 2);
+        assert_eq!(display_width("😊"), 2);
     }
 
     #[test]
@@ -1748,7 +1761,7 @@ mod tests {
     #[test]
     fn input_render_sets_cursor_at_input_end() {
         let mut state = AppState::new();
-        state.input_line.input = "你好".to_string();
+        state.set_input_text("你好");
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1758,7 +1771,50 @@ mod tests {
 
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(17, 20));
+            .assert_cursor_position(Position::new(7, 20));
+    }
+    #[test]
+    fn input_render_sets_cursor_at_multiline_cursor_position() {
+        let mut state = AppState::new();
+        state.set_input_text("ab\ncd");
+        state.input_line.cursor = 0;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &state, &Theme::midnight()))
+            .unwrap();
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(3, 19));
+    }
+    #[test]
+    fn multiline_input_dynamic_height_soft_wrap_snapshot() {
+        let mut state = AppState::new();
+        state.transcript.push(TranscriptBlock::Assistant(
+            "transcript remains visible".to_string(),
+        ));
+        let text = "普通 multi\nabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ\nfinal 行";
+        state.set_input_text(text);
+        state.input_line.cursor = "普通 multi\nabcdefghijklmnopqrstuvwxyz0123456789ABCD".len();
+
+        let backend = TestBackend::new(42, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &Theme::midnight()))
+            .unwrap();
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(5, 19));
+        let output = buffer_to_plain(terminal.backend().buffer());
+        assert!(output.contains("transcript remains visible"));
+        assert!(output.contains("> 普通 multi"));
+        assert!(output.contains("abcdefghijklmnopqrstuvwxyz0123456789AB"));
+        assert!(output.contains("  CDEFGHIJ"));
+        assert!(output.contains("final 行"));
+        insta::assert_snapshot!("tui_multiline_input_dynamic_height_soft_wrap", output);
     }
 
     fn tool_card(
@@ -1913,7 +1969,10 @@ mod tests {
     fn jump_to_bottom_pill_idle_snapshot() {
         let state = scrolled_away_state();
         let text = render_to_styled(&state, &Theme::midnight());
-        insta::assert_snapshot!("tui_jump_to_bottom_pill_idle", jump_to_bottom_pill_line(&text));
+        insta::assert_snapshot!(
+            "tui_jump_to_bottom_pill_idle",
+            jump_to_bottom_pill_line(&text)
+        );
     }
 
     #[test]
@@ -2286,9 +2345,9 @@ mod tests {
                 continue;
             }
             assert!(
-                super::display_width(&plain) <= width,
+                display_width(&plain) <= width,
                 "逻辑行宽度 {} 超过视口宽度 {width}: {plain:?}",
-                super::display_width(&plain)
+                display_width(&plain)
             );
         }
     }
@@ -2311,7 +2370,7 @@ mod tests {
         assert_eq!(border_lines.len(), 2, "Error 块应有顶/底各一条边框行");
         for border in border_lines {
             assert_eq!(
-                super::display_width(&border),
+                display_width(&border),
                 WIDTH,
                 "边框行应铺满视口宽度: {border:?}"
             );
@@ -2350,9 +2409,9 @@ mod tests {
         assert!(output_lines.iter().any(|line| line.contains("second line")));
         for line in &output_lines {
             assert!(
-                super::display_width(line) <= WIDTH,
+                display_width(line) <= WIDTH,
                 "工具输出行宽度 {} 超过视口: {line:?}",
-                super::display_width(line)
+                display_width(line)
             );
         }
     }
