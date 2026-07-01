@@ -8,6 +8,7 @@ use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
 use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
 use crate::tui::input_history::{reduce_input_history, InputHistoryAction, InputHistoryState};
 use crate::tui::jump_to_bottom::{bump_new_message_count, new_message_count_on_follow_bottom};
+use crate::tui::selection::{reduce_selection, SelectionAction, SelectionState};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -390,6 +391,7 @@ pub struct AppState {
     pub models_picker: Option<ModelsPicker>,
     pub provider_profiles: BTreeMap<String, ProviderProfile>,
     pub input_line: InputHistoryState,
+    pub selection: SelectionState,
     pub permission_mode: Arc<Mutex<PermissionMode>>,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
@@ -435,6 +437,7 @@ impl AppState {
             models_picker: None,
             provider_profiles: BTreeMap::new(),
             input_line: InputHistoryState::default(),
+            selection: SelectionState::default(),
             permission_mode: Arc::new(Mutex::new(PermissionMode::Normal)),
             phase: Phase::Ready,
             pending_permission: None,
@@ -465,6 +468,18 @@ impl AppState {
 
     pub fn input(&self) -> &str {
         &self.input_line.input
+    }
+
+    pub fn apply_selection_action(&mut self, action: SelectionAction) {
+        self.selection = reduce_selection(&self.selection, action);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.apply_selection_action(SelectionAction::Clear);
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.selection.is_some()
     }
 
     pub fn current_permission_mode(&self) -> PermissionMode {
@@ -966,6 +981,7 @@ impl AppState {
                 if prompt.is_empty() {
                     return;
                 }
+                self.clear_selection();
                 self.apply_input_action(InputHistoryAction::PushSubmitted(prompt.clone()));
                 if let Some(command) = parse_command(&prompt) {
                     self.execute_command(command, input_tx);
@@ -988,7 +1004,10 @@ impl AppState {
     ) {
         match command {
             Command::Help => self.transcript.push(TranscriptBlock::Help),
-            Command::Clear => self.transcript.clear(),
+            Command::Clear => {
+                self.transcript.clear();
+                self.clear_selection();
+            }
             Command::Status => self
                 .transcript
                 .push(TranscriptBlock::Status(self.status_snapshot())),
@@ -1073,6 +1092,7 @@ mod tests {
     use crate::tool::ToolOutcome;
     use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
     use crate::tui::command::Command;
+    use crate::tui::selection::{Point, SelectionAction};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1094,6 +1114,16 @@ mod tests {
         kind: KeyEventKind,
     ) -> KeyEvent {
         KeyEvent::new_with_kind(code, modifiers, kind)
+    }
+
+    fn selection_point(col: u16, row: u16) -> Point {
+        Point { col, row }
+    }
+
+    fn create_selection(state: &mut AppState) {
+        state.apply_selection_action(SelectionAction::Press(selection_point(2, 1)));
+        state.apply_selection_action(SelectionAction::Drag(selection_point(6, 1)));
+        state.apply_selection_action(SelectionAction::Release(selection_point(6, 1)));
     }
 
     fn diff_line(kind: DiffKind, text: &str) -> DiffLine {
@@ -1138,6 +1168,56 @@ mod tests {
 
     // --- ModelsPicker §2.1 (卡点 A) ---
 
+    #[test]
+    fn app_state_selection_helpers_apply_and_clear_selection() {
+        let mut state = AppState::new();
+        assert!(!state.has_selection());
+
+        create_selection(&mut state);
+
+        assert!(state.has_selection());
+        assert!(!state.selection.dragging);
+
+        state.clear_selection();
+
+        assert!(!state.has_selection());
+        assert!(!state.selection.dragging);
+    }
+
+    #[test]
+    fn enter_submission_clears_selection() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        create_selection(&mut state);
+        assert!(state.has_selection());
+        state.input_line.input = "hello".to_string();
+
+        state.on_key(key(KeyCode::Enter), &tx);
+
+        assert!(!state.has_selection());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            UserInput::Prompt("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn clear_command_clears_selection() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(TranscriptBlock::User("old".to_string()));
+        create_selection(&mut state);
+        assert!(state.has_selection());
+        state.input_line.input = "/clear".to_string();
+
+        state.on_key(key(KeyCode::Enter), &tx);
+
+        assert!(state.transcript.is_empty());
+        assert!(!state.has_selection());
+        assert!(rx.try_recv().is_err());
+    }
     #[test]
     fn build_rows_groups_providers_marks_current_and_headers_not_selectable() {
         let profiles = wps_openai_profiles();

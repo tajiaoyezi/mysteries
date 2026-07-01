@@ -9,11 +9,14 @@ use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSour
 use crate::error::AgentError;
 use crate::permission::PermissionMode;
 use crate::provider::Usage;
+use crate::tui::clipboard::{copy_selection, ArboardClipboard, Clipboard};
+use crate::tui::selection::{Point, SelectionAction};
 use crate::tool::ToolContext;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
+use ratatui::buffer::Buffer;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -25,10 +28,12 @@ use tokio::time::{Duration, MissedTickBehavior};
 
 pub mod app;
 pub mod channel;
+pub mod clipboard;
 pub mod command;
 pub mod input_history;
 pub mod jump_to_bottom;
 pub mod render;
+pub mod selection;
 pub mod terminal;
 pub mod theme;
 
@@ -110,6 +115,8 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut calling_model_started_at: Option<Instant> = None;
     let mut first_token_at: Option<Instant> = None;
+    let mut clipboard = ArboardClipboard::new();
+    let mut last_frame: Option<Buffer> = None;
 
     terminal
         .terminal_mut()
@@ -132,6 +139,14 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                                 if should_exit(&state, key) {
                                     break;
                                 }
+                                if handle_selection_key(
+                                    &mut state,
+                                    key,
+                                    last_frame.as_ref(),
+                                    &mut clipboard,
+                                ) {
+                                    continue;
+                                }
                                 let scroll_handled = if arrows_route_to_models_picker(&state, key)
                                     || arrows_route_to_completion(&state, key)
                                 {
@@ -147,9 +162,18 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                                 }
                             }
                             Event::Mouse(me) => {
-                                handle_mouse_wheel(&mut terminal, &mut state, &theme, me.kind)?;
+                                if !handle_mouse_selection_event(
+                                    &mut state,
+                                    me.kind,
+                                    me.column,
+                                    me.row,
+                                    last_frame.as_ref(),
+                                    &mut clipboard,
+                                ) {
+                                    handle_mouse_wheel(&mut terminal, &mut state, &theme, me.kind)?;
+                                }
                             }
-                            Event::Resize(_, _) => {}
+                            Event::Resize(_, _) => handle_resize(&mut state),
                             Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
                         }
                     }
@@ -175,9 +199,14 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
             }
         }
 
-        terminal
+        let completed = terminal
             .terminal_mut()
             .draw(|frame| render::render(frame, &state, &theme))?;
+        if state.has_selection() {
+            last_frame = Some(completed.buffer.clone());
+        } else {
+            last_frame = None;
+        }
     }
 
     drop(input_tx);
@@ -246,6 +275,60 @@ fn append_debug_event_line(line: &str) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionKeyAction {
+    Copy,
+    Clear,
+}
+
+fn selection_key_action(state: &app::AppState, key: KeyEvent) -> Option<SelectionKeyAction> {
+    if !is_key_press(key) || !state.has_selection() {
+        return None;
+    }
+
+    if state.pending_permission.is_some() {
+        return None;
+    }
+
+    if state.models_picker.is_some() && key.code == KeyCode::Esc {
+        return None;
+    }
+
+    if state.command_completion.is_some() && key.code == KeyCode::Esc {
+        return None;
+    }
+
+    if key.code == KeyCode::Esc {
+        return Some(SelectionKeyAction::Clear);
+    }
+
+    (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        .then_some(SelectionKeyAction::Copy)
+}
+
+fn handle_selection_key(
+    state: &mut app::AppState,
+    key: KeyEvent,
+    last_frame: Option<&Buffer>,
+    clipboard: &mut dyn Clipboard,
+) -> bool {
+    match selection_key_action(state, key) {
+        Some(SelectionKeyAction::Copy) => {
+            copy_selection(state, last_frame, clipboard);
+            true
+        }
+        Some(SelectionKeyAction::Clear) => {
+            state.clear_selection();
+            true
+        }
+        None => false,
+    }
+}
+
+fn handle_resize(state: &mut app::AppState) {
+    state.clear_selection();
+}
+
 fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
     if !is_key_press(key) {
         return false;
@@ -260,6 +343,13 @@ fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
     }
 
     if state.command_completion.is_some() && key.code == KeyCode::Esc {
+        return false;
+    }
+
+    if state.has_selection()
+        && (key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
+    {
         return false;
     }
 
@@ -315,6 +405,55 @@ fn mouse_wheel_scroll_action(kind: MouseEventKind) -> Option<MouseWheelScrollAct
     }
 }
 
+fn apply_mouse_wheel_scroll_to_state(
+    state: &mut app::AppState,
+    total_lines: usize,
+    viewport_lines: usize,
+    action: MouseWheelScrollAction,
+) {
+    match action {
+        MouseWheelScrollAction::Up { lines } => {
+            state.scroll_up(total_lines, viewport_lines, lines);
+        }
+        MouseWheelScrollAction::Down { lines } => {
+            state.scroll_down(total_lines, viewport_lines, lines);
+        }
+    }
+    state.clear_selection();
+}
+
+fn mouse_point(column: u16, row: u16) -> Point {
+    Point { col: column, row }
+}
+
+fn mouse_selection_action(kind: MouseEventKind, column: u16, row: u16) -> Option<SelectionAction> {
+    let point = mouse_point(column, row);
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => Some(SelectionAction::Press(point)),
+        MouseEventKind::Drag(MouseButton::Left) => Some(SelectionAction::Drag(point)),
+        MouseEventKind::Up(MouseButton::Left) => Some(SelectionAction::Release(point)),
+        _ => None,
+    }
+}
+
+fn handle_mouse_selection_event(
+    state: &mut app::AppState,
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+    last_frame: Option<&Buffer>,
+    clipboard: &mut dyn Clipboard,
+) -> bool {
+    let Some(action) = mouse_selection_action(kind, column, row) else {
+        return false;
+    };
+    state.apply_selection_action(action);
+    if matches!(action, SelectionAction::Release(_)) && state.has_selection() {
+        copy_selection(state, last_frame, clipboard);
+    }
+    true
+}
+
 fn apply_mouse_wheel_scroll(
     terminal: &mut terminal::TerminalGuard,
     state: &mut app::AppState,
@@ -325,14 +464,7 @@ fn apply_mouse_wheel_scroll(
     let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     let total_lines = render::transcript_line_count(state, theme, area.width as usize);
     let viewport_lines = render::transcript_viewport_height(area, state);
-    match action {
-        MouseWheelScrollAction::Up { lines } => {
-            state.scroll_up(total_lines, viewport_lines, lines);
-        }
-        MouseWheelScrollAction::Down { lines } => {
-            state.scroll_down(total_lines, viewport_lines, lines);
-        }
-    }
+    apply_mouse_wheel_scroll_to_state(state, total_lines, viewport_lines, action);
     Ok(())
 }
 
@@ -367,6 +499,16 @@ fn scroll_action_for_key(key: KeyEvent) -> Option<fn(&mut app::AppState, usize, 
     }
 }
 
+fn apply_scroll_to_state(
+    state: &mut app::AppState,
+    total_lines: usize,
+    viewport_lines: usize,
+    scroll: fn(&mut app::AppState, usize, usize),
+) {
+    scroll(state, total_lines, viewport_lines);
+    state.clear_selection();
+}
+
 fn apply_scroll(
     terminal: &mut terminal::TerminalGuard,
     state: &mut app::AppState,
@@ -377,7 +519,7 @@ fn apply_scroll(
     let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     let total_lines = render::transcript_line_count(state, theme, area.width as usize);
     let viewport_lines = render::transcript_viewport_height(area, state);
-    scroll(state, total_lines, viewport_lines);
+    apply_scroll_to_state(state, total_lines, viewport_lines, scroll);
     Ok(())
 }
 
@@ -601,7 +743,9 @@ fn error_message(err: AgentError) -> String {
 mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
     use super::{
-        arrows_route_to_completion, run_agent_task, scroll_action_for_key, should_exit,
+        arrows_route_to_completion, handle_mouse_selection_event, handle_resize, handle_selection_key,
+        run_agent_task, scroll_action_for_key, selection_key_action, should_exit,
+        SelectionKeyAction, MouseWheelScrollAction, apply_mouse_wheel_scroll_to_state,
         RunAgentTaskConfig, DEFAULT_SYSTEM_PROMPT,
     };
     use crate::agent::message::Message;
@@ -619,10 +763,15 @@ mod tests {
     };
     use crate::tool::ToolContext;
     use crate::tui::app::CommandCompletion;
+    use crate::tui::clipboard::Clipboard;
     use crate::tui::command::command_metadata;
+    use crate::tui::selection::{Point, SelectionAction};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Style;
     use async_trait::async_trait;
     use crossterm::event::{
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -655,7 +804,7 @@ mod tests {
         let Some(scroll) = scroll_action_for_key(key) else {
             return false;
         };
-        scroll(state, total_lines, viewport_lines);
+        super::apply_scroll_to_state(state, total_lines, viewport_lines, scroll);
         true
     }
 
@@ -745,6 +894,43 @@ mod tests {
         }
     }
 
+    struct RecordingClipboard {
+        calls: Vec<String>,
+    }
+
+    impl RecordingClipboard {
+        fn new() -> Self {
+            Self { calls: Vec::new() }
+        }
+    }
+
+    impl Clipboard for RecordingClipboard {
+        fn set_text(&mut self, text: String) -> Result<(), String> {
+            self.calls.push(text);
+            Ok(())
+        }
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    fn selection_point(col: u16, row: u16) -> Point {
+        Point { col, row }
+    }
+
+    fn create_selection(state: &mut super::app::AppState) {
+        state.apply_selection_action(SelectionAction::Press(selection_point(0, 0)));
+        state.apply_selection_action(SelectionAction::Drag(selection_point(4, 0)));
+        state.apply_selection_action(SelectionAction::Release(selection_point(4, 0)));
+    }
+
+    fn buffer_with_text(text: &str) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 1));
+        buffer.set_string(0, 0, text, Style::default());
+        buffer
+    }
+
     #[test]
     fn should_exit_ignores_non_press_escape_events() {
         let state = super::app::AppState::new();
@@ -832,6 +1018,59 @@ mod tests {
     }
 
     #[test]
+    fn selection_keys_respect_modal_priority_before_selection() {
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = super::app::AppState::new();
+        create_selection(&mut pending);
+        pending.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "write_file".to_string(),
+            args: json!({}),
+            responder: tx,
+        }));
+        assert_eq!(selection_key_action(&pending, ctrl_c()), None);
+        assert_eq!(selection_key_action(&pending, key(KeyCode::Esc)), None);
+        assert!(!should_exit(&pending, ctrl_c()));
+        assert!(!should_exit(&pending, key(KeyCode::Esc)));
+
+        let mut completion = state_with_command_completion();
+        create_selection(&mut completion);
+        assert_eq!(selection_key_action(&completion, key(KeyCode::Esc)), None);
+        assert!(!should_exit(&completion, key(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn selection_keys_intercept_copy_and_clear_before_exit() {
+        let mut selected = super::app::AppState::new();
+        create_selection(&mut selected);
+
+        assert_eq!(selection_key_action(&selected, ctrl_c()), Some(SelectionKeyAction::Copy));
+        assert_eq!(selection_key_action(&selected, key(KeyCode::Esc)), Some(SelectionKeyAction::Clear));
+        assert!(!should_exit(&selected, ctrl_c()));
+        assert!(!should_exit(&selected, key(KeyCode::Esc)));
+
+        let ready = super::app::AppState::new();
+        assert_eq!(selection_key_action(&ready, ctrl_c()), None);
+        assert!(should_exit(&ready, ctrl_c()));
+        assert!(should_exit(&ready, key(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn handle_selection_key_copies_or_clears_selection() {
+        let buffer = buffer_with_text("hello   ");
+        let mut copied = super::app::AppState::new();
+        create_selection(&mut copied);
+        let mut clipboard = RecordingClipboard::new();
+
+        assert!(handle_selection_key(&mut copied, ctrl_c(), Some(&buffer), &mut clipboard));
+        assert_eq!(clipboard.calls, vec!["hello".to_string()]);
+        assert!(copied.has_selection());
+
+        let mut cleared = super::app::AppState::new();
+        create_selection(&mut cleared);
+        assert!(handle_selection_key(&mut cleared, key(KeyCode::Esc), Some(&buffer), &mut clipboard));
+        assert!(!cleared.has_selection());
+    }
+    #[test]
     fn mouse_wheel_scroll_action_maps_scroll_kinds_and_ignores_others() {
         use super::{mouse_wheel_scroll_action, MouseWheelScrollAction, MOUSE_WHEEL_SCROLL_LINES};
         use crossterm::event::MouseButton;
@@ -855,6 +1094,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mouse_selection_events_copy_on_release_and_wheel_scroll_clears_selection() {
+        let buffer = buffer_with_text("hello   ");
+        let mut state = super::app::AppState::new();
+        let mut clipboard = RecordingClipboard::new();
+
+        assert!(handle_mouse_selection_event(
+            &mut state,
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            0,
+            Some(&buffer),
+            &mut clipboard,
+        ));
+        assert!(state.selection.dragging);
+        assert!(handle_mouse_selection_event(
+            &mut state,
+            MouseEventKind::Drag(MouseButton::Left),
+            4,
+            0,
+            Some(&buffer),
+            &mut clipboard,
+        ));
+        assert!(handle_mouse_selection_event(
+            &mut state,
+            MouseEventKind::Up(MouseButton::Left),
+            4,
+            0,
+            Some(&buffer),
+            &mut clipboard,
+        ));
+        assert_eq!(clipboard.calls, vec!["hello".to_string()]);
+        assert!(state.has_selection());
+
+        let mut scrolled = super::app::AppState::new();
+        create_selection(&mut scrolled);
+        apply_mouse_wheel_scroll_to_state(
+            &mut scrolled,
+            40,
+            5,
+            MouseWheelScrollAction::Down { lines: 3 },
+        );
+        assert!(!scrolled.has_selection());
+    }
     #[test]
     fn scroll_key_routing_maps_page_and_boundary_keys_only_for_press() {
         let mut state = super::app::AppState::new();
@@ -903,6 +1186,18 @@ mod tests {
         assert_eq!(state.visible_scroll_offset(40, 5), before);
     }
 
+    #[test]
+    fn keyboard_scroll_and_resize_clear_selection() {
+        let mut scrolled = super::app::AppState::new();
+        create_selection(&mut scrolled);
+        assert!(apply_scroll_key_for_test(&mut scrolled, key(KeyCode::PageUp), 40, 5));
+        assert!(!scrolled.has_selection());
+
+        let mut resized = super::app::AppState::new();
+        create_selection(&mut resized);
+        handle_resize(&mut resized);
+        assert!(!resized.has_selection());
+    }
     #[test]
     fn end_and_ctrl_end_map_to_scroll_to_bottom_and_clear_new_message_count() {
         for scroll_key in [

@@ -22,7 +22,7 @@ expression: text
 
 ‹text.muted›◇ 就绪‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
-‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹text.title›                                           ‹/›‹border.subtle›│‹/›
+‹border.subtle›│‹/›‹accent.primary›mysteries ▸ ‹/›‹text.title›                                           ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
 ‹text.muted›▸ normal · shift+tab 切换‹/›

@@ -21,6 +21,7 @@ pub struct Theme {
     pub error_bg: Color,
     pub error_border: Color,
     pub info_fg: Color,
+    pub selection_bg: Color,
 }
 
 impl Theme {
@@ -45,6 +46,7 @@ impl Theme {
             error_bg: rgb(0x241a1a),
             error_border: rgb(0x5c2b2e),
             info_fg: rgb(0x6fd3e0),
+            selection_bg: rgb(0x3f3455),
         }
     }
 
@@ -69,6 +71,7 @@ impl Theme {
             error_bg: rgb(0xfdf1f0),
             error_border: rgb(0xf0d4d2),
             info_fg: rgb(0x1f7a8c),
+            selection_bg: rgb(0xe0d8e4),
         }
     }
 
@@ -78,7 +81,7 @@ impl Theme {
             .find_map(|(name, token_color)| (token_color == color).then_some(name))
     }
 
-    fn tokens(&self) -> [(&'static str, Color); 19] {
+    fn tokens(&self) -> [(&'static str, Color); 20] {
         [
             ("bg.base", self.bg_base),
             ("bg.sunken", self.bg_sunken),
@@ -99,6 +102,7 @@ impl Theme {
             ("error.bg", self.error_bg),
             ("error.border", self.error_border),
             ("info.fg", self.info_fg),
+            ("selection.bg", self.selection_bg),
         ]
     }
 }
@@ -145,6 +149,7 @@ mod tests {
             theme.error_bg,
             theme.error_border,
             theme.info_fg,
+            theme.selection_bg,
         ];
 
         for (actual, expected) in actual.into_iter().zip(expected.iter()) {
@@ -178,6 +183,7 @@ mod tests {
                 rgb(0x241a1a),
                 rgb(0x5c2b2e),
                 rgb(0x6fd3e0),
+                rgb(0x3f3455),
             ],
         );
     }
@@ -208,7 +214,20 @@ mod tests {
                 rgb(0xfdf1f0),
                 rgb(0xf0d4d2),
                 rgb(0x1f7a8c),
+                rgb(0xe0d8e4),
             ],
+        );
+    }
+
+    #[test]
+    fn selection_bg_token_is_exposed_for_both_palettes() {
+        assert_eq!(
+            Theme::midnight().token_name(rgb(0x3f3455)),
+            Some("selection.bg")
+        );
+        assert_eq!(
+            Theme::daylight().token_name(rgb(0xe0d8e4)),
+            Some("selection.bg")
         );
     }
 }

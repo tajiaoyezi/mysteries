@@ -4,7 +4,9 @@ use crate::tui::app::{
     ToolCard, ToolCardStatus, TranscriptBlock,
 };
 use crate::tui::jump_to_bottom::jump_to_bottom_pill_text;
+use crate::tui::selection::{col_range_for_row, Selection};
 use crate::tui::theme::Theme;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -34,6 +36,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     render_status(frame, rows[6], state, theme);
     render_models_picker(frame, rows[6], state, theme);
     render_mode_line(frame, rows[7], state, theme);
+    highlight_selection(frame, state, theme);
 }
 
 pub(crate) fn transcript_line_count(state: &AppState, theme: &Theme, width: usize) -> usize {
@@ -1078,26 +1081,33 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
     const INPUT_PROMPT: &str = "mysteries ▸ ";
 
     let input_text = state.input();
-    let content = if input_text.is_empty() {
+    let prompt_span = Span::styled(
+        INPUT_PROMPT,
+        Style::default().fg(theme.accent_primary).bg(theme.bg_base),
+    );
+    let content = if !input_text.is_empty() {
         Line::from(vec![
-            Span::styled(
-                INPUT_PROMPT,
-                Style::default().fg(theme.accent_primary).bg(theme.bg_base),
-            ),
-            Span::styled(
-                "输入任务,或 / 执行命令…",
-                Style::default().fg(theme.text_muted).bg(theme.bg_base),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(
-                INPUT_PROMPT,
-                Style::default().fg(theme.accent_primary).bg(theme.bg_base),
-            ),
+            prompt_span,
             Span::styled(
                 input_text.to_string(),
                 Style::default().fg(theme.text_primary).bg(theme.bg_base),
+            ),
+        ])
+    } else if state.models_picker.is_some() {
+        // 浮层活跃时不显示输入提示(浮层是焦点),也避免右对齐提示从浮层旁露出。
+        Line::from(vec![prompt_span])
+    } else {
+        // 空态:提示右对齐,避开终端 IME 组合浮层(画在左侧光标处)。app 收不到
+        // IME composition 事件,无法按组合状态隐藏提示,故靠版式让开碰撞区。
+        let hint = "输入任务,或 / 执行命令…";
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let pad = inner_width.saturating_sub(display_width(INPUT_PROMPT) + display_width(hint));
+        Line::from(vec![
+            prompt_span,
+            Span::styled(" ".repeat(pad), Style::default().bg(theme.bg_base)),
+            Span::styled(
+                hint,
+                Style::default().fg(theme.text_muted).bg(theme.bg_base),
             ),
         ])
     };
@@ -1302,6 +1312,78 @@ fn render_models_picker(
     frame.render_widget(paragraph, area);
 }
 
+fn highlight_selection(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
+    let Some(selection) = state.selection.selection else {
+        return;
+    };
+
+    let buffer = frame.buffer_mut();
+    let area = *buffer.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let normalized = selection.normalized();
+    let area_bottom = area.y.saturating_add(area.height.saturating_sub(1));
+    let row_start = normalized.start.row.max(area.y);
+    let row_end = normalized.end.row.min(area_bottom);
+    if row_start > row_end {
+        return;
+    }
+
+    let area_right = area.x.saturating_add(area.width);
+    for row in row_start..=row_end {
+        let Some(range) = col_range_for_row(&selection, row, area_right) else {
+            continue;
+        };
+        let start = range.start.max(area.x);
+        let end = range.end.min(area_right);
+        for col in start..end {
+            if let Some(cell) = buffer.cell_mut(Position::new(col, row)) {
+                cell.set_bg(theme.selection_bg);
+            }
+        }
+    }
+}
+
+pub(crate) fn selection_text(buffer: &Buffer, selection: &Selection) -> String {
+    let area = *buffer.area();
+    if area.width == 0 || area.height == 0 {
+        return String::new();
+    }
+
+    let normalized = selection.normalized();
+    let area_bottom = area.y.saturating_add(area.height.saturating_sub(1));
+    let row_start = normalized.start.row.max(area.y);
+    let row_end = normalized.end.row.min(area_bottom);
+    if row_start > row_end {
+        return String::new();
+    }
+
+    let area_right = area.x.saturating_add(area.width);
+    let mut lines = Vec::new();
+    for row in row_start..=row_end {
+        let Some(range) = col_range_for_row(selection, row, area_right) else {
+            continue;
+        };
+        let mut line = String::new();
+        let mut col = range.start.max(area.x);
+        let end = range.end.min(area_right);
+        while col < end {
+            let Some(cell) = buffer.cell(Position::new(col, row)) else {
+                col = col.saturating_add(1);
+                continue;
+            };
+            let symbol = cell.symbol();
+            line.push_str(symbol);
+            col = col.saturating_add(display_width(symbol).max(1) as u16);
+        }
+        lines.push(line.trim_end().to_string());
+    }
+
+    lines.join("\n")
+}
+
 fn input_cursor_position(area: Rect, input: &str) -> Position {
     const INPUT_PROMPT: &str = "mysteries ▸ ";
 
@@ -1318,7 +1400,7 @@ fn input_cursor_position(area: Rect, input: &str) -> Position {
 
 #[cfg(test)]
 mod tests {
-    use super::{render, transcript_line_count};
+    use super::{render, selection_text, transcript_line_count};
     use crate::permission::PermissionMode;
     use crate::provider::Usage;
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
@@ -1326,12 +1408,13 @@ mod tests {
         AppState, ModelsPicker, Phase, SessionSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
     };
     use crate::tui::channel::{AgentEvent, PermissionRequest};
+    use crate::tui::selection::{Point, Selection, SelectionState};
     use crate::tui::theme::Theme;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::layout::Position;
-    use ratatui::style::{Color, Modifier};
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::Terminal;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1348,6 +1431,12 @@ mod tests {
         reversed: bool,
     }
 
+    fn render_to_buffer(state: &AppState, theme: &Theme) -> Buffer {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let completed = terminal.draw(|frame| render(frame, state, theme)).unwrap();
+        completed.buffer.clone()
+    }
     fn render_to_styled(state: &AppState, theme: &Theme) -> String {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1532,6 +1621,106 @@ mod tests {
         state
     }
 
+    fn find_symbol(buffer: &Buffer, symbol: &str) -> Position {
+        let area = *buffer.area();
+        for row in area.y..area.y.saturating_add(area.height) {
+            for col in area.x..area.x.saturating_add(area.width) {
+                if buffer
+                    .cell(Position::new(col, row))
+                    .is_some_and(|cell| cell.symbol() == symbol)
+                {
+                    return Position::new(col, row);
+                }
+            }
+        }
+        panic!("symbol {symbol:?} not found in buffer");
+    }
+
+    fn selection(anchor_col: u16, anchor_row: u16, head_col: u16, head_row: u16) -> Selection {
+        Selection {
+            anchor: Point {
+                col: anchor_col,
+                row: anchor_row,
+            },
+            head: Point {
+                col: head_col,
+                row: head_row,
+            },
+        }
+    }
+
+    #[test]
+    fn selection_highlight_snapshot() {
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.transcript.push(TranscriptBlock::Assistant(
+            "alpha\n你好 beta".to_string(),
+        ));
+
+        let before = render_to_buffer(&state, &theme);
+        let start = find_symbol(&before, "你");
+        state.selection = SelectionState {
+            selection: Some(selection(start.x, start.y, start.x.saturating_add(3), start.y)),
+            dragging: false,
+        };
+
+        let after = render_to_buffer(&state, &theme);
+        let leading = after.cell(start).expect("selected leading CJK cell");
+        let continuation = after
+            .cell(Position::new(start.x.saturating_add(1), start.y))
+            .expect("selected CJK continuation cell");
+        let original = before.cell(start).expect("original selected cell");
+
+        assert_eq!(leading.bg, theme.selection_bg);
+        assert_eq!(continuation.bg, theme.selection_bg);
+        assert_eq!(leading.fg, original.fg);
+        assert!(state.has_selection(), "released selection should remain highlighted");
+
+        let text = buffer_to_styled(&after, &theme);
+        println!("\n--- selection highlight frame ---\n{text}\n--- end selection highlight frame ---");
+        insta::assert_snapshot!("tui_selection_highlight", text);
+    }
+
+    #[test]
+    fn selection_text_skips_cjk_continuation_cells() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        buffer.set_string(0, 0, "你好  ", Style::default());
+
+        let text = selection_text(&buffer, &selection(0, 0, 3, 0));
+
+        assert_eq!(text, "你好");
+    }
+
+    #[test]
+    fn selection_text_trims_lines_and_joins_cross_line() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+        buffer.set_string(0, 0, "abc   ", Style::default());
+        buffer.set_string(0, 1, "de    ", Style::default());
+
+        let text = selection_text(&buffer, &selection(1, 0, 1, 1));
+
+        assert_eq!(text, "bc\nde");
+    }
+
+    #[test]
+    fn selection_text_single_line_uses_inclusive_end_col() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        buffer.set_string(0, 0, "abcdef", Style::default());
+
+        let text = selection_text(&buffer, &selection(1, 0, 3, 0));
+
+        assert_eq!(text, "bcd");
+    }
+
+    #[test]
+    fn selection_text_out_of_bounds_selection_does_not_panic() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer.set_string(0, 0, "hi", Style::default());
+
+        let text = selection_text(&buffer, &selection(5, 5, 9, 5));
+
+        assert_eq!(text, "");
+    }
     #[test]
     fn display_width_treats_common_emoji_as_wide() {
         assert_eq!(super::display_width("a"), 1);

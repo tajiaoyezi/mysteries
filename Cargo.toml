@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+arboard = "3"
 async-trait = "0.1"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
