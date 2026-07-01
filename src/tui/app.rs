@@ -672,6 +672,11 @@ impl AppState {
         });
     }
 
+    fn insert_newline_and_refresh(&mut self) {
+        self.apply_input_action(InputBufferAction::InsertNewline);
+        self.refresh_command_completion();
+    }
+
     fn close_command_completion(&mut self) {
         self.command_completion = None;
     }
@@ -972,8 +977,7 @@ impl AppState {
             _ => false,
         };
         if newline_key {
-            self.apply_input_action(InputBufferAction::InsertNewline);
-            self.refresh_command_completion();
+            self.insert_newline_and_refresh();
             return;
         }
 
@@ -1077,6 +1081,84 @@ impl AppState {
             self.phase = Phase::Busy;
         }
     }
+}
+
+pub(crate) enum ApplyBatchKeyResult {
+    Continue,
+    BreakBatch,
+}
+
+pub(crate) fn flush_merged_input_chars(state: &mut AppState, pending_str: &mut String) {
+    if !pending_str.is_empty() {
+        state.apply_input_action(InputBufferAction::InsertStr(std::mem::take(pending_str)));
+        state.refresh_command_completion();
+    }
+}
+
+fn is_bare_enter_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Enter
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+fn is_insertable_char_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(_) => {
+            let pure_control = key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT);
+            !pure_control
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn apply_batch_input_key(
+    state: &mut AppState,
+    key: KeyEvent,
+    intent: crate::tui::input_batch::KeyIntent,
+    modal_closed_in_batch: &mut bool,
+    pending_str: &mut String,
+    input_tx: &mpsc::UnboundedSender<UserInput>,
+    interrupt_tx: &mpsc::UnboundedSender<UserInput>,
+) -> ApplyBatchKeyResult {
+    use crate::tui::input_batch::KeyIntent;
+
+    if state.pending_permission.is_some() {
+        flush_merged_input_chars(state, pending_str);
+        state.on_key_with_interrupt(key, input_tx, interrupt_tx);
+        return ApplyBatchKeyResult::BreakBatch;
+    }
+
+    if state.models_picker.is_some() {
+        flush_merged_input_chars(state, pending_str);
+        state.on_key_with_interrupt(key, input_tx, interrupt_tx);
+        if state.models_picker.is_none() {
+            *modal_closed_in_batch = true;
+        }
+        return ApplyBatchKeyResult::Continue;
+    }
+
+    if *modal_closed_in_batch && is_bare_enter_key(key) {
+        flush_merged_input_chars(state, pending_str);
+        return ApplyBatchKeyResult::Continue;
+    }
+
+    if intent == KeyIntent::Newline {
+        flush_merged_input_chars(state, pending_str);
+        state.insert_newline_and_refresh();
+        return ApplyBatchKeyResult::Continue;
+    }
+
+    if is_insertable_char_key(key) && intent == KeyIntent::Passthrough {
+        if let KeyCode::Char(ch) = key.code {
+            pending_str.push(ch);
+        }
+        return ApplyBatchKeyResult::Continue;
+    }
+
+    flush_merged_input_chars(state, pending_str);
+    state.on_key_with_interrupt(key, input_tx, interrupt_tx);
+    ApplyBatchKeyResult::Continue
 }
 
 fn command_completion_candidates(input: &str) -> Option<Vec<CommandMetadata>> {
@@ -2737,6 +2819,194 @@ mod tests {
 
         state.on_key(key(KeyCode::Backspace), &tx);
         assert_eq!(state.input_line.history_cursor, None);
+        assert_eq!(state.input(), "");
+    }
+
+    fn apply_press_key_batch(
+        state: &mut AppState,
+        keys: &[KeyEvent],
+        input_tx: &mpsc::UnboundedSender<UserInput>,
+        interrupt_tx: &mpsc::UnboundedSender<UserInput>,
+    ) {
+        use crate::tui::app::{apply_batch_input_key, flush_merged_input_chars, ApplyBatchKeyResult};
+        use crate::tui::input_batch::classify_key_batch;
+
+        let intents = classify_key_batch(keys);
+        let mut pending_str = String::new();
+        let mut modal_closed_in_batch = false;
+        for (key, intent) in keys.iter().zip(intents.iter()) {
+            match apply_batch_input_key(
+                state,
+                *key,
+                *intent,
+                &mut modal_closed_in_batch,
+                &mut pending_str,
+                input_tx,
+                interrupt_tx,
+            ) {
+                ApplyBatchKeyResult::Continue => {}
+                ApplyBatchKeyResult::BreakBatch => break,
+            }
+        }
+        flush_merged_input_chars(state, &mut pending_str);
+    }
+
+    #[test]
+    fn batch_char_burst_with_internal_newline_inserts_without_submit() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        apply_press_key_batch(
+            &mut state,
+            &[
+                key(KeyCode::Char('a')),
+                key(KeyCode::Char('b')),
+                key(KeyCode::Enter),
+                key(KeyCode::Char('x')),
+                key(KeyCode::Char('y')),
+            ],
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        assert_eq!(state.input(), "ab\nxy");
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn batch_newline_apply_closes_command_completion() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.set_input_text("/mod");
+        state.refresh_command_completion();
+        assert!(state.command_completion.is_some());
+
+        // 批内纯 [Enter, Enter](n=2 → 两个 Newline):首 Enter 走 insert_newline_and_refresh,
+        // pending_str 为空故 flush 不触发 refresh —— 关闭 completion 的必须是 Newline 分支自身的
+        // refresh(而非 flush 顺带),这样退化掉 insert_newline_and_refresh 的 refresh 时本测试会红。
+        apply_press_key_batch(
+            &mut state,
+            &[key(KeyCode::Enter), key(KeyCode::Enter)],
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        assert!(state.command_completion.is_none());
+    }
+
+    #[test]
+    fn batch_pending_permission_answers_once_and_drops_rest() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let (permission_tx, mut permission_rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "write_file".to_string(),
+            args: json!({}),
+            responder: permission_tx,
+        }));
+
+        apply_press_key_batch(
+            &mut state,
+            &[
+                key(KeyCode::Enter),
+                key(KeyCode::Char('x')),
+                key(KeyCode::Char('y')),
+            ],
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        assert_eq!(permission_rx.try_recv().unwrap(), PermissionDecision::Allow);
+        assert!(state.pending_permission.is_none());
+        assert_eq!(state.input(), "");
+        assert!(!state.input().contains('\n'));
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn batch_models_picker_keeps_all_filter_chars() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.provider_profiles = wps_openai_profiles();
+        state.execute_command(Command::Models, &input_tx);
+        assert!(state.models_picker.is_some());
+
+        apply_press_key_batch(
+            &mut state,
+            &[
+                key(KeyCode::Char('g')),
+                key(KeyCode::Char('p')),
+                key(KeyCode::Char('t')),
+            ],
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        assert_eq!(
+            state
+                .models_picker
+                .as_ref()
+                .expect("picker stays open")
+                .filter_text(),
+            "gpt"
+        );
+    }
+
+    #[test]
+    fn batch_trailing_enter_after_picker_close_is_discarded() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.provider_profiles = wps_openai_profiles();
+        state.session.provider = "wps".to_string();
+        state.session.model = "zhipu/glm-5.2".to_string();
+        state.execute_command(Command::Models, &input_tx);
+        assert!(state.models_picker.is_some());
+
+        apply_press_key_batch(
+            &mut state,
+            &[key(KeyCode::Enter), key(KeyCode::Enter)],
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        assert!(state.models_picker.is_none());
+        // 尾随裸 Enter 必须被 modal_closed_in_batch 守卫丢弃:既不落缓冲、也不提交。
+        // 断言 input 为空可杀死"删掉守卫"的实现(否则第 2 个 Enter 因 n==2 判 Newline 会插入 "\n")。
+        assert_eq!(
+            state.input(),
+            "",
+            "trailing bare Enter after picker close must be discarded, not inserted as newline"
+        );
+        match input_rx.try_recv() {
+            Ok(UserInput::SetProvider { .. }) => {}
+            other => panic!("expected SetProvider from picker Enter, got {other:?}"),
+        }
+        assert!(
+            input_rx.try_recv().is_err(),
+            "trailing bare Enter after picker close must not submit"
+        );
+    }
+
+    #[test]
+    fn batch_lone_enter_submits_prompt_via_batch_path() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.set_input_text("hi");
+
+        // 孤立 [Enter](n=1 → Submit):经 apply_batch_input_key 末路 flush + on_key 提交,
+        // 锁住"burst 判定不误伤正常提交"这条 change 底线。
+        apply_press_key_batch(&mut state, &[key(KeyCode::Enter)], &input_tx, &interrupt_tx);
+
+        match input_rx.try_recv() {
+            Ok(UserInput::Prompt(text)) => assert_eq!(text, "hi"),
+            other => panic!("lone Enter should submit a prompt, got {other:?}"),
+        }
         assert_eq!(state.input(), "");
     }
 }

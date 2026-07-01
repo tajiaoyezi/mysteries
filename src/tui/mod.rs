@@ -22,6 +22,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{Duration, MissedTickBehavior};
@@ -30,6 +31,7 @@ pub mod app;
 pub mod channel;
 pub mod clipboard;
 pub mod command;
+pub mod input_batch;
 pub mod input_buffer;
 pub(crate) mod input_layout;
 pub mod jump_to_bottom;
@@ -40,6 +42,7 @@ pub mod theme;
 pub(crate) mod width;
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const EVENT_BATCH_CAP: usize = 1 << 20;
 
 pub struct RunAgentTaskConfig {
     pub profiles: BTreeMap<String, ProviderProfile>,
@@ -128,55 +131,22 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
         tokio::select! {
             event = events.next() => {
                 match event {
-                    Some(Ok(event)) => {
-                        if debug_events {
-                            append_debug_event_line(&debug_event_line(&event));
-                        }
-
-                        match event {
-                            Event::Key(key) => {
-                                if !is_key_press(key) {
-                                    continue;
-                                }
-                                if should_exit(&state, key) {
-                                    break;
-                                }
-                                if handle_selection_key(
-                                    &mut state,
-                                    key,
-                                    last_frame.as_ref(),
-                                    &mut clipboard,
-                                ) {
-                                    continue;
-                                }
-                                let scroll_handled = if arrows_route_to_models_picker(&state, key)
-                                    || arrows_route_to_completion(&state, key)
-                                {
-                                    false
-                                } else {
-                                    handle_scroll_key(&mut terminal, &mut state, key, &theme)?
-                                };
-                                if !scroll_handled {
-                                    state.on_key_with_interrupt(key, &input_tx, &interrupt_tx);
-                                    if state.should_exit {
-                                        break;
-                                    }
-                                }
-                            }
-                            Event::Mouse(me) => {
-                                if !handle_mouse_selection_event(
-                                    &mut state,
-                                    me.kind,
-                                    me.column,
-                                    me.row,
-                                    last_frame.as_ref(),
-                                    &mut clipboard,
-                                ) {
-                                    handle_mouse_wheel(&mut terminal, &mut state, &theme, me.kind)?;
-                                }
-                            }
-                            Event::Resize(_, _) => handle_resize(&mut state),
-                            Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+                    Some(Ok(ev0)) => {
+                        let batch = drain_event_batch(ev0)?;
+                        if process_event_batch(
+                            batch,
+                            EventBatchContext {
+                                state: &mut state,
+                                terminal: &mut terminal,
+                                last_frame: &last_frame,
+                                clipboard: &mut clipboard,
+                                theme: &theme,
+                                input_tx: &input_tx,
+                                interrupt_tx: &interrupt_tx,
+                                debug_events,
+                            },
+                        )? {
+                            break;
                         }
                     }
                     Some(Err(err)) => return Err(CliError::Io(err.to_string())),
@@ -607,6 +577,128 @@ fn debug_key_code(code: KeyCode) -> String {
 
 fn is_key_press(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
+}
+
+fn drain_event_batch(ev0: Event) -> Result<Vec<Event>, CliError> {
+    let mut batch = vec![ev0];
+    while crossterm::event::poll(StdDuration::ZERO).map_err(|e| CliError::Io(e.to_string()))? {
+        batch.push(crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?);
+        if batch.len() >= EVENT_BATCH_CAP {
+            break;
+        }
+    }
+    Ok(batch)
+}
+
+struct EventBatchContext<'a> {
+    state: &'a mut app::AppState,
+    terminal: &'a mut terminal::TerminalGuard,
+    last_frame: &'a Option<Buffer>,
+    clipboard: &'a mut ArboardClipboard,
+    theme: &'a theme::Theme,
+    input_tx: &'a mpsc::UnboundedSender<channel::UserInput>,
+    interrupt_tx: &'a mpsc::UnboundedSender<channel::UserInput>,
+    debug_events: bool,
+}
+
+fn process_event_batch(
+    batch: Vec<Event>,
+    ctx: EventBatchContext<'_>,
+) -> Result<bool, CliError> {
+    let EventBatchContext {
+        state,
+        terminal,
+        last_frame,
+        clipboard,
+        theme,
+        input_tx,
+        interrupt_tx,
+        debug_events,
+    } = ctx;
+    for event in &batch {
+        if debug_events {
+            append_debug_event_line(&debug_event_line(event));
+        }
+    }
+
+    let press_keys = input_batch::press_key_events(&batch);
+    let intents = input_batch::classify_key_batch(&press_keys);
+    let mut press_index = 0usize;
+    let mut pending_str = String::new();
+    let mut modal_closed_in_batch = false;
+    let mut break_loop = false;
+
+    for event in batch {
+        match event {
+            Event::Key(key) if !is_key_press(key) => continue,
+            Event::Key(key) => {
+                let intent = intents[press_index];
+                press_index += 1;
+
+                if should_exit(state, key) {
+                    app::flush_merged_input_chars(state, &mut pending_str);
+                    break_loop = true;
+                    break;
+                }
+                if handle_selection_key(state, key, last_frame.as_ref(), clipboard) {
+                    app::flush_merged_input_chars(state, &mut pending_str);
+                    continue;
+                }
+                let scroll_handled = if arrows_route_to_models_picker(state, key)
+                    || arrows_route_to_completion(state, key)
+                {
+                    false
+                } else {
+                    handle_scroll_key(terminal, state, key, theme)?
+                };
+                if scroll_handled {
+                    app::flush_merged_input_chars(state, &mut pending_str);
+                    continue;
+                }
+
+                match app::apply_batch_input_key(
+                    state,
+                    key,
+                    intent,
+                    &mut modal_closed_in_batch,
+                    &mut pending_str,
+                    input_tx,
+                    interrupt_tx,
+                ) {
+                    app::ApplyBatchKeyResult::Continue => {}
+                    app::ApplyBatchKeyResult::BreakBatch => break,
+                }
+                if state.should_exit {
+                    break_loop = true;
+                    break;
+                }
+            }
+            Event::Mouse(me) => {
+                app::flush_merged_input_chars(state, &mut pending_str);
+                if !handle_mouse_selection_event(
+                    state,
+                    me.kind,
+                    me.column,
+                    me.row,
+                    last_frame.as_ref(),
+                    clipboard,
+                ) {
+                    handle_mouse_wheel(terminal, state, theme, me.kind)?;
+                }
+            }
+            Event::Resize(_, _) => {
+                app::flush_merged_input_chars(state, &mut pending_str);
+                handle_resize(state);
+            }
+            Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
+                app::flush_merged_input_chars(state, &mut pending_str);
+            }
+        }
+    }
+
+    app::flush_merged_input_chars(state, &mut pending_str);
+
+    Ok(break_loop)
 }
 
 pub async fn run_agent_task(

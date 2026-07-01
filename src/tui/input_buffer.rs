@@ -14,6 +14,7 @@ pub enum InputBufferAction {
     PushSubmitted(String),
     SetText(String),
     InsertChar(char),
+    InsertStr(String),
     InsertNewline,
     Backspace,
     Delete,
@@ -62,6 +63,11 @@ pub fn reduce_input_buffer(
             next.exit_history();
             next.text.insert(next.cursor, ch);
             next.cursor += ch.len_utf8();
+        }
+        InputBufferAction::InsertStr(s) => {
+            next.exit_history();
+            next.text.insert_str(next.cursor, &s);
+            next.cursor += s.len();
         }
         InputBufferAction::InsertNewline => {
             next.exit_history();
@@ -433,6 +439,68 @@ mod tests {
             "x你好\nab".len(),
             "target display col 3 lands inside 你, so cursor chooses the boundary before 你"
         );
+    }
+
+    #[test]
+    fn insert_str_empty_keeps_text_and_cursor_and_resets_history_cursor() {
+        let state = InputBufferState {
+            text: "old".to_string(),
+            cursor: "old".len(),
+            input_history: vec!["old".to_string()],
+            history_cursor: Some(0),
+            ..InputBufferState::default()
+        };
+
+        let next = reduce(&state, InputBufferAction::InsertStr(String::new()));
+        assert_eq!(next.text(), "old");
+        assert_eq!(next.cursor, "old".len());
+        assert_eq!(next.history_cursor, None);
+    }
+
+    #[test]
+    fn insert_str_with_cjk_moves_cursor_to_end_of_inserted_text() {
+        let state = reduce(
+            &InputBufferState::default(),
+            InputBufferAction::InsertStr("你好a".to_string()),
+        );
+        assert_eq!(state.text(), "你好a");
+        assert_eq!(state.cursor, "你好a".len());
+    }
+
+    #[test]
+    fn insert_str_at_middle_of_text_inserts_at_cursor() {
+        let state = reduce(
+            &buffer_state("a你b", "a".len()),
+            InputBufferAction::InsertStr("好x".to_string()),
+        );
+        assert_eq!(state.text(), "a好x你b");
+        assert_eq!(state.cursor, "a好x".len());
+    }
+
+    #[test]
+    fn insert_str_equals_folding_insert_char() {
+        let s = "粘贴 line\nab你好";
+        let initial = buffer_state("头尾", "头".len());
+
+        let via_str = reduce(&initial, InputBufferAction::InsertStr(s.to_string()));
+        let via_chars = s.chars().fold(initial, |state, ch| {
+            reduce(&state, InputBufferAction::InsertChar(ch))
+        });
+
+        assert_eq!(via_str.text(), via_chars.text());
+        assert_eq!(via_str.cursor, via_chars.cursor);
+    }
+
+    #[test]
+    fn insert_str_exits_history_like_insert_char() {
+        let state = with_history(&["h1"], "", 0);
+        let recalled = reduce(&state, InputBufferAction::Up);
+        assert_eq!(recalled.history_cursor, Some(0));
+
+        let edited = reduce(&recalled, InputBufferAction::InsertStr("xy".to_string()));
+        assert_eq!(edited.text(), "h1xy");
+        assert_eq!(edited.cursor, "h1xy".len());
+        assert_eq!(edited.history_cursor, None);
     }
 
     #[test]
