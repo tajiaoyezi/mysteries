@@ -43,6 +43,7 @@ pub(crate) mod width;
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const EVENT_BATCH_CAP: usize = 1 << 20;
+const PASTE_CONTINUATION_GRACE: StdDuration = StdDuration::from_millis(10);
 
 pub struct RunAgentTaskConfig {
     pub profiles: BTreeMap<String, ProviderProfile>,
@@ -581,10 +582,29 @@ fn is_key_press(key: KeyEvent) -> bool {
 
 fn drain_event_batch(ev0: Event) -> Result<Vec<Event>, CliError> {
     let mut batch = vec![ev0];
-    while crossterm::event::poll(StdDuration::ZERO).map_err(|e| CliError::Io(e.to_string()))? {
-        batch.push(crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?);
-        if batch.len() >= EVENT_BATCH_CAP {
+    loop {
+        while crossterm::event::poll(StdDuration::ZERO).map_err(|e| CliError::Io(e.to_string()))? {
+            batch.push(crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?);
+            if batch.len() >= EVENT_BATCH_CAP {
+                return Ok(batch);
+            }
+        }
+
+        if !input_batch::would_submit_lone_enter(&batch) || batch.len() >= EVENT_BATCH_CAP {
             break;
+        }
+
+        if crossterm::event::poll(PASTE_CONTINUATION_GRACE)
+            .map_err(|e| CliError::Io(e.to_string()))?
+        {
+            let ev = crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?;
+            let is_key = matches!(ev, Event::Key(_));
+            batch.push(ev);
+            if !is_key {
+                break; // 续读只等键盘续批;鼠标 Moved/Focus/Resize 即收批,防高频 Moved 令续读不退出
+            }
+        } else {
+            break; // 静默:真提交
         }
     }
     Ok(batch)

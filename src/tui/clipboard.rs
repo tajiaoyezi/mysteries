@@ -49,11 +49,14 @@ pub fn copy_selection(
     if text.trim().is_empty() {
         return;
     }
-
-    if let Err(err) = clipboard.set_text(text) {
-        state
+    let char_count = text.chars().count();
+    match clipboard.set_text(text) {
+        Ok(()) => state
             .transcript
-            .push(TranscriptBlock::Notice(format!("复制失败: {err}")));
+            .push(TranscriptBlock::Notice(format!("已复制 {char_count} 字"))),
+        Err(err) => state
+            .transcript
+            .push(TranscriptBlock::Notice(format!("复制失败: {err}"))),
     }
 }
 
@@ -114,6 +117,36 @@ mod tests {
 
         assert_eq!(clipboard.calls, vec!["hello".to_string()]);
         assert!(state.has_selection());
+        assert!(
+            state.transcript.iter().any(|block| {
+                matches!(
+                    block,
+                    TranscriptBlock::Notice(text) if text == "已复制 5 字"
+                )
+            }),
+            "expected copy success notice in transcript"
+        );
+    }
+
+    #[test]
+    fn copy_selection_success_notice_counts_chars_not_bytes_for_cjk() {
+        let mut state = AppState::new();
+        select(&mut state, 0, 3);
+        let buffer = buffer_with_text("你好");
+        let mut clipboard = MockClipboard::default();
+
+        copy_selection(&mut state, Some(&buffer), &mut clipboard);
+
+        assert_eq!(clipboard.calls, vec!["你好".to_string()]);
+        assert!(
+            state.transcript.iter().any(|block| {
+                matches!(
+                    block,
+                    TranscriptBlock::Notice(text) if text == "已复制 2 字"
+                )
+            }),
+            "expected copy success notice with char count, not byte count"
+        );
     }
 
     #[test]

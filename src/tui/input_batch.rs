@@ -59,9 +59,13 @@ pub fn classify_key_batch(keys: &[KeyEvent]) -> Vec<KeyIntent> {
         .collect()
 }
 
+pub fn would_submit_lone_enter(batch: &[Event]) -> bool {
+    classify_key_batch(&press_key_events(batch)).contains(&KeyIntent::Submit)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{classify_key_batch, press_key_events, KeyIntent};
+    use super::{classify_key_batch, press_key_events, would_submit_lone_enter, KeyIntent};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -213,5 +217,45 @@ mod tests {
             classify_key_batch(&keys),
             vec![KeyIntent::Passthrough, KeyIntent::Newline]
         );
+    }
+
+    #[test]
+    fn would_submit_lone_enter_returns_true_for_enter_press() {
+        let batch = [press_event(KeyCode::Enter)];
+
+        assert!(would_submit_lone_enter(&batch));
+    }
+
+    #[test]
+    fn would_submit_lone_enter_ignores_enter_release() {
+        let batch = [press_event(KeyCode::Enter), release_event(KeyCode::Enter)];
+
+        assert!(would_submit_lone_enter(&batch));
+    }
+
+    #[test]
+    fn would_submit_lone_enter_returns_false_for_char_then_enter() {
+        let batch = [press_event(KeyCode::Char('a')), press_event(KeyCode::Enter)];
+
+        assert!(!would_submit_lone_enter(&batch));
+    }
+
+    #[test]
+    fn would_submit_lone_enter_returns_false_for_char_only() {
+        let batch = [press_event(KeyCode::Char('a'))];
+
+        assert!(!would_submit_lone_enter(&batch));
+    }
+
+    #[test]
+    fn would_submit_lone_enter_returns_false_for_empty_batch() {
+        assert!(!would_submit_lone_enter(&[]));
+    }
+
+    #[test]
+    fn would_submit_lone_enter_returns_false_after_continuation_char_is_merged() {
+        let batch = [press_event(KeyCode::Enter), press_event(KeyCode::Char('a'))];
+
+        assert!(!would_submit_lone_enter(&batch));
     }
 }
