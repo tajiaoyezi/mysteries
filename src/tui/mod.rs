@@ -164,23 +164,13 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
             event = ui_rx.recv() => {
                 match event {
                     Some(event) => {
-                        let is_terminal = matches!(
-                            event,
-                            channel::AgentEvent::TurnComplete
-                                | channel::AgentEvent::Interrupted
-                                | channel::AgentEvent::Error(_)
-                        );
-                        apply_ui_event(
+                        handle_agent_event(
                             &mut state,
                             event,
                             &mut calling_model_started_at,
                             &mut first_token_at,
+                            &input_tx,
                         );
-                        if is_terminal && state.has_queue() {
-                            if let Some(prompt) = state.dequeue_next() {
-                                let _ = input_tx.send(channel::UserInput::Prompt(prompt));
-                            }
-                        }
                     }
                     None => break,
                 }
@@ -205,6 +195,29 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let _ = agent_handle.await;
 
     Ok(())
+}
+
+/// ui_rx 臂的完整处理:apply 事件 + 三终止事件推进排队(同一调用内,先算 is_terminal 再 apply)。
+/// 抽为函数供集成测试直接驱动(推进闸门 = 本函数唯一出口)。
+fn handle_agent_event(
+    state: &mut app::AppState,
+    event: channel::AgentEvent,
+    calling_model_started_at: &mut Option<Instant>,
+    first_token_at: &mut Option<Instant>,
+    input_tx: &mpsc::UnboundedSender<channel::UserInput>,
+) {
+    let is_terminal = matches!(
+        event,
+        channel::AgentEvent::TurnComplete
+            | channel::AgentEvent::Interrupted
+            | channel::AgentEvent::Error(_)
+    );
+    apply_ui_event(state, event, calling_model_started_at, first_token_at);
+    if is_terminal && state.has_queue() {
+        if let Some(prompt) = state.dequeue_next() {
+            let _ = input_tx.send(channel::UserInput::Prompt(prompt));
+        }
+    }
 }
 
 fn apply_ui_event(
@@ -349,7 +362,12 @@ fn handle_queue_cancel_key(
     interrupt_tx: &mpsc::UnboundedSender<channel::UserInput>,
     now: Instant,
 ) -> bool {
-    if !is_key_press(key) || state.pending_permission.is_some() || !state.has_queue() {
+    if !is_key_press(key)
+        || state.pending_permission.is_some()
+        || state.models_picker.is_some()
+        || state.command_completion.is_some()
+        || !state.has_queue()
+    {
         return false;
     }
     if !is_queue_cancel_key(key) {
@@ -1266,6 +1284,178 @@ mod tests {
         assert_eq!(interrupt_rx.try_recv().unwrap(), UserInput::Interrupt);
     }
 
+    // --- fix-queue-cancel-modal-priority Task 1(RED):浮层活跃时取消排队让位 ---
+
+    #[test]
+    fn handle_queue_cancel_key_yields_to_models_picker() {
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.enqueue_prompt("queued".to_string());
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "alt".to_string(),
+            ProviderProfile {
+                id: "alt".to_string(),
+                kind: ProviderKind::Mock,
+                base_url: None,
+                model: "alt-model".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        state.models_picker = Some(super::app::ModelsPicker::new(
+            &profiles,
+            ("alt", "alt-model"),
+        ));
+
+        assert!(!handle_queue_cancel_key(
+            &mut state,
+            key(KeyCode::Esc),
+            &interrupt_tx,
+            StdInstant::now(),
+        ));
+        assert!(interrupt_rx.try_recv().is_err());
+        assert_eq!(state.last_cancel_at(), None);
+        assert!(state.has_queue());
+    }
+
+    #[test]
+    fn handle_queue_cancel_key_yields_to_command_completion() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.enqueue_prompt("queued".to_string());
+        state.on_key(key(KeyCode::Char('/')), &input_tx);
+        assert!(state.command_completion.is_some());
+
+        assert!(!handle_queue_cancel_key(
+            &mut state,
+            key(KeyCode::Esc),
+            &interrupt_tx,
+            StdInstant::now(),
+        ));
+        assert!(interrupt_rx.try_recv().is_err());
+        assert_eq!(state.last_cancel_at(), None);
+        assert!(state.has_queue());
+    }
+
+    // --- fix-queue-cancel-modal-priority Task 2:推进闸门集成测试(add-message-queue 3.4 补课) ---
+
+    fn feed_agent_event(
+        state: &mut super::app::AppState,
+        event: AgentEvent,
+        input_tx: &mpsc::UnboundedSender<UserInput>,
+    ) {
+        let mut calling_model_started_at = None;
+        let mut first_token_at = None;
+        super::handle_agent_event(
+            state,
+            event,
+            &mut calling_model_started_at,
+            &mut first_token_at,
+            input_tx,
+        );
+    }
+
+    #[test]
+    fn turn_complete_advances_exactly_one_queued_prompt() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.phase = super::app::Phase::CallingModel;
+        state.enqueue_prompt("B".to_string());
+        state.enqueue_prompt("C".to_string());
+
+        feed_agent_event(&mut state, AgentEvent::TurnComplete, &input_tx);
+
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            UserInput::Prompt("B".to_string())
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "channel must hold at most one advanced prompt"
+        );
+        assert_eq!(state.pending_queue, vec!["C".to_string()]);
+        assert_eq!(state.phase, super::app::Phase::Busy);
+        assert_eq!(
+            state.transcript.last(),
+            Some(&super::app::TranscriptBlock::User("B".to_string()))
+        );
+    }
+
+    #[test]
+    fn error_terminal_event_still_advances_queue() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.phase = super::app::Phase::CallingModel;
+        state.enqueue_prompt("B".to_string());
+
+        feed_agent_event(&mut state, AgentEvent::Error("boom".to_string()), &input_tx);
+
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            UserInput::Prompt("B".to_string())
+        );
+        assert!(input_rx.try_recv().is_err());
+        assert!(!state.has_queue());
+        assert_eq!(state.phase, super::app::Phase::Busy);
+    }
+
+    #[test]
+    fn interrupted_terminal_event_still_advances_queue() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.phase = super::app::Phase::CallingModel;
+        state.enqueue_prompt("B".to_string());
+
+        feed_agent_event(&mut state, AgentEvent::Interrupted, &input_tx);
+
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            UserInput::Prompt("B".to_string())
+        );
+        assert!(input_rx.try_recv().is_err());
+        assert!(!state.has_queue());
+        assert_eq!(state.phase, super::app::Phase::Busy);
+    }
+
+    #[test]
+    fn idle_does_not_advance_and_idle_window_submit_enqueues() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.phase = super::app::Phase::CallingModel;
+        state.enqueue_prompt("B".to_string());
+
+        feed_agent_event(
+            &mut state,
+            AgentEvent::StatusChanged(AgentStatus::Idle),
+            &input_tx,
+        );
+        assert!(input_rx.try_recv().is_err(), "Idle must not advance queue");
+        assert_eq!(state.phase, super::app::Phase::CallingModel);
+        assert_eq!(state.pending_queue, vec!["B".to_string()]);
+
+        // Idle→TurnComplete 窗口内提交:入队、不直发
+        state.set_input_text("X");
+        state.on_key(key(KeyCode::Enter), &input_tx);
+        assert!(
+            input_rx.try_recv().is_err(),
+            "submit in Idle window must enqueue, not direct-send"
+        );
+        assert_eq!(
+            state.pending_queue,
+            vec!["B".to_string(), "X".to_string()]
+        );
+
+        // 随后 TurnComplete:恰推进一条(队首 B),无 double-send
+        feed_agent_event(&mut state, AgentEvent::TurnComplete, &input_tx);
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            UserInput::Prompt("B".to_string())
+        );
+        assert!(input_rx.try_recv().is_err());
+        assert_eq!(state.pending_queue, vec!["X".to_string()]);
+    }
+
     #[test]
     fn should_exit_ignores_non_press_escape_events() {
         let state = super::app::AppState::new();
@@ -2034,6 +2224,11 @@ mod tests {
         assert!(
             interrupted.is_ok(),
             "expected Interrupted event before timeout"
+        );
+        let trailing = timeout(Duration::from_millis(80), ui_rx.recv()).await;
+        assert!(
+            trailing.is_err(),
+            "Interrupted must not be followed by any trailing event (esp. StatusChanged(Idle)), got {trailing:?}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(!handle.is_finished());
