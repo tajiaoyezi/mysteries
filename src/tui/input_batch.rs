@@ -3,6 +3,8 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
+pub const PASTE_FOLD_MIN_LINES: usize = 15;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyIntent {
     Newline,
@@ -63,9 +65,28 @@ pub fn would_submit_lone_enter(batch: &[Event]) -> bool {
     classify_key_batch(&press_key_events(batch)).contains(&KeyIntent::Submit)
 }
 
+pub fn fold_candidate(batch: &[Event], threshold: usize) -> Option<String> {
+    let keys = press_key_events(batch);
+    if keys.is_empty() || !keys.iter().all(is_text_content_key) {
+        return None;
+    }
+    let text: String = keys
+        .iter()
+        .map(|key| match key.code {
+            KeyCode::Enter => '\n',
+            KeyCode::Char(ch) => ch,
+            _ => unreachable!("is_text_content_key guarantees Char or bare Enter"),
+        })
+        .collect();
+    (text.split('\n').count() >= threshold).then_some(text)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{classify_key_batch, press_key_events, would_submit_lone_enter, KeyIntent};
+    use super::{
+        classify_key_batch, fold_candidate, press_key_events, would_submit_lone_enter, KeyIntent,
+        PASTE_FOLD_MIN_LINES,
+    };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -90,6 +111,56 @@ mod tests {
             KeyModifiers::NONE,
             KeyEventKind::Release,
         ))
+    }
+
+    /// 构造 N 逻辑行粘贴批:每行一个 Char,行间裸 Enter(N−1 个),无尾随 Enter。
+    fn paste_lines_batch(line_count: usize, ch: char) -> Vec<Event> {
+        let mut batch = Vec::with_capacity(line_count * 2 - 1);
+        for i in 0..line_count {
+            if i > 0 {
+                batch.push(press_event(KeyCode::Enter));
+            }
+            batch.push(press_event(KeyCode::Char(ch)));
+        }
+        batch
+    }
+
+    // --- Task 2.1 RED: fold_candidate ---
+
+    #[test]
+    fn fold_candidate_returns_some_when_line_count_meets_threshold() {
+        let batch = paste_lines_batch(15, 'x');
+        let result = fold_candidate(&batch, PASTE_FOLD_MIN_LINES);
+        let s = result.expect("15 logical lines should fold");
+        assert_eq!(s.split('\n').count(), 15);
+    }
+
+    #[test]
+    fn fold_candidate_returns_none_when_line_count_below_threshold() {
+        let batch = paste_lines_batch(14, 'x');
+        assert_eq!(fold_candidate(&batch, PASTE_FOLD_MIN_LINES), None);
+    }
+
+    #[test]
+    fn fold_candidate_returns_none_when_batch_contains_non_text_key() {
+        let mut batch = paste_lines_batch(15, 'x');
+        batch.insert(3, press_event(KeyCode::PageUp));
+        assert_eq!(fold_candidate(&batch, PASTE_FOLD_MIN_LINES), None);
+    }
+
+    #[test]
+    fn fold_candidate_returns_none_for_empty_batch() {
+        assert_eq!(fold_candidate(&[], PASTE_FOLD_MIN_LINES), None);
+    }
+
+    #[test]
+    fn fold_candidate_rebuilds_cjk_lines_with_bare_enter_as_newline() {
+        let batch = paste_lines_batch(15, '你');
+        let result = fold_candidate(&batch, PASTE_FOLD_MIN_LINES);
+        let expected = std::iter::repeat_n("你", 15)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(result.as_deref(), Some(expected.as_str()));
     }
 
     // ① Windows 孤立 Enter = [Press, Release]:滤 Release 后只剩 1 键,n 不翻倍,判 Submit

@@ -44,6 +44,10 @@ pub(crate) mod width;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const EVENT_BATCH_CAP: usize = 1 << 20;
 const PASTE_CONTINUATION_GRACE: StdDuration = StdDuration::from_millis(10);
+/// 判「本批已像粘贴」的原始事件数阈值(粘贴 chunk 通常数十事件;单/双键仅 2~4 事件)。真机可调。
+const PASTE_COALESCE_MIN_EVENTS: usize = 8;
+/// 粘贴合批的 chunk 间桥接窗口(比 lone-enter 续读的 10ms 宽,容 ConPTY chunk 间隔)。真机可调。
+const PASTE_COALESCE_GRACE: StdDuration = StdDuration::from_millis(30);
 const CANCEL_DOUBLE_TAP: StdDuration = StdDuration::from_millis(600);
 
 pub struct RunAgentTaskConfig {
@@ -663,21 +667,30 @@ fn drain_event_batch(ev0: Event) -> Result<Vec<Event>, CliError> {
             }
         }
 
-        if !input_batch::would_submit_lone_enter(&batch) || batch.len() >= EVENT_BATCH_CAP {
+        if batch.len() >= EVENT_BATCH_CAP {
             break;
         }
 
-        if crossterm::event::poll(PASTE_CONTINUATION_GRACE)
-            .map_err(|e| CliError::Io(e.to_string()))?
-        {
+        // 粘贴合批:ConPTY 把大粘贴切成多个 chunk 分次投递(每 chunk ~数十事件、chunk 间有小间隔)。
+        // 一旦本批已像粘贴(事件数够多),用较大 grace 桥接后续 chunk,把整段并成一个 batch,
+        // 使 process_event_batch 的 fold_candidate 能看到整段;否则每 chunk 不足阈值行、永不折叠。
+        let grace = if batch.len() >= PASTE_COALESCE_MIN_EVENTS {
+            PASTE_COALESCE_GRACE
+        } else if input_batch::would_submit_lone_enter(&batch) {
+            PASTE_CONTINUATION_GRACE
+        } else {
+            break;
+        };
+
+        if crossterm::event::poll(grace).map_err(|e| CliError::Io(e.to_string()))? {
             let ev = crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?;
             let is_key = matches!(ev, Event::Key(_));
             batch.push(ev);
             if !is_key {
-                break; // 续读只等键盘续批;鼠标 Moved/Focus/Resize 即收批,防高频 Moved 令续读不退出
+                break; // 非键事件(鼠标 Moved/Focus/Resize)即收批,防高频事件令合批不退出
             }
         } else {
-            break; // 静默:真提交
+            break; // 静默超过 grace:粘贴/续读结束
         }
     }
     Ok(batch)
@@ -716,6 +729,16 @@ fn process_event_batch(
 
     let press_keys = input_batch::press_key_events(&batch);
     let intents = input_batch::classify_key_batch(&press_keys);
+
+    // 批级折叠:整批为大段纯粘贴(全文本内容键、≥阈值行)时折叠为占位符并消费整批
+    if state.pending_permission.is_none() && state.models_picker.is_none() {
+        if let Some(text) = input_batch::fold_candidate(&batch, input_batch::PASTE_FOLD_MIN_LINES)
+        {
+            state.insert_paste_fold(text);
+            return Ok(false);
+        }
+    }
+
     let mut press_index = 0usize;
     let mut pending_str = String::new();
     let mut modal_closed_in_batch = false;

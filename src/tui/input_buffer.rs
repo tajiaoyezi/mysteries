@@ -1,4 +1,13 @@
+use std::collections::BTreeMap;
+
 use crate::tui::width::{char_width, display_width};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PastedChunk {
+    pub seq: u32,
+    pub text: String,
+    pub line_count: usize,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InputBufferState {
@@ -7,6 +16,8 @@ pub struct InputBufferState {
     pub input_history: Vec<String>,
     pub history_cursor: Option<usize>,
     pub draft: String,
+    pub pasted: BTreeMap<char, PastedChunk>,
+    pub next_paste_seq: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,6 +26,7 @@ pub enum InputBufferAction {
     SetText(String),
     InsertChar(char),
     InsertStr(String),
+    InsertPasteFold(String),
     InsertNewline,
     Backspace,
     Delete,
@@ -29,6 +41,22 @@ pub enum InputBufferAction {
 impl InputBufferState {
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    pub fn expand_folds(&self) -> String {
+        let mut out = String::with_capacity(self.text.len());
+        for ch in self.text.chars() {
+            match self.pasted.get(&ch) {
+                Some(chunk) => out.push_str(&chunk.text),
+                None => out.push(ch),
+            }
+        }
+        out
+    }
+
+    pub fn prune_pasted(&mut self) {
+        let text = &self.text;
+        self.pasted.retain(|sentinel, _| text.contains(*sentinel));
     }
 
     fn exit_history(&mut self) {
@@ -53,6 +81,8 @@ pub fn reduce_input_buffer(
             next.cursor = 0;
             next.history_cursor = None;
             next.draft.clear();
+            next.pasted.clear();
+            next.next_paste_seq = 0;
         }
         InputBufferAction::SetText(text) => {
             next.text = text;
@@ -69,6 +99,23 @@ pub fn reduce_input_buffer(
             next.text.insert_str(next.cursor, &s);
             next.cursor += s.len();
         }
+        InputBufferAction::InsertPasteFold(s) => {
+            next.exit_history();
+            let seq = next.next_paste_seq;
+            let sentinel = char::from_u32(0xE000 + seq).expect("valid PUA sentinel");
+            let line_count = s.split('\n').count();
+            next.text.insert(next.cursor, sentinel);
+            next.cursor += sentinel.len_utf8();
+            next.pasted.insert(
+                sentinel,
+                PastedChunk {
+                    seq,
+                    text: s,
+                    line_count,
+                },
+            );
+            next.next_paste_seq += 1;
+        }
         InputBufferAction::InsertNewline => {
             next.exit_history();
             next.text.insert(next.cursor, '\n');
@@ -80,12 +127,14 @@ pub fn reduce_input_buffer(
                 next.text.drain(previous..next.cursor);
                 next.cursor = previous;
             }
+            next.prune_pasted();
         }
         InputBufferAction::Delete => {
             next.exit_history();
             if let Some(after) = next_char_boundary(&next.text, next.cursor) {
                 next.text.drain(next.cursor..after);
             }
+            next.prune_pasted();
         }
         InputBufferAction::MoveLeft => {
             if let Some(previous) = previous_char_boundary(&next.text, next.cursor) {
@@ -240,7 +289,22 @@ fn history_down(next: &mut InputBufferState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{reduce_input_buffer, InputBufferAction, InputBufferState};
+    use std::collections::BTreeMap;
+
+    use super::{reduce_input_buffer, InputBufferAction, InputBufferState, PastedChunk};
+
+    fn paste_sentinel(seq: u32) -> char {
+        char::from_u32(0xE000 + seq).expect("valid PUA sentinel")
+    }
+
+    fn paste_sentinels_in_text(text: &str) -> Vec<char> {
+        text.chars()
+            .filter(|c| {
+                let code = *c as u32;
+                (0xE000..=0xF8FF).contains(&code)
+            })
+            .collect()
+    }
 
     fn reduce(state: &InputBufferState, action: InputBufferAction) -> InputBufferState {
         let next = reduce_input_buffer(state, action);
@@ -501,6 +565,200 @@ mod tests {
         assert_eq!(edited.text(), "h1xy");
         assert_eq!(edited.cursor, "h1xy".len());
         assert_eq!(edited.history_cursor, None);
+    }
+
+    #[test]
+    fn insert_paste_fold_inserts_sentinel_at_cursor_and_records_chunk() {
+        let pasted_text = "line1\nline2\nline3";
+        let state = reduce(
+            &InputBufferState::default(),
+            InputBufferAction::InsertPasteFold(pasted_text.to_string()),
+        );
+
+        let sentinels = paste_sentinels_in_text(&state.text);
+        assert_eq!(sentinels.len(), 1, "text must contain exactly one sentinel");
+        let sentinel = sentinels[0];
+        assert_eq!(sentinel, paste_sentinel(0));
+
+        assert_eq!(
+            state.cursor,
+            sentinel.len_utf8(),
+            "cursor lands immediately after the sentinel"
+        );
+
+        assert_eq!(state.pasted.len(), 1);
+        let chunk = state.pasted.get(&sentinel).expect("sentinel mapped in pasted");
+        assert_eq!(
+            chunk,
+            &PastedChunk {
+                seq: 0,
+                text: pasted_text.to_string(),
+                line_count: pasted_text.split('\n').count(),
+            }
+        );
+        assert_eq!(state.next_paste_seq, 1);
+    }
+
+    #[test]
+    fn insert_paste_fold_twice_assigns_distinct_sentinels_and_seqs() {
+        let first = "a\nb";
+        let second = "c\nd\ne";
+
+        let state = reduce(
+            &InputBufferState::default(),
+            InputBufferAction::InsertPasteFold(first.to_string()),
+        );
+        let state = reduce(
+            &state,
+            InputBufferAction::InsertPasteFold(second.to_string()),
+        );
+
+        let sentinels = paste_sentinels_in_text(&state.text);
+        assert_eq!(sentinels.len(), 2);
+        assert_eq!(sentinels[0], paste_sentinel(0));
+        assert_eq!(sentinels[1], paste_sentinel(1));
+
+        assert_eq!(state.pasted.len(), 2);
+        assert_eq!(state.pasted.get(&paste_sentinel(0)).unwrap().seq, 0);
+        assert_eq!(state.pasted.get(&paste_sentinel(1)).unwrap().seq, 1);
+        assert_eq!(state.next_paste_seq, 2);
+    }
+
+    #[test]
+    fn insert_paste_fold_in_middle_of_existing_text() {
+        let pasted_text = "mid\nline";
+        let initial = buffer_state("头尾", "头".len());
+
+        let state = reduce(
+            &initial,
+            InputBufferAction::InsertPasteFold(pasted_text.to_string()),
+        );
+
+        let sentinel = paste_sentinel(0);
+        assert_eq!(state.text, format!("头{sentinel}尾"));
+        assert_eq!(
+            state.cursor,
+            "头".len() + sentinel.len_utf8(),
+            "cursor sits between sentinel and trailing text"
+        );
+        assert_eq!(state.pasted.len(), 1);
+        assert_eq!(state.pasted.get(&sentinel).unwrap().text, pasted_text);
+    }
+
+    // --- Task 1.2 RED: expand_folds / prune_pasted (A 类 panic-RED) ---
+
+    #[test]
+    fn expand_folds_expands_mixed_text_and_single_fold() {
+        let state = reduce(&InputBufferState::default(), InputBufferAction::InsertChar('a'));
+        let state = reduce(
+            &state,
+            InputBufferAction::InsertPasteFold("X\nY".to_string()),
+        );
+        let state = reduce(&state, InputBufferAction::InsertChar('b'));
+
+        assert_eq!(state.expand_folds(), "aX\nYb");
+    }
+
+    #[test]
+    fn expand_folds_preserves_order_with_multiple_folds_and_text_between() {
+        let state = reduce(
+            &InputBufferState::default(),
+            InputBufferAction::InsertPasteFold("A".to_string()),
+        );
+        let state = reduce(&state, InputBufferAction::InsertChar('中'));
+        let state = reduce(
+            &state,
+            InputBufferAction::InsertPasteFold("B".to_string()),
+        );
+
+        assert_eq!(state.expand_folds(), "A中B");
+    }
+
+    #[test]
+    fn prune_pasted_drops_orphan_entries_not_present_in_text() {
+        let s0 = paste_sentinel(0);
+        let s1 = paste_sentinel(1);
+        let mut state = InputBufferState {
+            text: s0.to_string(),
+            cursor: s0.len_utf8(),
+            pasted: BTreeMap::from([
+                (
+                    s0,
+                    PastedChunk {
+                        seq: 0,
+                        text: "kept".to_string(),
+                        line_count: 1,
+                    },
+                ),
+                (
+                    s1,
+                    PastedChunk {
+                        seq: 1,
+                        text: "orphan".to_string(),
+                        line_count: 1,
+                    },
+                ),
+            ]),
+            next_paste_seq: 2,
+            ..InputBufferState::default()
+        };
+
+        state.prune_pasted();
+
+        assert_eq!(state.pasted.len(), 1);
+        assert!(state.pasted.contains_key(&s0));
+        assert!(!state.pasted.contains_key(&s1));
+    }
+
+    // --- Task 1.2 RED: PushSubmitted / Backspace wiring (B 类 assertion-RED) ---
+
+    #[test]
+    fn push_submitted_clears_pasted_and_resets_next_paste_seq() {
+        let s0 = paste_sentinel(0);
+        let state = InputBufferState {
+            text: format!("x{s0}"),
+            cursor: format!("x{s0}").len(),
+            pasted: BTreeMap::from([(
+                s0,
+                PastedChunk {
+                    seq: 0,
+                    text: "folded".to_string(),
+                    line_count: 1,
+                },
+            )]),
+            next_paste_seq: 2,
+            ..InputBufferState::default()
+        };
+
+        let state = reduce(&state, InputBufferAction::PushSubmitted("x".to_string()));
+
+        assert!(state.pasted.is_empty());
+        assert_eq!(state.next_paste_seq, 0);
+    }
+
+    #[test]
+    fn backspace_deleting_sentinel_prunes_pasted_map() {
+        let s0 = paste_sentinel(0);
+        let text = format!("a{s0}");
+        let state = InputBufferState {
+            text: text.clone(),
+            cursor: "a".len() + s0.len_utf8(),
+            pasted: BTreeMap::from([(
+                s0,
+                PastedChunk {
+                    seq: 0,
+                    text: "X\nY".to_string(),
+                    line_count: 2,
+                },
+            )]),
+            next_paste_seq: 1,
+            ..InputBufferState::default()
+        };
+
+        let state = reduce(&state, InputBufferAction::Backspace);
+
+        assert!(state.pasted.is_empty());
+        assert_eq!(state.text, "a");
     }
 
     #[test]

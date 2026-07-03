@@ -510,6 +510,15 @@ impl AppState {
         self.input_line.text()
     }
 
+    pub(crate) fn insert_paste_fold(&mut self, text: String) {
+        self.apply_input_action(InputBufferAction::InsertPasteFold(text));
+        self.refresh_command_completion();
+    }
+
+    fn input_has_fold(&self) -> bool {
+        !self.input_line.pasted.is_empty()
+    }
+
     pub fn apply_selection_action(&mut self, action: SelectionAction) {
         self.selection = reduce_selection(&self.selection, action);
     }
@@ -1068,8 +1077,9 @@ impl AppState {
             }
             KeyCode::Enter => {
                 self.close_command_completion();
-                let contains_newline = self.input().contains('\n');
-                let prompt = self.input().trim().to_string();
+                let contains_newline = self.input().contains('\n') || self.input_has_fold();
+                let prompt = self.input_line.expand_folds();
+                let prompt = prompt.trim().to_string();
                 if prompt.is_empty() {
                     return;
                 }
@@ -2184,6 +2194,50 @@ mod tests {
         );
         assert_eq!(state.phase, Phase::Busy);
         assert_eq!(rx.try_recv().unwrap(), UserInput::Prompt("h!".to_string()));
+    }
+
+    #[test]
+    fn enter_submits_expanded_paste_fold_text() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.phase = Phase::Ready;
+        state.insert_paste_fold("l1\nl2\nl3".to_string());
+
+        state.on_key(key(KeyCode::Enter), &tx);
+
+        assert_eq!(state.input(), "");
+        assert!(state.input_line.pasted.is_empty());
+        assert_eq!(
+            state.transcript,
+            vec![TranscriptBlock::User("l1\nl2\nl3".to_string())]
+        );
+        assert_eq!(state.phase, Phase::Busy);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            UserInput::Prompt("l1\nl2\nl3".to_string())
+        );
+    }
+
+    #[test]
+    fn enter_submits_mixed_text_and_paste_fold_in_order() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.phase = Phase::Ready;
+
+        state.on_key(key(KeyCode::Char('a')), &tx);
+        state.insert_paste_fold("X\nY".to_string());
+        state.on_key(key(KeyCode::Char('b')), &tx);
+        state.on_key(key(KeyCode::Enter), &tx);
+
+        assert_eq!(state.input(), "");
+        assert_eq!(
+            state.transcript,
+            vec![TranscriptBlock::User("aX\nYb".to_string())]
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            UserInput::Prompt("aX\nYb".to_string())
+        );
     }
 
     #[test]

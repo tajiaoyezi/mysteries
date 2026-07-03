@@ -3,6 +3,7 @@ use crate::tui::app::{
     compute_diff, AppState, DiffKind, DiffLine, ModelsPickerRowKind, Phase, StatusSnapshot,
     ToolCard, ToolCardStatus, TranscriptBlock,
 };
+use crate::tui::input_buffer::{InputBufferState, PastedChunk};
 use crate::tui::input_layout::{
     input_content_height_cap, input_scroll_offset, visual_input_layout, InputVisualLayout,
 };
@@ -91,10 +92,40 @@ fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
+fn fold_label(chunk: &PastedChunk) -> String {
+    format!("[Pasted text #{} +{} lines]", chunk.seq + 1, chunk.line_count)
+}
+
+fn expand_for_display(input: &InputBufferState) -> String {
+    let mut out = String::new();
+    for ch in input.text.chars() {
+        match input.pasted.get(&ch) {
+            Some(chunk) => out.push_str(&fold_label(chunk)),
+            None => out.push(ch),
+        }
+    }
+    out
+}
+
+fn display_cursor(input: &InputBufferState) -> usize {
+    let mut disp = 0usize;
+    for (i, ch) in input.text.char_indices() {
+        if i >= input.cursor {
+            break;
+        }
+        disp += match input.pasted.get(&ch) {
+            Some(chunk) => fold_label(chunk).len(),
+            None => ch.len_utf8(),
+        };
+    }
+    disp
+}
+
 fn input_box_height(area: Rect, state: &AppState) -> u16 {
     let inner_width = area.width.saturating_sub(2) as usize;
     let layout_width = inner_width.saturating_sub(display_width(INPUT_PROMPT));
-    let layout = visual_input_layout(state.input(), state.input_line.cursor, layout_width);
+    let display = expand_for_display(&state.input_line);
+    let layout = visual_input_layout(&display, display_cursor(&state.input_line), layout_width);
     let cap = input_content_height_cap(
         area.height,
         status_top_gap_height(state),
@@ -1125,12 +1156,12 @@ fn render_mode_line(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: 
     frame.render_widget(paragraph, area);
 }
 fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
-    let input_text = state.input();
+    let input_text = expand_for_display(&state.input_line);
     let prompt_style = Style::default().fg(theme.accent_primary).bg(theme.bg_base);
     let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
     let inner_width = area.width.saturating_sub(2) as usize;
     let layout_width = inner_width.saturating_sub(display_width(INPUT_PROMPT));
-    let layout = visual_input_layout(input_text, state.input_line.cursor, layout_width);
+    let layout = visual_input_layout(&input_text, display_cursor(&state.input_line), layout_width);
     let content_rows = area.height.saturating_sub(2).max(1) as usize;
     let scroll_offset = input_scroll_offset(layout.lines.len(), content_rows, layout.cursor.row);
 
@@ -1472,7 +1503,10 @@ fn input_cursor_position(area: Rect, layout: &InputVisualLayout, scroll_offset: 
 
 #[cfg(test)]
 mod tests {
-    use super::{render, selection_text, transcript_line_count};
+    use super::{
+        display_cursor, expand_for_display, fold_label, render, selection_text,
+        transcript_line_count,
+    };
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::PermissionMode;
     use crate::provider::Usage;
@@ -1885,6 +1919,104 @@ mod tests {
         assert!(output.contains("  CDEFGHIJ"));
         assert!(output.contains("final 行"));
         insta::assert_snapshot!("tui_multiline_input_dynamic_height_soft_wrap", output);
+    }
+
+    fn press_char(state: &mut AppState, ch: char, tx: &mpsc::UnboundedSender<crate::tui::channel::UserInput>) {
+        state.on_key(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            tx,
+        );
+    }
+
+    fn twenty_line_paste_text() -> String {
+        (1..=20)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn expand_for_display_replaces_fold_with_label_and_preserves_surrounding_text() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        for ch in "before ".chars() {
+            press_char(&mut state, ch, &tx);
+        }
+        state.insert_paste_fold(twenty_line_paste_text());
+        for ch in " after".chars() {
+            press_char(&mut state, ch, &tx);
+        }
+
+        let display = expand_for_display(&state.input_line);
+        assert!(display.starts_with("before "));
+        assert!(display.contains("[Pasted text #1 +20 lines]"));
+        assert!(display.ends_with(" after"));
+        assert_eq!(
+            display,
+            format!("before {} after", fold_label(state.input_line.pasted.values().next().unwrap()))
+        );
+    }
+
+    #[test]
+    fn expand_for_display_numbers_multiple_folds_in_order() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.insert_paste_fold("A".to_string());
+        press_char(&mut state, '中', &tx);
+        state.insert_paste_fold("B\nC".to_string());
+
+        let display = expand_for_display(&state.input_line);
+        assert_eq!(
+            display,
+            format!(
+                "{}中{}",
+                fold_label(state.input_line.pasted.get(&char::from_u32(0xE000).unwrap()).unwrap()),
+                fold_label(state.input_line.pasted.get(&char::from_u32(0xE001).unwrap()).unwrap()),
+            )
+        );
+        assert!(display.contains("#1"));
+        assert!(display.contains("#2"));
+    }
+
+    #[test]
+    fn display_cursor_maps_after_fold_and_matches_raw_cursor_when_fold_free() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        for ch in "前缀".chars() {
+            press_char(&mut state, ch, &tx);
+        }
+        state.insert_paste_fold("X\nY".to_string());
+        let label = fold_label(state.input_line.pasted.values().next().unwrap());
+        let expected = "前缀".len() + label.len();
+        assert_eq!(display_cursor(&state.input_line), expected);
+
+        let mut plain = AppState::new();
+        plain.set_input_text("hello");
+        plain.input_line.cursor = 3;
+        assert_eq!(display_cursor(&plain.input_line), 3);
+    }
+
+    #[test]
+    fn paste_fold_input_renders_label_between_prefix_and_suffix() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        for ch in "前缀文字".chars() {
+            press_char(&mut state, ch, &tx);
+        }
+        state.insert_paste_fold(twenty_line_paste_text());
+        for ch in "后缀文字".chars() {
+            press_char(&mut state, ch, &tx);
+        }
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &Theme::midnight()))
+            .unwrap();
+
+        let output = buffer_to_plain(terminal.backend().buffer());
+        assert!(output.contains("前缀文字[Pasted text #1 +20 lines]后缀文字"));
+        insta::assert_snapshot!("tui_paste_fold_input", output);
     }
 
     fn tool_card(
