@@ -1,7 +1,7 @@
 # anthropic-transport Specification
 
 ## Purpose
-TBD - created by archiving change add-anthropic-provider. Update Purpose after archive.
+定义 Anthropic Messages API 的接入传输层:`AnthropicProvider` 的 HTTP 请求与鉴权(`x-api-key` + `anthropic-version`)、内核 `Message[]` 到 Messages 请求体的序列化,以及 SSE 事件流到 `ModelResponse`(含 `Usage`)的流式累积。关键立场是协议差异止于传输层:累积结果与 OpenAI 归一化为同一 `ModelResponse` / `ToolCall` / `Usage` 形状,SSE 累积与错误分类同 reqwest 解耦、可离线单测,超时与重试复用与 OpenAI 同一套 transport 逻辑。`Provider` trait 与凭据解析属 provider-abstraction / credential-source,provider 的选择与装配属 cli-runtime;本域仅覆盖 Anthropic 协议自身的 wire 细节。
 ## Requirements
 ### Requirement: AnthropicProvider 实 HTTP 请求与鉴权
 

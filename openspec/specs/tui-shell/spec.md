@@ -1,7 +1,7 @@
 # tui-shell Specification
 
 ## Purpose
-TBD - created by archiving change add-tui-shell. Update Purpose after archive.
+定义 mysteries 交互式 TUI 外壳的全部交互契约,覆盖三层:架构上以双-task + channel 运行,UI 与 agent task 经 `UserInput` / `AgentEvent` 通信,经既有 `DeltaSink` / `PermissionDecider` / `AgentObserver` 缝接入内核、不改 agent-loop;呈现上约定四区布局、主题令牌与 transcript 渲染(工具卡、markdown、滚动与选区);交互上约定输入到会话的完整行为(多行编辑、粘贴合并与折叠、输入历史、命令补全、模型 picker、权限授权与模式、消息排队、中断)及终端生命周期(raw mode / 鼠标捕获的进入与恢复)。关键立场是逻辑与呈现分层:状态与按键归约为可单测纯函数(时间与 IO 不进入 `AppState` / `render`),渲染对给定状态确定,以 `TestBackend` + `insta` 带色快照做事后回归。命令语义属 builtin-commands,Agent 循环 / 工具 / 权限判定属 headless 内核各域;本域覆盖它们在终端上的全部呈现与交互编排。
 ## Requirements
 ### Requirement: §3 双-task + channel 协议
 

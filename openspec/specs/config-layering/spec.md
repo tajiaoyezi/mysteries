@@ -1,7 +1,7 @@
 # config-layering Specification
 
 ## Purpose
-TBD - created by archiving change add-config-layering. Update Purpose after archive.
+config-layering 管 TOML 配置从文本到运行用 `Config` 的全链路:解析为全 `Option` 字段的 `RawConfig`(缺失即未设置)、user / project 两层字段级 merge(project 覆盖、`None` 继承)、resolve 收敛(多 provider schema 按 `active` 选定单个运行 provider + model,套默认并校验必填),以及 user `config.toml` 的 upsert 回写(read-modify-write,保留其他 provider 与字段)。设计立场是配置非法即致命——缺必填、`active` 指向不存在的 id、ratio 越界均报 `ConfigError` 而不静默默认;且凭据一律不经配置,`Config` 无 `api_key` 字段,密钥走 `CredentialChain`。边界:凭据文件的读写属 credential-source,provider-id 对应的模型目录属 provider-registry,压缩三项在此只定义配置面、其行为属 context-strategy。
 ## Requirements
 ### Requirement: TOML 配置解析
 

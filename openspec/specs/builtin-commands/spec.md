@@ -1,7 +1,7 @@
 # builtin-commands Specification
 
 ## Purpose
-TBD - created by archiving change finish-1-0. Update Purpose after archive.
+定义会话内 slash 命令的解析与执行语义:纯函数 `parse_command` 把 `/` 起头的输入归约为 `Command`,并约定各内置命令(`/help` / `/clear` / `/model` / `/models` / `/status` / `/compact` / `/exit`)对 transcript 与会话状态的效果。关键立场是解析零副作用、命令元数据与可解析命令集单一同源(`/` 补全 UI 直接取用,防补全与执行漂移)。补全浮层与模型 picker 的呈现交互属 tui-shell,`/compact` 复用的 `Compacting` 压缩逻辑属 context-strategy;auth 类操作已迁至 CLI `mysteries auth`(cli-runtime),不在本命令集内。
 ## Requirements
 ### Requirement: slash 命令解析
 

@@ -1,7 +1,7 @@
 # provider-registry Specification
 
 ## Purpose
-TBD - created by archiving change add-provider-registry-hotswap. Update Purpose after archive.
+provider-registry 提供一份内置的 provider 到可用模型的目录,以逻辑 provider-id(与 auth preset、config `[providers.<id>]` 对齐)为键,作为运行时模型切换与 `/models` 浏览的数据源。设计立场是目录按 id 而非 `ProviderKind` 区分——同为 `OpenAi` kind 的 `wps` 与 `deepseek` 各有独立模型集;未收录 id 返回 `None`,使 custom provider 回落到只列其已配 model。本域仅是随实现维护的静态目录常量:provider profile 的持久化与选定属 config-layering,provider 实例的构造与切换属 provider-abstraction 及装配层。
 ## Requirements
 ### Requirement: 内置 provider 模型目录
 

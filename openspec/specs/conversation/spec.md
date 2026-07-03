@@ -1,7 +1,7 @@
 # conversation Specification
 
 ## Purpose
-TBD - created by archiving change bootstrap-provider-core. Update Purpose after archive.
+conversation 定义 CLI 的单轮对话链路:接收一条用户 prompt,组装含 `System` + `User` 的 `ModelRequest`,经 `Provider` 取回一次 `ModelResponse`,回复文本输出到 stdout,流式增量经 `DeltaSink` 按到达顺序可见。设计立场是链路核心收敛在 IO 无关的 `run_single_turn`、`main` 仅作薄胶水,使其可由 `MockProvider` 离线驱动测试。边界:单轮取得回复即结束,不进入多轮编排——多轮循环、工具与权限属 agent-loop 及其协作能力域。
 ## Requirements
 ### Requirement: 单轮 stdout 对话
 

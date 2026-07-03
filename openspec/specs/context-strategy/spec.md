@@ -1,7 +1,7 @@
 # context-strategy Specification
 
 ## Purpose
-TBD - created by archiving change add-context-strategy. Update Purpose after archive.
+context-strategy 决定每轮请求前实际发送给 provider 的 messages:`Agent` 在发起请求前经 `ContextStrategy::prepare` 由 history(连同上一轮 `usage`)产出发送内容,以应对长会话下 context window 的增长。默认 `Passthrough` 原样透传,保证未注入策略时行为逐字节不变;`Compacting` 据真实 token 用量超阈值时把旧轮重写为拼入 `System` 的结构化 summary,并守住正确性红线——不新增独立 message 以保 user/assistant 交替、保留窗口对齐完整轮不切断 `tool_calls` 与 `tool_result` 配对,summary 生成失败则降级为不压、不致命。本域只产出「发送什么」:history 的累积与所有权在 agent-loop,压缩阈值等参数的配置面在 config-layering。
 ## Requirements
 ### Requirement: 请求前上下文策略钩子
 

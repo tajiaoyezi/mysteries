@@ -1,7 +1,7 @@
 # builtin-tools Specification
 
 ## Purpose
-TBD - created by archiving change add-builtin-tools. Update Purpose after archive.
+定义 7 个内置工具的行为契约:4 个只读工具(`list_dir` / `read_file` / `glob` / `grep`,权限级别 `ReadOnly`)与 3 个变更类工具(`write_file` / `edit_file` / `run_shell`,`RequiresConfirmation`),覆盖各自的输入语义、输出截断(`max_output_bytes` / `truncated`)与 exit code 编码。关键立场是失败一律编码为 `ToolOutcome{is_error}` 回给模型而非 panic,变更类工具经权限门 `Deny` 时零副作用,`edit_file` 要求 `old_string` 唯一匹配、否则不写入。工具抽象与注册调度属 tool-system,权限判定机制属 permission-gate;本域仅约定各实体工具自身的行为。
 ## Requirements
 ### Requirement: list_dir 列目录(ReadOnly)
 

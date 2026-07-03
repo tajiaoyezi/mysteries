@@ -1,7 +1,7 @@
 # permission-gate Specification
 
 ## Purpose
-TBD - created by archiving change add-agent-loop-core. Update Purpose after archive.
+permission-gate 是工具执行前的集中放行决策点:`ReadOnly` 工具直接放行,`Edit` / `Execute` 工具经可注入的 `PermissionDecider` 取得 `Allow` / `Deny`;拒绝不静默跳过,而是产出 is_error 的 `ToolResult` 入 history,使循环带着被拒上下文继续。设计立场是门与 UI 解耦——decider 为 async 注入 seam,不绑定具体 channel;运行时 `PermissionMode`(`Normal` / `AcceptEdits` / `Yolo`)以纯函数 `auto_allows` 在询问前判定,命中自动放行即不发起 UI 往返。本域只按 tool-system 声明的 `permission_level` 做放行裁决,拒绝之后的 history 与续跑行为由 agent-loop 承接。
 ## Requirements
 ### Requirement: 可注入的权限门
 

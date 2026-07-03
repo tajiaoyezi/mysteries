@@ -1,7 +1,7 @@
 # agent-loop Specification
 
 ## Purpose
-TBD - created by archiving change add-agent-loop-core. Update Purpose after archive.
+agent-loop 是内核的多轮编排中枢:每轮以完整 history 请求 Provider,经权限门与工具系统处理回复中的 tool_calls,并把全部事件(用户输入、模型文本、工具调用与结果、权限拒绝、错误)统一落为 history 中的 `Message`,直到模型产出无 tool_calls 的回复。设计立场是 history 为唯一事实源、错误按可恢复 / 致命分流(工具失败以 is_error 的 `ToolResult` 入 history 续跑,provider 错误致命上抛),`max_iterations` 触顶时先禁用工具追加一次强制收尾而非直接报错;观测(`AgentObserver`)与运行时 provider / model 切换均以 default no-op、不改 `run` 既有契约的方式增量提供。本域只负责编排次序、终止与错误分流:工具的定义与执行属 tool-system,放行决策属 permission-gate,每轮实际发送的 messages 由 context-strategy 产出。
 ## Requirements
 ### Requirement: 多轮编排循环
 

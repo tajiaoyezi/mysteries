@@ -1,7 +1,7 @@
 # tool-system Specification
 
 ## Purpose
-TBD - created by archiving change add-agent-loop-core. Update Purpose after archive.
+tool-system 定义 Agent 可用工具的统一抽象与分发基础:`Tool` trait、按名注册与查找的 `ToolRegistry`、执行结果 `ToolOutcome` 与执行环境 `ToolContext`,并产出 schema 列表供 Loop 放入 `ModelRequest.tools` 下发给模型。设计立场是工具自声明 `permission_level`(`ReadOnly` / `Edit` / `Execute`)作为权限判定的输入,registry 拒绝重名并保持插入顺序,使下发给模型的工具集确定。本域只提供抽象、注册与执行入口:何时调用由 agent-loop 编排,是否放行由 permission-gate 依 `permission_level` 裁决。
 ## Requirements
 ### Requirement: 工具抽象与注册表
 

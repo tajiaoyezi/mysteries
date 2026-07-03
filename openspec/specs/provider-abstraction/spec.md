@@ -1,7 +1,7 @@
 # provider-abstraction Specification
 
 ## Purpose
-TBD - created by archiving change bootstrap-provider-core. Update Purpose after archive.
+provider-abstraction 是内核与 LLM 后端之间的归一化边界:内核仅依赖 `Provider` trait(async、dyn 安全)与 `ModelRequest` / `ModelResponse` / `ProviderError` 等归一化类型,不感知任何具体线格式;本域同时约定 OpenAI 兼容线格式的序列化 / 解析规则、`ProviderError` 的可恢复 / 致命分类、token 用量透传,以及驱动内核测试的 `MockProvider`。设计立场是向两端解耦:流式增量经 `DeltaSink` 出口而非直写 UI,凭据以构造时注入凭据名、`complete` 内经 `CredentialChain` 解析,使逻辑 provider 身份与 wire 协议族(kind)正交。边界:凭据来源与链属 credential-source,provider 到模型目录的映射属 provider-registry,「何种具体条件映射到何错误变体」留给各传输实现。
 ## Requirements
 ### Requirement: 归一化的 Provider 接口
 

@@ -1,7 +1,7 @@
 # credential-source Specification
 
 ## Purpose
-TBD - created by archiving change add-credential-chain. Update Purpose after archive.
+credential-source 负责按 provider 逻辑名解析 API key:`CredentialSource` trait 之下提供 env(预设名映射约定环境变量)与 file(credentials 文件 `provider = key` 行)两种来源,由 `CredentialChain` 按 env 优先于 file 的顺序取首个命中并短路其余,另提供 credentials 文件的 upsert / remove 维护(原子写回,Unix 下 `0600`)。设计立场是密钥从类型层面防泄露:全程以 `secrecy::SecretString` 承载、`Debug` 脱敏、取明文必经显式 `expose_secret()`,未命中一律 `None` 不 panic。边界:凭据不进配置(config-layering 的 `Config` 无 `api_key` 字段),解析失败如何呈现为 `ProviderError::Auth` 属 provider-abstraction。
 ## Requirements
 ### Requirement: 凭据来源抽象 CredentialSource
 

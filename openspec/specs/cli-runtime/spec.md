@@ -1,7 +1,7 @@
 # cli-runtime Specification
 
 ## Purpose
-TBD - created by archiving change add-cli-assembly. Update Purpose after archive.
+定义 CLI 进程从配置到可运行 Agent 的装配层与入口运行时:两层配置加载、按 `provider.kind` 选择并构造 provider(凭据以逻辑 `provider.id` 解析,支持同 kind 多端点)、7 个内置工具与权限 decider 的端到端装配,以及 `mysteries auth` 子命令族(`login` / `logout` / `list`,含预设 provider 与 WPS AI 流程)、首次运行引导与顶层错误呈现。关键立场是装配期不触网(凭据缺失延迟到 run 时经 `ProviderError::Auth` 暴露)、一切交互输入可注入,使全链路能以 `MockProvider` + 临时目录 hermetic 离线验证。配置 merge / resolve 语义属 config-layering,凭据链属 credential-source,Agent loop 与工具行为属 agent-loop / builtin-tools;本域只负责把它们接成可运行的进程,TUI 与 headless 两个前端共用同一装配。
 ## Requirements
 ### Requirement: 配置驱动的 provider 选择
 

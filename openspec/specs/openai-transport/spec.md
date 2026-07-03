@@ -1,7 +1,7 @@
 # openai-transport Specification
 
 ## Purpose
-TBD - created by archiving change add-openai-live-transport. Update Purpose after archive.
+定义 OpenAI Chat Completions 协议的接入传输层:`OpenAiProvider` 的 HTTP 请求与 Bearer 鉴权、SSE 流式累积(文本增量即时经 `DeltaSink` 推出、tool_calls 按 index 拼接、usage 经 `stream_options.include_usage` 解析),以及 per-attempt 超时与指数退避重试。关键立场是 IO 与逻辑分离:SSE 累积器与「HTTP 结果 → `ProviderError` / 是否可重试」的分类均为与 reqwest 解耦的纯逻辑,可离线单测;`base_url` 可配,同一实现覆盖官方与 OpenAI 兼容端点(如 DeepSeek / 本地网关)。`Provider` trait 与凭据链属 provider-abstraction / credential-source;本域的 retry / timeout 传输逻辑同时被 anthropic-transport 复用。
 ## Requirements
 ### Requirement: OpenAiProvider 实 HTTP 请求
 
