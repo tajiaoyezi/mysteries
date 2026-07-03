@@ -44,6 +44,7 @@ pub(crate) mod width;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const EVENT_BATCH_CAP: usize = 1 << 20;
 const PASTE_CONTINUATION_GRACE: StdDuration = StdDuration::from_millis(10);
+const CANCEL_DOUBLE_TAP: StdDuration = StdDuration::from_millis(600);
 
 pub struct RunAgentTaskConfig {
     pub profiles: BTreeMap<String, ProviderProfile>,
@@ -157,12 +158,23 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
             event = ui_rx.recv() => {
                 match event {
                     Some(event) => {
+                        let is_terminal = matches!(
+                            event,
+                            channel::AgentEvent::TurnComplete
+                                | channel::AgentEvent::Interrupted
+                                | channel::AgentEvent::Error(_)
+                        );
                         apply_ui_event(
                             &mut state,
                             event,
                             &mut calling_model_started_at,
                             &mut first_token_at,
                         );
+                        if is_terminal && state.has_queue() {
+                            if let Some(prompt) = state.dequeue_next() {
+                                let _ = input_tx.send(channel::UserInput::Prompt(prompt));
+                            }
+                        }
                     }
                     None => break,
                 }
@@ -302,6 +314,60 @@ fn handle_resize(state: &mut app::AppState) {
     state.clear_selection();
 }
 
+/// 两次取消键到达间隔判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelAction {
+    /// 中断当前轮并推进下一条排队。
+    InterruptAndAdvance,
+    /// 快速连按:清空所有排队。
+    ClearAll,
+}
+
+/// gap = 两次取消键到达间隔;gap >= threshold → 第 1 次/隔久;gap < threshold → 快速连按清空。
+pub fn cancel_action(gap: StdDuration, threshold: StdDuration) -> CancelAction {
+    if gap >= threshold {
+        CancelAction::InterruptAndAdvance
+    } else {
+        CancelAction::ClearAll
+    }
+}
+
+fn is_queue_cancel_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn handle_queue_cancel_key(
+    state: &mut app::AppState,
+    key: KeyEvent,
+    interrupt_tx: &mpsc::UnboundedSender<channel::UserInput>,
+    now: Instant,
+) -> bool {
+    if !is_key_press(key) || state.pending_permission.is_some() || !state.has_queue() {
+        return false;
+    }
+    if !is_queue_cancel_key(key) {
+        return false;
+    }
+
+    let gap = state
+        .last_cancel_at()
+        .map(|t| now.duration_since(t))
+        .unwrap_or(StdDuration::MAX);
+
+    match cancel_action(gap, CANCEL_DOUBLE_TAP) {
+        CancelAction::InterruptAndAdvance => {
+            let _ = interrupt_tx.send(channel::UserInput::Interrupt);
+            state.set_last_cancel_at(now);
+        }
+        CancelAction::ClearAll => {
+            state.clear_queue();
+            let _ = interrupt_tx.send(channel::UserInput::Interrupt);
+        }
+    }
+    true
+}
+
 fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
     if !is_key_press(key) {
         return false;
@@ -320,6 +386,13 @@ fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
     }
 
     if state.has_selection()
+        && (key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
+    {
+        return false;
+    }
+
+    if state.has_queue()
         && (key.code == KeyCode::Esc
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
     {
@@ -664,6 +737,10 @@ fn process_event_batch(
                     app::flush_merged_input_chars(state, &mut pending_str);
                     continue;
                 }
+                if handle_queue_cancel_key(state, key, interrupt_tx, Instant::now()) {
+                    app::flush_merged_input_chars(state, &mut pending_str);
+                    continue;
+                }
                 let scroll_handled = if arrows_route_to_models_picker(state, key)
                     || arrows_route_to_completion(state, key)
                 {
@@ -784,7 +861,6 @@ pub async fn run_agent_task(
                     _ = wait_for_interrupt(&mut interrupt_rx) => {
                         *agent_history.lock().await = working;
                         let _ = ui_tx.send(channel::AgentEvent::Interrupted);
-                        let _ = ui_tx.send(channel::AgentEvent::StatusChanged(AgentStatus::Idle));
                     }
                 }
             }
@@ -861,10 +937,11 @@ fn error_message(err: AgentError) -> String {
 mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
     use super::{
-        apply_mouse_wheel_scroll_to_state, arrows_route_to_completion,
-        handle_mouse_selection_event, handle_resize, handle_selection_key, run_agent_task,
-        scroll_action_for_key, selection_key_action, should_exit, MouseWheelScrollAction,
-        RunAgentTaskConfig, SelectionKeyAction, DEFAULT_SYSTEM_PROMPT,
+        apply_mouse_wheel_scroll_to_state, arrows_route_to_completion, cancel_action,
+        handle_mouse_selection_event, handle_queue_cancel_key, handle_resize,
+        handle_selection_key, run_agent_task, scroll_action_for_key, selection_key_action,
+        should_exit, CancelAction, MouseWheelScrollAction, RunAgentTaskConfig,
+        SelectionKeyAction, DEFAULT_SYSTEM_PROMPT,
     };
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
@@ -897,6 +974,7 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Instant as StdInstant;
     use tokio::sync::{mpsc, oneshot, Mutex};
     use tokio::time::{timeout, Duration};
 
@@ -1052,6 +1130,115 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 1));
         buffer.set_string(0, 0, text, Style::default());
         buffer
+    }
+
+    // --- 消息排队 Task 4.1(cancel_action 纯函数 · RED) ---
+
+    #[test]
+    fn cancel_action_wide_gap_interrupts_and_advances() {
+        assert_eq!(
+            cancel_action(
+                std::time::Duration::from_millis(1000),
+                std::time::Duration::from_millis(600),
+            ),
+            CancelAction::InterruptAndAdvance,
+        );
+    }
+
+    #[test]
+    fn cancel_action_narrow_gap_clears_all() {
+        assert_eq!(
+            cancel_action(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(600),
+            ),
+            CancelAction::ClearAll,
+        );
+    }
+
+    #[test]
+    fn cancel_action_boundary_gap_equals_threshold_interrupts_and_advances() {
+        assert_eq!(
+            cancel_action(
+                std::time::Duration::from_millis(600),
+                std::time::Duration::from_millis(600),
+            ),
+            CancelAction::InterruptAndAdvance,
+        );
+    }
+
+    #[test]
+    fn should_exit_does_not_exit_when_queue_nonempty() {
+        let mut state = super::app::AppState::new();
+        state.enqueue_prompt("queued".to_string());
+
+        assert!(!should_exit(&state, ctrl_c()));
+        assert!(!should_exit(&state, key(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn handle_queue_cancel_key_skips_when_pending_permission() {
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+        let (perm_tx, _perm_rx) = oneshot::channel();
+        let mut state = super::app::AppState::new();
+        state.enqueue_prompt("queued".to_string());
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "write_file".to_string(),
+            args: json!({}),
+            responder: perm_tx,
+        }));
+
+        assert!(!handle_queue_cancel_key(
+            &mut state,
+            key(KeyCode::Esc),
+            &interrupt_tx,
+            StdInstant::now(),
+        ));
+        assert!(interrupt_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn handle_queue_cancel_key_first_press_interrupts_and_records_time() {
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.enqueue_prompt("first".to_string());
+        let now = StdInstant::now();
+
+        assert!(handle_queue_cancel_key(
+            &mut state,
+            key(KeyCode::Esc),
+            &interrupt_tx,
+            now,
+        ));
+        assert_eq!(interrupt_rx.try_recv().unwrap(), UserInput::Interrupt);
+        assert_eq!(state.last_cancel_at(), Some(now));
+        assert!(state.has_queue());
+    }
+
+    #[test]
+    fn handle_queue_cancel_key_quick_second_press_clears_queue() {
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.enqueue_prompt("a".to_string());
+        state.enqueue_prompt("b".to_string());
+        let first = StdInstant::now();
+        assert!(handle_queue_cancel_key(
+            &mut state,
+            key(KeyCode::Esc),
+            &interrupt_tx,
+            first,
+        ));
+        let _ = interrupt_rx.try_recv().unwrap();
+
+        let second = first + std::time::Duration::from_millis(100);
+        assert!(handle_queue_cancel_key(
+            &mut state,
+            key(KeyCode::Esc),
+            &interrupt_tx,
+            second,
+        ));
+        assert!(!state.has_queue());
+        assert_eq!(interrupt_rx.try_recv().unwrap(), UserInput::Interrupt);
     }
 
     #[test]
@@ -1823,10 +2010,6 @@ mod tests {
             interrupted.is_ok(),
             "expected Interrupted event before timeout"
         );
-        match ui_rx.recv().await.expect("idle status") {
-            AgentEvent::StatusChanged(AgentStatus::Idle) => {}
-            other => panic!("expected StatusChanged(Idle), got {other:?}"),
-        }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(!handle.is_finished());
 

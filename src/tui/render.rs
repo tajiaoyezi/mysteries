@@ -20,6 +20,7 @@ use ratatui::Frame;
 const STATUS_TOP_GAP_LINES: u16 = 2;
 const INPUT_PROMPT: &str = "> ";
 const INPUT_MAX_CONTENT_ROWS: u16 = 10;
+pub(crate) const QUEUE_MAX_ROWS: usize = 5;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     let area = frame.area();
@@ -29,6 +30,10 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     );
 
     let rows = layout_rows(area, state);
+    let queue_row = queue_height(state).gt(&0).then_some(5usize);
+    let input_row = queue_row.map_or(5, |_| 6);
+    let status_row = input_row + 1;
+    let mode_row = input_row + 2;
 
     render_header(frame, rows[0], theme);
     render_transcript(frame, rows[1], state, theme);
@@ -37,11 +42,14 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
         render_permission(frame, rows[2], state, theme);
     }
     render_activity(frame, rows[4], state, theme);
-    render_input(frame, rows[5], state, theme);
-    render_command_completion(frame, rows[5], state, theme);
-    render_status(frame, rows[6], state, theme);
-    render_models_picker(frame, rows[6], state, theme);
-    render_mode_line(frame, rows[7], state, theme);
+    if let Some(row) = queue_row {
+        render_queue(frame, rows[row], state, theme);
+    }
+    render_input(frame, rows[input_row], state, theme);
+    render_command_completion(frame, rows[input_row], state, theme);
+    render_status(frame, rows[status_row], state, theme);
+    render_models_picker(frame, rows[status_row], state, theme);
+    render_mode_line(frame, rows[mode_row], state, theme);
     highlight_selection(frame, state, theme);
 }
 
@@ -53,19 +61,33 @@ pub(crate) fn transcript_viewport_height(area: Rect, state: &AppState) -> usize 
     layout_rows(area, state)[1].height as usize
 }
 
+fn queue_height(state: &AppState) -> u16 {
+    if state.pending_queue.is_empty() {
+        return 0;
+    }
+    state.pending_queue.len().min(QUEUE_MAX_ROWS) as u16
+}
+
 fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
+    let qh = queue_height(state);
+    let mut constraints = vec![
+        Constraint::Length(3),
+        Constraint::Min(8),
+        Constraint::Length(permission_height(state)),
+        Constraint::Length(status_top_gap_height(state)),
+        Constraint::Length(1),
+    ];
+    if qh > 0 {
+        constraints.push(Constraint::Length(qh));
+    }
+    constraints.extend([
+        Constraint::Length(input_box_height(area, state)),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ]);
     Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(permission_height(state)),
-            Constraint::Length(status_top_gap_height(state)),
-            Constraint::Length(1),
-            Constraint::Length(input_box_height(area, state)),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(area)
 }
 
@@ -78,6 +100,7 @@ fn input_box_height(area: Rect, state: &AppState) -> u16 {
         status_top_gap_height(state),
         permission_height(state),
         INPUT_MAX_CONTENT_ROWS,
+        queue_height(state),
     );
     (layout.lines.len() as u16).clamp(1, cap).saturating_add(2)
 }
@@ -929,6 +952,53 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &
     let paragraph = Paragraph::new(Line::from(spans))
         .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
     frame.render_widget(paragraph, area);
+}
+
+fn queue_message_display(message: &str) -> String {
+    let first = message.split('\n').next().unwrap_or("");
+    if message.contains('\n') {
+        format!("{first}…")
+    } else {
+        first.to_string()
+    }
+}
+
+fn render_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+
+    let queue = &state.pending_queue;
+    let max_rows = area.height as usize;
+    let total = queue.len();
+    let overflow = total.saturating_sub(max_rows);
+    let item_slots = if overflow > 0 {
+        max_rows.saturating_sub(1)
+    } else {
+        max_rows.min(total)
+    };
+    let style = Style::default().fg(theme.text_secondary).bg(theme.bg_base);
+
+    for (row, message) in queue.iter().take(item_slots).enumerate() {
+        let text = format!("⟩ {}", queue_message_display(message));
+        let line_area = Rect {
+            x: area.x,
+            y: area.y + row as u16,
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(text).style(style), line_area);
+    }
+    if overflow > 0 {
+        let text = format!("⟩ …(+{})", total - item_slots);
+        let line_area = Rect {
+            x: area.x,
+            y: area.y + item_slots as u16,
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(text).style(style), line_area);
+    }
 }
 
 fn activity_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
@@ -1893,6 +1963,69 @@ mod tests {
             }
         }
         state
+    }
+
+    fn state_with_pending_queue() -> AppState {
+        let mut state = AppState::new();
+        state.phase = Phase::CallingModel;
+        state.enqueue_prompt("fix the login bug".to_string());
+        state.enqueue_prompt("also check\nsession timeout".to_string());
+        state
+    }
+
+    #[test]
+    fn queue_area_snapshot_with_multiline_entry() {
+        let state = state_with_pending_queue();
+        let theme = Theme::midnight();
+        let text = render_to_styled(&state, &theme);
+
+        assert!(text.contains("⟩ fix the login bug"));
+        assert!(text.contains("⟩ also check…"));
+        insta::assert_snapshot!("tui_queue_area", text);
+    }
+
+    #[test]
+    fn empty_queue_layout_matches_baseline_snapshot() {
+        let state = AppState::new();
+        let theme = Theme::midnight();
+        let text = render_to_styled(&state, &theme);
+
+        insta::assert_snapshot!("tui_welcome_state", text);
+    }
+
+    #[test]
+    fn queue_reduces_input_content_cap_when_input_is_full() {
+        use super::QUEUE_MAX_ROWS;
+        use crate::tui::input_layout::input_content_height_cap;
+
+        let fill = "line\n".repeat(12);
+        let mut without_queue = AppState::new();
+        without_queue.transcript.push(TranscriptBlock::Assistant(
+            "transcript remains visible".to_string(),
+        ));
+        without_queue.set_input_text(fill.trim_end());
+
+        let mut with_queue = AppState::new();
+        with_queue.transcript.push(TranscriptBlock::Assistant(
+            "transcript remains visible".to_string(),
+        ));
+        with_queue.set_input_text(fill.trim_end());
+        for i in 0..QUEUE_MAX_ROWS {
+            with_queue.enqueue_prompt(format!("queued {i}"));
+        }
+
+        let cap_without = input_content_height_cap(24, 2, 0, super::INPUT_MAX_CONTENT_ROWS, 0);
+        let cap_with =
+            input_content_height_cap(24, 2, 0, super::INPUT_MAX_CONTENT_ROWS, QUEUE_MAX_ROWS as u16);
+        assert!(cap_with < cap_without);
+        assert_eq!(cap_with, cap_without.saturating_sub(QUEUE_MAX_ROWS as u16));
+
+        let plain_without = render_to_plain_with_size(&without_queue, &Theme::midnight(), 42, 24);
+        let plain_with = render_to_plain_with_size(&with_queue, &Theme::midnight(), 42, 24);
+
+        assert!(plain_with.contains("⟩ queued 0"));
+        assert!(!plain_without.contains("⟩"));
+        assert!(plain_with.matches('┌').count() <= plain_without.matches('┌').count());
     }
 
     #[test]

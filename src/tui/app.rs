@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -406,6 +406,10 @@ pub struct AppState {
     idle_output_tokens: u32,
     idle_rate_tps: Option<f64>,
     idle_rate_is_approximate: bool,
+    /// running 时提交的 prompt 排队(FIFO);推进时 pop 队首进 transcript。
+    pub pending_queue: Vec<String>,
+    /// 最近一次「第 1 次取消键」时刻;Task 4 时间窗两级取消用。
+    last_cancel_at: Option<Instant>,
 }
 
 impl AppState {
@@ -452,7 +456,44 @@ impl AppState {
             idle_output_tokens: 0,
             idle_rate_tps: None,
             idle_rate_is_approximate: false,
+            pending_queue: Vec::new(),
+            last_cancel_at: None,
         }
+    }
+
+    /// 将 prompt 追加到排队队尾。
+    pub fn enqueue_prompt(&mut self, s: String) {
+        self.pending_queue.push(s);
+    }
+
+    /// pop 队首(FIFO);有值时 push transcript User、置 Busy、reset turn token。
+    pub fn dequeue_next(&mut self) -> Option<String> {
+        if self.pending_queue.is_empty() {
+            return None;
+        }
+        let s = self.pending_queue.remove(0);
+        self.transcript.push(TranscriptBlock::User(s.clone()));
+        self.phase = Phase::Busy;
+        self.reset_turn_token_usage();
+        Some(s)
+    }
+
+    /// 清空所有排队消息。
+    pub fn clear_queue(&mut self) {
+        self.pending_queue.clear();
+    }
+
+    /// 排队区是否非空。
+    pub fn has_queue(&self) -> bool {
+        !self.pending_queue.is_empty()
+    }
+
+    pub(crate) fn last_cancel_at(&self) -> Option<Instant> {
+        self.last_cancel_at
+    }
+
+    pub(crate) fn set_last_cancel_at(&mut self, at: Instant) {
+        self.last_cancel_at = Some(at);
     }
 
     pub fn follows_bottom(&self) -> bool {
@@ -856,19 +897,14 @@ impl AppState {
                 }
             }
             AgentEvent::StatusChanged(status) => {
-                let was_busy = self.phase != Phase::Ready;
                 if status == AgentStatus::CallingModel {
                     self.iteration += 1;
                 }
-                self.phase = match status {
-                    AgentStatus::Idle => Phase::Ready,
-                    AgentStatus::CallingModel => Phase::CallingModel,
-                    AgentStatus::ExecutingTool(name) => Phase::ExecutingTool(name),
-                    AgentStatus::WaitingForPermission => Phase::WaitingForPermission,
-                };
-                if was_busy && self.phase == Phase::Ready {
-                    self.new_message_count =
-                        bump_new_message_count(self.follows_bottom, self.new_message_count);
+                match status {
+                    AgentStatus::Idle => { /* phase→Ready 仅由三终止事件驱动 */ }
+                    AgentStatus::CallingModel => self.phase = Phase::CallingModel,
+                    AgentStatus::ExecutingTool(name) => self.phase = Phase::ExecutingTool(name),
+                    AgentStatus::WaitingForPermission => self.phase = Phase::WaitingForPermission,
                 }
             }
             AgentEvent::PermissionRequired(request) => {
@@ -876,27 +912,42 @@ impl AppState {
                 self.phase = Phase::WaitingForPermission;
             }
             AgentEvent::TurnComplete => {
+                let was_busy = self.phase != Phase::Ready;
                 self.pending_permission = None;
                 self.iteration = 0;
                 self.phase = Phase::Ready;
                 self.save_idle_token_summary();
                 self.reset_turn_token_usage();
+                if was_busy {
+                    self.new_message_count =
+                        bump_new_message_count(self.follows_bottom, self.new_message_count);
+                }
             }
             AgentEvent::Notice(message) => {
                 self.transcript.push(TranscriptBlock::Notice(message));
             }
             AgentEvent::Interrupted => {
+                let was_busy = self.phase != Phase::Ready;
                 self.pending_permission = None;
                 self.iteration = 0;
                 self.phase = Phase::Ready;
                 self.transcript
                     .push(TranscriptBlock::Notice("⊘ 已中断本轮".to_string()));
+                if was_busy {
+                    self.new_message_count =
+                        bump_new_message_count(self.follows_bottom, self.new_message_count);
+                }
             }
             AgentEvent::Error(message) => {
+                let was_busy = self.phase != Phase::Ready;
                 self.pending_permission = None;
                 self.iteration = 0;
                 self.phase = Phase::Ready;
                 self.transcript.push(TranscriptBlock::Error(message));
+                if was_busy {
+                    self.new_message_count =
+                        bump_new_message_count(self.follows_bottom, self.new_message_count);
+                }
             }
             AgentEvent::Usage {
                 input_tokens: _,
@@ -1030,11 +1081,16 @@ impl AppState {
                         return;
                     }
                 }
-                self.reset_turn_token_usage();
-                self.iteration = 0;
-                self.phase = Phase::Busy;
-                self.transcript.push(TranscriptBlock::User(prompt.clone()));
-                let _ = input_tx.send(UserInput::Prompt(prompt));
+                if self.phase == Phase::Ready && !self.has_queue() {
+                    self.reset_turn_token_usage();
+                    self.iteration = 0;
+                    self.phase = Phase::Busy;
+                    self.transcript
+                        .push(TranscriptBlock::User(prompt.clone()));
+                    let _ = input_tx.send(UserInput::Prompt(prompt));
+                } else {
+                    self.enqueue_prompt(prompt);
+                }
             }
             _ => {}
         }
@@ -1290,6 +1346,150 @@ mod tests {
                 test_profile("openai", "gpt-5.5", ProviderKind::OpenAi),
             ),
         ])
+    }
+
+    // --- 消息排队 Task 1.1 (RED) ---
+
+    #[test]
+    fn enqueue_prompt_appends_to_queue_tail_in_fifo_order() {
+        let mut state = AppState::new();
+        state.enqueue_prompt("x".to_string());
+        state.enqueue_prompt("y".to_string());
+        assert_eq!(state.pending_queue, vec!["x".to_string(), "y".to_string()]);
+        assert!(state.has_queue());
+    }
+
+    #[test]
+    fn dequeue_next_on_empty_queue_returns_none_without_side_effects() {
+        let mut state = AppState::new();
+        state.phase = Phase::CallingModel;
+        state
+            .transcript
+            .push(TranscriptBlock::User("existing".to_string()));
+
+        assert_eq!(state.dequeue_next(), None);
+        assert_eq!(state.phase, Phase::CallingModel);
+        assert_eq!(
+            state.transcript,
+            vec![TranscriptBlock::User("existing".to_string())]
+        );
+    }
+
+    #[test]
+    fn dequeue_next_pops_front_sets_busy_and_appends_user_transcript() {
+        let mut state = AppState::new();
+        state.enqueue_prompt("x".to_string());
+        state.enqueue_prompt("y".to_string());
+
+        assert_eq!(state.dequeue_next(), Some("x".to_string()));
+        assert_eq!(state.phase, Phase::Busy);
+        assert_eq!(
+            state.transcript.last(),
+            Some(&TranscriptBlock::User("x".to_string()))
+        );
+        assert_eq!(state.pending_queue, vec!["y".to_string()]);
+    }
+
+    #[test]
+    fn dequeue_next_resets_turn_token_usage() {
+        let mut state = AppState::new();
+        state.record_usage(
+            Usage {
+                input_tokens: 0,
+                output_tokens: 40,
+            },
+            Duration::from_secs(1),
+        );
+        assert_eq!(state.output_tokens_this_turn(), 40);
+        state.enqueue_prompt("next".to_string());
+
+        let _ = state.dequeue_next();
+
+        assert_eq!(state.output_tokens_this_turn(), 0);
+        assert_eq!(state.last_rate_tps(), None);
+    }
+
+    #[test]
+    fn clear_queue_empties_pending_and_has_queue_returns_false() {
+        let mut state = AppState::new();
+        state.enqueue_prompt("a".to_string());
+        state.enqueue_prompt("b".to_string());
+        assert!(state.has_queue());
+
+        state.clear_queue();
+
+        assert!(state.pending_queue.is_empty());
+        assert!(!state.has_queue());
+    }
+
+    // --- 消息排队 Task 2(提交分流) ---
+
+    #[test]
+    fn running_submit_enqueues_without_polluting_current_turn() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.phase = Phase::CallingModel;
+        state.iteration = 3;
+        state.record_usage(
+            Usage {
+                input_tokens: 0,
+                output_tokens: 40,
+            },
+            Duration::from_secs(1),
+        );
+        let transcript_len_before = state.transcript.len();
+        state.set_input_text("queued prompt");
+
+        state.on_key(key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(state.pending_queue, vec!["queued prompt".to_string()]);
+        assert_eq!(state.transcript.len(), transcript_len_before);
+        assert_eq!(state.iteration, 3);
+        assert_eq!(state.output_tokens_this_turn(), 40);
+        assert_eq!(state.last_rate_tps(), Some(40.0));
+        assert_eq!(state.phase, Phase::CallingModel);
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ready_with_nonempty_queue_submits_enqueue_not_direct_send() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.enqueue_prompt("already queued".to_string());
+        assert_eq!(state.phase, Phase::Ready);
+        state.set_input_text("second prompt");
+
+        state.on_key(key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(
+            state.pending_queue,
+            vec!["already queued".to_string(), "second prompt".to_string()]
+        );
+        assert!(state.transcript.is_empty());
+        assert_eq!(state.phase, Phase::Ready);
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ready_with_empty_queue_submits_directly() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        assert_eq!(state.phase, Phase::Ready);
+        assert!(!state.has_queue());
+        state.set_input_text("direct prompt");
+
+        state.on_key(key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            UserInput::Prompt("direct prompt".to_string())
+        );
+        assert_eq!(
+            state.transcript,
+            vec![TranscriptBlock::User("direct prompt".to_string())]
+        );
+        assert_eq!(state.phase, Phase::Busy);
+        assert!(state.pending_queue.is_empty());
     }
 
     // --- ModelsPicker §2.1 (卡点 A) ---
@@ -1650,6 +1850,8 @@ mod tests {
 
         state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
         assert_eq!(state.iteration, 1);
+        state.apply(AgentEvent::TurnComplete);
+        assert_eq!(state.iteration, 0);
         state.set_input_text("next prompt");
         state.on_key(key(KeyCode::Enter), &tx);
         assert_eq!(state.iteration, 0);
@@ -1910,6 +2112,16 @@ mod tests {
             state.transcript,
             vec![TranscriptBlock::User("keep me".to_string())]
         );
+    }
+
+    #[test]
+    fn apply_status_changed_idle_does_not_set_ready() {
+        let mut state = AppState::new();
+        state.phase = Phase::CallingModel;
+
+        state.apply(AgentEvent::StatusChanged(AgentStatus::Idle));
+
+        assert_eq!(state.phase, Phase::CallingModel);
     }
 
     #[test]
@@ -2597,7 +2809,7 @@ mod tests {
             "read_file".to_string(),
         )));
         state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
-        state.apply(AgentEvent::StatusChanged(AgentStatus::Idle));
+        state.apply(AgentEvent::TurnComplete);
 
         assert_eq!(state.new_message_count, 1);
     }
@@ -2607,9 +2819,33 @@ mod tests {
         let mut state = AppState::new();
 
         state.apply(AgentEvent::StatusChanged(AgentStatus::CallingModel));
-        state.apply(AgentEvent::StatusChanged(AgentStatus::Idle));
+        state.apply(AgentEvent::TurnComplete);
 
         assert_eq!(state.new_message_count, 0);
+    }
+
+    #[test]
+    fn interrupted_bumps_new_message_count_when_not_following_bottom() {
+        let mut state = AppState::new();
+        state.page_up(100, 10);
+        state.phase = Phase::CallingModel;
+
+        state.apply(AgentEvent::Interrupted);
+
+        assert_eq!(state.new_message_count, 1);
+        assert_eq!(state.phase, Phase::Ready);
+    }
+
+    #[test]
+    fn error_bumps_new_message_count_when_not_following_bottom() {
+        let mut state = AppState::new();
+        state.page_up(100, 10);
+        state.phase = Phase::ExecutingTool("read_file".to_string());
+
+        state.apply(AgentEvent::Error("provider failed".to_string()));
+
+        assert_eq!(state.new_message_count, 1);
+        assert_eq!(state.phase, Phase::Ready);
     }
 
     #[test]
@@ -2729,6 +2965,7 @@ mod tests {
 
         state.on_key(key(KeyCode::Char('a')), &tx);
         state.on_key(key(KeyCode::Enter), &tx);
+        state.apply(AgentEvent::TurnComplete);
         state.on_key(key(KeyCode::Char('b')), &tx);
         state.on_key(key(KeyCode::Enter), &tx);
         assert!(rx.try_recv().is_ok());
