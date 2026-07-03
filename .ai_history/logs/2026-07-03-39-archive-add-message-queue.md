@@ -14,6 +14,7 @@
 - `src/tui/render.rs`:`QUEUE_MAX_ROWS`;`queue_height`;`layout_rows` 条件插排队区;`render_queue`(`⟩` 前缀 + 首行 `…` + 超限 `⟩ …(+N)`)。
 - `src/tui/input_layout.rs`:`input_content_height_cap` 增 `queue_height` 入参并减去。
 - 新快照 `tui_queue_area.snap`;既有快照零 churn。`cargo test --lib` 450 passed / 0 failed;clippy 零警告;真机复核通过。
+- **更正(2026-07-03,主 agent 事后审查)**:①归档 tasks.md 的 **3.4「四个推进闸门集成测试」当时误勾 `[x]` 实未实现**(全库无对应测试,ui_rx 推进闸门零自动化覆盖;spec「中断收场不紧跟 Idle」亦无断言);②`handle_queue_cancel_key` 只让位 pending,**漏 `models_picker`/`command_completion`**,有排队时浮层 Esc 被劫持成中断/清队(spec delta 优先级链本身漏写浮层,spec+实现复合缺口)。两项均由 [[2026-07-03-41-archive-fix-queue-cancel-modal-priority]] 修复/补课。
 
 ## 待决
 - **↑ 编辑排队消息**:v1 未做(↑ 维持输入历史/多行光标),按需再议。
