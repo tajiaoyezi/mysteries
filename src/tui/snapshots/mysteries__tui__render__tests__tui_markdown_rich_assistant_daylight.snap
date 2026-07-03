@@ -1,0 +1,40 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────────────────────‹/›
+‹info.fg›◆ ‹/›‹accent.primary +bold›Markdown 富消息‹/›
+
+‹text.body›  普通 ‹/›‹text.body +bold›粗体‹/›‹text.body›、‹/›‹text.body bg=bg.surface_alt›code‹/›‹text.body›、‹/›‹accent.primary›link‹/›
+
+‹text.body›  ‹/›‹text.secondary›• ‹/›‹text.body›一级‹/›
+‹text.body›  ‹/›‹text.secondary›  • ‹/›‹text.body›二级‹/›
+
+‹text.body›  ‹/›‹border.strong›▎ ‹/›‹text.secondary›引用‹/›
+
+‹text.body›  ‹/›‹text.title +bold›名称‹/›‹border.subtle› │ ‹/›‹text.title +bold›值‹/›
+‹text.body›  ‹/›‹border.subtle›─────┼───‹/›
+‹text.body›  苹果‹/›‹border.subtle› │ ‹/›‹text.body›10‹/›
+
+‹text.body›  ‹/›‹text.muted bg=bg.sunken› rust‹/›
+‹text.body›  ‹/›‹bg=bg.sunken›fn main() {‹/›
+‹text.body›  ‹/›‹bg=bg.sunken›    println!("hi");‹/›
+‹text.body›  ‹/›‹bg=bg.sunken›}‹/›
+
+
+
+
+
+
+
+
+
+
+‹text.muted›◇ 就绪‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.title›                                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 1 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

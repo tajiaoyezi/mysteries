@@ -35,6 +35,7 @@ pub mod input_batch;
 pub mod input_buffer;
 pub(crate) mod input_layout;
 pub mod jump_to_bottom;
+pub(crate) mod markdown;
 pub mod render;
 pub mod selection;
 pub mod terminal;

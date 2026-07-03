@@ -2,6 +2,7 @@ use ratatui::style::Color;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Theme {
+    pub is_dark: bool,
     pub bg_base: Color,
     pub bg_sunken: Color,
     pub bg_surface: Color,
@@ -27,6 +28,7 @@ pub struct Theme {
 impl Theme {
     pub fn midnight() -> Self {
         Self {
+            is_dark: true,
             bg_base: rgb(0x14131c),
             bg_sunken: rgb(0x0e0d15),
             bg_surface: rgb(0x1a1925),
@@ -52,6 +54,7 @@ impl Theme {
 
     pub fn daylight() -> Self {
         Self {
+            is_dark: false,
             bg_base: rgb(0xf4f1ea),
             bg_sunken: rgb(0xefebe2),
             bg_surface: rgb(0xfffdf8),
@@ -161,6 +164,7 @@ mod tests {
     fn midnight_tokens_match_design_spec_01() {
         let theme = Theme::midnight();
 
+        assert!(theme.is_dark);
         assert_tokens(
             &theme,
             &[
@@ -192,6 +196,7 @@ mod tests {
     fn daylight_tokens_match_design_spec_01() {
         let theme = Theme::daylight();
 
+        assert!(!theme.is_dark);
         assert_tokens(
             &theme,
             &[

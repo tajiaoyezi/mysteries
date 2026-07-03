@@ -8,6 +8,7 @@ use crate::tui::input_layout::{
     input_content_height_cap, input_scroll_offset, visual_input_layout, InputVisualLayout,
 };
 use crate::tui::jump_to_bottom::jump_to_bottom_pill_text;
+use crate::tui::markdown::render_markdown;
 use crate::tui::selection::{col_range_for_row, Selection};
 use crate::tui::theme::Theme;
 use crate::tui::width::{char_width, display_width};
@@ -350,13 +351,7 @@ fn transcript_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'
                 ));
             }
             TranscriptBlock::Assistant(text) => {
-                lines.extend(message_lines(
-                    "◆ ",
-                    text,
-                    width,
-                    Style::default().fg(theme.info_fg).bg(theme.bg_base),
-                    Style::default().fg(theme.text_body).bg(theme.bg_base),
-                ));
+                lines.extend(assistant_message_lines(text, theme, width));
             }
             TranscriptBlock::Error(text) => {
                 lines.extend(error_block_lines(text, theme, width));
@@ -386,6 +381,32 @@ fn transcript_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'
             lines.push(Line::from(""));
         }
     }
+    lines
+}
+
+fn assistant_message_lines(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let marker = "◆ ";
+    let marker_width = display_width(marker);
+    let content_width = width.saturating_sub(marker_width).max(1);
+    let indent = " ".repeat(marker_width);
+    let marker_style = Style::default().fg(theme.info_fg).bg(theme.bg_base);
+    let indent_style = Style::default().fg(theme.text_body).bg(theme.bg_base);
+    let mut lines = Vec::new();
+
+    for (index, markdown_line) in render_markdown(text, theme, content_width)
+        .into_iter()
+        .enumerate()
+    {
+        let mut spans = Vec::with_capacity(markdown_line.spans.len() + 1);
+        if index == 0 {
+            spans.push(Span::styled(marker, marker_style));
+        } else {
+            spans.push(Span::styled(indent.clone(), indent_style));
+        }
+        spans.extend(markdown_line.spans);
+        lines.push(Line::from(spans));
+    }
+
     lines
 }
 
@@ -1551,6 +1572,18 @@ mod tests {
         buffer_to_styled(terminal.backend().buffer(), theme)
     }
 
+    fn render_to_styled_with_size(
+        state: &AppState,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, state, theme)).unwrap();
+        buffer_to_styled(terminal.backend().buffer(), theme)
+    }
+
     fn render_to_plain_with_size(
         state: &AppState,
         theme: &Theme,
@@ -2181,6 +2214,33 @@ mod tests {
         assert_ne!(text, midnight_text);
         println!("\n--- welcome daylight frame ---\n{text}\n--- end welcome daylight frame ---");
         insta::assert_snapshot!("tui_welcome_state_daylight", text);
+    }
+
+    fn markdown_rich_assistant_state() -> AppState {
+        let mut state = AppState::new();
+        state.transcript.push(TranscriptBlock::Assistant(
+            "# Markdown 富消息\n\n普通 **粗体**、`code`、[link](https://example.com)\n\n- 一级\n  - 二级\n\n> 引用\n\n| 名称 | 值 |\n| --- | --- |\n| 苹果 | 10 |\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```"
+                .to_string(),
+        ));
+        state
+    }
+
+    #[test]
+    fn markdown_rich_assistant_midnight_snapshot() {
+        let state = markdown_rich_assistant_state();
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 96, 36);
+
+        println!("\n--- markdown rich midnight frame ---\n{text}\n--- end markdown rich midnight frame ---");
+        insta::assert_snapshot!("tui_markdown_rich_assistant_midnight", text);
+    }
+
+    #[test]
+    fn markdown_rich_assistant_daylight_snapshot() {
+        let state = markdown_rich_assistant_state();
+        let text = render_to_styled_with_size(&state, &Theme::daylight(), 96, 36);
+
+        println!("\n--- markdown rich daylight frame ---\n{text}\n--- end markdown rich daylight frame ---");
+        insta::assert_snapshot!("tui_markdown_rich_assistant_daylight", text);
     }
 
     #[test]
