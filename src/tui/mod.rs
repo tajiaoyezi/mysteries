@@ -44,8 +44,10 @@ pub(crate) mod width;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const EVENT_BATCH_CAP: usize = 1 << 20;
 const PASTE_CONTINUATION_GRACE: StdDuration = StdDuration::from_millis(10);
-/// 判「本批已像粘贴」的原始事件数阈值(粘贴 chunk 通常数十事件;单/双键仅 2~4 事件)。真机可调。
-const PASTE_COALESCE_MIN_EVENTS: usize = 8;
+/// 判「本批已像粘贴」的原始事件数阈值:单键仅 2 事件(Press+Release),粘贴多字符 chunk
+/// 会一次性 buffer 成 ≥4 事件;取 4 = 不误触打字的下限,且把「首 chunk 仅 2~3 字符」也纳入合批,
+/// 减少首字符泄漏(如 `ys`=4 事件)。仍无法区分「首 chunk 恰 1 字符」与单键,该边界残留 1 字符泄漏。真机可调。
+const PASTE_COALESCE_MIN_EVENTS: usize = 4;
 /// 粘贴合批的 chunk 间桥接窗口(比 lone-enter 续读的 10ms 宽,容 ConPTY chunk 间隔)。真机可调。
 const PASTE_COALESCE_GRACE: StdDuration = StdDuration::from_millis(30);
 const CANCEL_DOUBLE_TAP: StdDuration = StdDuration::from_millis(600);
