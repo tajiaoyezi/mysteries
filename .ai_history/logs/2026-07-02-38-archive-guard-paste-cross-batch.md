@@ -14,7 +14,7 @@
 
 ## 待决
 - 大段粘贴逐行展开进输入框、跨批多次全屏重绘 → 卡顿。下一个 change:Claude 式 `[Pasted text #N +M lines]` 折叠占位符(先 brainstorm:折叠阈值 / 占位符 token 存储渲染提交展开 / 跨批聚合判粘贴边界 / Backspace 删 token 交互;本栈无 bracketed paste 只能近似聚合)
-- 滚轮偶发"操作多行输入框"现象未复现(诊断日志证滚轮=Mouse ScrollUp/Down、非 Key,代码只滚 transcript scroll_offset、不碰输入框);待复现再查
+- ~~滚轮偶发"操作多行输入框"现象未复现(诊断日志证滚轮=Mouse ScrollUp/Down、非 Key,代码只滚 transcript scroll_offset、不碰输入框);待复现再查~~ **已闭案(2026-07-04,见 [[2026-07-04-45-archive-fix-shell-clobbers-mouse-capture]])**:根因 = run_shell 子进程重置 console 输入模式后,终端把滚轮降级为 ↑/↓ 方向键落入输入路径;当时诊断到 Mouse 正常是因为该会话模式尚未被冲掉
 - guard 保留 Non-Goal:粘贴以落单换行收尾仍提交、续批间隔>GRACE 的极端(跨秒慢粘贴)、粘贴含 Tab、模态关闭后同批尾 Enter 丢弃
 
 ## 引用
