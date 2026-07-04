@@ -56,12 +56,19 @@ impl InputBufferState {
 
     pub fn prune_pasted(&mut self) {
         let text = &self.text;
-        self.pasted.retain(|sentinel, _| text.contains(*sentinel));
+        let draft = &self.draft;
+        self.pasted
+            .retain(|sentinel, _| text.contains(*sentinel) || draft.contains(*sentinel));
+        if self.pasted.is_empty() {
+            self.next_paste_seq = 0;
+        }
     }
 
     fn exit_history(&mut self) {
         if self.history_cursor.is_some() {
             self.history_cursor = None;
+            self.draft.clear();
+            self.prune_pasted();
         }
     }
 }
@@ -88,6 +95,8 @@ pub fn reduce_input_buffer(
             next.text = text;
             next.cursor = next.text.len();
             next.history_cursor = None;
+            next.draft.clear();
+            next.prune_pasted();
         }
         InputBufferAction::InsertChar(ch) => {
             next.exit_history();
@@ -268,6 +277,7 @@ fn history_up(next: &mut InputBufferState) {
         }
         Some(_) => {}
     }
+    next.prune_pasted();
 }
 
 fn history_down(next: &mut InputBufferState) {
@@ -283,8 +293,10 @@ fn history_down(next: &mut InputBufferState) {
             next.history_cursor = None;
             next.text = next.draft.clone();
             next.cursor = next.text.len();
+            next.draft.clear();
         }
     }
+    next.prune_pasted();
 }
 
 #[cfg(test)]
@@ -304,6 +316,14 @@ mod tests {
                 (0xE000..=0xF8FF).contains(&code)
             })
             .collect()
+    }
+
+    fn pasted_chunk(seq: u32, text: &str) -> PastedChunk {
+        PastedChunk {
+            seq,
+            text: text.to_string(),
+            line_count: text.split('\n').count(),
+        }
     }
 
     fn reduce(state: &InputBufferState, action: InputBufferAction) -> InputBufferState {
@@ -708,6 +728,171 @@ mod tests {
         assert_eq!(state.pasted.len(), 1);
         assert!(state.pasted.contains_key(&s0));
         assert!(!state.pasted.contains_key(&s1));
+    }
+
+    #[test]
+    fn prune_pasted_keeps_draft_only_sentinel_and_drops_true_orphan() {
+        let s0 = paste_sentinel(0);
+        let s1 = paste_sentinel(1);
+        let mut state = InputBufferState {
+            draft: s0.to_string(),
+            pasted: BTreeMap::from([
+                (s0, pasted_chunk(0, "draft only")),
+                (s1, pasted_chunk(1, "orphan")),
+            ]),
+            next_paste_seq: 2,
+            ..InputBufferState::default()
+        };
+
+        state.prune_pasted();
+
+        assert_eq!(state.pasted.len(), 1);
+        assert!(state.pasted.contains_key(&s0));
+        assert!(!state.pasted.contains_key(&s1));
+    }
+
+    #[test]
+    fn history_up_prunes_orphans_but_keeps_draft_referenced_fold() {
+        let s0 = paste_sentinel(0);
+        let s1 = paste_sentinel(1);
+        let state = InputBufferState {
+            text: s0.to_string(),
+            cursor: s0.len_utf8(),
+            input_history: vec!["history".to_string()],
+            pasted: BTreeMap::from([
+                (s0, pasted_chunk(0, "draft fold")),
+                (s1, pasted_chunk(1, "orphan")),
+            ]),
+            next_paste_seq: 2,
+            ..InputBufferState::default()
+        };
+
+        let state = reduce(&state, InputBufferAction::Up);
+
+        assert_eq!(state.text(), "history");
+        assert_eq!(state.draft, s0.to_string());
+        assert_eq!(state.pasted.len(), 1);
+        assert!(state.pasted.contains_key(&s0));
+        assert!(!state.pasted.contains_key(&s1));
+    }
+
+    #[test]
+    fn history_up_down_roundtrip_preserves_fold_chunk() {
+        let s0 = paste_sentinel(0);
+        let state = InputBufferState {
+            text: s0.to_string(),
+            cursor: s0.len_utf8(),
+            input_history: vec!["history".to_string()],
+            pasted: BTreeMap::from([(s0, pasted_chunk(0, "fold text"))]),
+            next_paste_seq: 1,
+            ..InputBufferState::default()
+        };
+
+        let recalled = reduce(&state, InputBufferAction::Up);
+        let restored = reduce(&recalled, InputBufferAction::Down);
+
+        assert_eq!(restored.text(), s0.to_string());
+        assert_eq!(restored.expand_folds(), "fold text");
+        assert!(restored.pasted.contains_key(&s0));
+    }
+
+    #[test]
+    fn history_down_restore_consumes_draft_but_keeps_restored_fold() {
+        let s0 = paste_sentinel(0);
+        let state = InputBufferState {
+            text: s0.to_string(),
+            cursor: s0.len_utf8(),
+            input_history: vec!["history".to_string()],
+            pasted: BTreeMap::from([(s0, pasted_chunk(0, "fold text"))]),
+            next_paste_seq: 1,
+            ..InputBufferState::default()
+        };
+
+        let recalled = reduce(&state, InputBufferAction::Up);
+        let restored = reduce(&recalled, InputBufferAction::Down);
+
+        assert_eq!(restored.text(), s0.to_string());
+        assert_eq!(restored.draft, "");
+        assert!(restored.pasted.contains_key(&s0));
+    }
+
+    #[test]
+    fn restored_fold_deleted_by_backspace_clears_pasted_and_resets_sequence() {
+        let s0 = paste_sentinel(0);
+        let state = InputBufferState {
+            text: s0.to_string(),
+            cursor: s0.len_utf8(),
+            input_history: vec!["history".to_string()],
+            pasted: BTreeMap::from([(s0, pasted_chunk(0, "fold text"))]),
+            next_paste_seq: 1,
+            ..InputBufferState::default()
+        };
+
+        let recalled = reduce(&state, InputBufferAction::Up);
+        let restored = reduce(&recalled, InputBufferAction::Down);
+        let deleted = reduce(&restored, InputBufferAction::Backspace);
+
+        assert!(deleted.pasted.is_empty());
+        assert_eq!(deleted.next_paste_seq, 0);
+    }
+
+    #[test]
+    fn typing_after_history_recall_discards_draft_and_prunes_draft_only_fold() {
+        let s0 = paste_sentinel(0);
+        let state = InputBufferState {
+            text: s0.to_string(),
+            cursor: s0.len_utf8(),
+            input_history: vec!["history".to_string()],
+            pasted: BTreeMap::from([(s0, pasted_chunk(0, "draft fold"))]),
+            next_paste_seq: 1,
+            ..InputBufferState::default()
+        };
+
+        let recalled = reduce(&state, InputBufferAction::Up);
+        let edited = reduce(&recalled, InputBufferAction::InsertChar('x'));
+
+        assert_eq!(edited.history_cursor, None);
+        assert_eq!(edited.draft, "");
+        assert!(edited.pasted.is_empty());
+        assert_eq!(edited.next_paste_seq, 0);
+    }
+
+    #[test]
+    fn set_text_discards_draft_prunes_pasted_and_resets_sequence_when_empty() {
+        let s0 = paste_sentinel(0);
+        let state = InputBufferState {
+            draft: s0.to_string(),
+            pasted: BTreeMap::from([(s0, pasted_chunk(0, "draft fold"))]),
+            next_paste_seq: 1,
+            ..InputBufferState::default()
+        };
+
+        let state = reduce(&state, InputBufferAction::SetText("plain".to_string()));
+
+        assert_eq!(state.text(), "plain");
+        assert_eq!(state.draft, "");
+        assert!(state.pasted.is_empty());
+        assert_eq!(state.next_paste_seq, 0);
+    }
+
+    #[test]
+    fn deleting_only_fold_resets_sequence_and_next_fold_reuses_first_sentinel() {
+        let state = reduce(
+            &InputBufferState::default(),
+            InputBufferAction::InsertPasteFold("first".to_string()),
+        );
+
+        let deleted = reduce(&state, InputBufferAction::Backspace);
+        assert!(deleted.pasted.is_empty());
+        assert_eq!(deleted.next_paste_seq, 0);
+
+        let inserted = reduce(
+            &deleted,
+            InputBufferAction::InsertPasteFold("second".to_string()),
+        );
+
+        assert_eq!(inserted.text(), paste_sentinel(0).to_string());
+        assert_eq!(inserted.pasted.get(&paste_sentinel(0)).unwrap().seq, 0);
     }
 
     // --- Task 1.2 RED: PushSubmitted / Backspace wiring (B 类 assertion-RED) ---

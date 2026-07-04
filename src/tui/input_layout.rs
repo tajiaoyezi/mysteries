@@ -3,6 +3,7 @@ use crate::tui::width::char_width;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InputVisualLayout {
     pub lines: Vec<String>,
+    pub line_starts: Vec<usize>,
     pub cursor: VisualPosition,
 }
 
@@ -35,6 +36,7 @@ pub(crate) fn visual_input_layout(
     let cursor = previous_char_boundary(text, cursor.min(text.len()));
     let inner_width = inner_width.max(1);
     let mut lines = Vec::new();
+    let mut line_starts = Vec::new();
     let mut cursor_position = None;
     let logical_lines = text.split('\n').collect::<Vec<_>>();
     let mut line_start = 0;
@@ -47,6 +49,7 @@ pub(crate) fn visual_input_layout(
             inner_width,
             cursor,
             &mut lines,
+            &mut line_starts,
             &mut cursor_position,
         );
         line_start = line_end.saturating_add(1);
@@ -54,6 +57,7 @@ pub(crate) fn visual_input_layout(
 
     InputVisualLayout {
         lines,
+        line_starts,
         cursor: cursor_position.unwrap_or(VisualPosition { row: 0, col: 0 }),
     }
 }
@@ -75,15 +79,18 @@ fn push_visual_line(
     inner_width: usize,
     cursor: usize,
     lines: &mut Vec<String>,
+    line_starts: &mut Vec<usize>,
     cursor_position: &mut Option<VisualPosition>,
 ) {
     let mut current = String::new();
     let mut current_col = 0;
+    let mut current_start = line_start;
     let capacity = inner_width.max(1);
     let mut row = lines.len();
 
     if logical_line.is_empty() {
         lines.push(String::new());
+        line_starts.push(line_start);
         if cursor == line_start && cursor_position.is_none() {
             *cursor_position = Some(VisualPosition { row, col: 0 });
         }
@@ -95,8 +102,10 @@ fn push_visual_line(
         let width = char_width(ch);
         if !current.is_empty() && current_col + width > capacity {
             lines.push(std::mem::take(&mut current));
+            line_starts.push(current_start);
             current_col = 0;
             row = lines.len();
+            current_start = index;
         }
 
         if cursor == index && cursor_position.is_none() {
@@ -119,10 +128,12 @@ fn push_visual_line(
     }
 
     lines.push(current);
+    line_starts.push(current_start);
     let at_line_end = cursor == line_start + logical_line.len() && cursor_position.is_none();
     if current_col == capacity {
         if at_line_end {
             lines.push(String::new());
+            line_starts.push(line_start + logical_line.len());
             *cursor_position = Some(VisualPosition {
                 row: lines.len() - 1,
                 col: 0,
@@ -223,6 +234,33 @@ mod tests {
             vec!["abcd".to_string(), "".to_string(), "ef".to_string()]
         );
         assert_eq!(at.cursor, VisualPosition { row: 1, col: 0 });
+    }
+
+    #[test]
+    fn visual_layout_line_starts_match_each_visual_line() {
+        let cases = [
+            ("multiple logical lines", "ab\ncd", "ab\nc".len(), 6),
+            ("soft wrap", "abcdefghi", "abcdefghi".len(), 4),
+            ("cjk wrap", "你a好", "你a好".len(), 3),
+            ("empty logical line", "ab\n\ncd", "ab\n".len(), 6),
+            ("full boundary cursor row", "abcd", "abcd".len(), 4),
+        ];
+
+        for (name, text, cursor, width) in cases {
+            let layout = visual_input_layout(text, cursor, width);
+            assert_eq!(
+                layout.lines.len(),
+                layout.line_starts.len(),
+                "{name}: every visual line needs a start offset"
+            );
+            for (line, start) in layout.lines.iter().zip(layout.line_starts.iter()) {
+                assert_eq!(
+                    &text[*start..start + line.len()],
+                    line,
+                    "{name}: line {line:?} must be a contiguous display-text slice"
+                );
+            }
+        }
     }
 
     #[test]

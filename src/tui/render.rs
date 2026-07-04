@@ -18,6 +18,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use std::ops::Range;
 use std::time::Instant;
 
 const STATUS_TOP_GAP_LINES: u16 = 2;
@@ -97,18 +98,44 @@ fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
 }
 
 fn fold_label(chunk: &PastedChunk) -> String {
-    format!("[Pasted text #{} +{} lines]", chunk.seq + 1, chunk.line_count)
+    if chunk.line_count >= 2 {
+        format!(
+            "[Pasted text #{} +{} lines]",
+            chunk.seq + 1,
+            chunk.line_count
+        )
+    } else {
+        format!(
+            "[Pasted text #{} +{} chars]",
+            chunk.seq + 1,
+            chunk.text.chars().count()
+        )
+    }
 }
 
-fn expand_for_display(input: &InputBufferState) -> String {
+struct DisplayExpansion {
+    text: String,
+    label_ranges: Vec<Range<usize>>,
+}
+
+fn expand_for_display(input: &InputBufferState) -> DisplayExpansion {
     let mut out = String::new();
+    let mut label_ranges = Vec::new();
     for ch in input.text.chars() {
         match input.pasted.get(&ch) {
-            Some(chunk) => out.push_str(&fold_label(chunk)),
+            Some(chunk) => {
+                let label = fold_label(chunk);
+                let start = out.len();
+                out.push_str(&label);
+                label_ranges.push(start..out.len());
+            }
             None => out.push(ch),
         }
     }
-    out
+    DisplayExpansion {
+        text: out,
+        label_ranges,
+    }
 }
 
 fn display_cursor(input: &InputBufferState) -> usize {
@@ -129,7 +156,7 @@ fn input_box_height(area: Rect, state: &AppState) -> u16 {
     let inner_width = area.width.saturating_sub(2) as usize;
     let layout_width = inner_width.saturating_sub(display_width(INPUT_PROMPT));
     let display = expand_for_display(&state.input_line);
-    let layout = visual_input_layout(&display, display_cursor(&state.input_line), layout_width);
+    let layout = visual_input_layout(&display.text, display_cursor(&state.input_line), layout_width);
     let cap = input_content_height_cap(
         area.height,
         status_top_gap_height(state),
@@ -1327,22 +1354,29 @@ fn render_mode_line(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: 
     frame.render_widget(paragraph, area);
 }
 fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
-    let input_text = expand_for_display(&state.input_line);
+    let input_display = expand_for_display(&state.input_line);
     let prompt_style = Style::default().fg(theme.accent_primary).bg(theme.bg_base);
     let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
+    let label_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
     let inner_width = area.width.saturating_sub(2) as usize;
     let layout_width = inner_width.saturating_sub(display_width(INPUT_PROMPT));
-    let layout = visual_input_layout(&input_text, display_cursor(&state.input_line), layout_width);
+    let layout = visual_input_layout(
+        &input_display.text,
+        display_cursor(&state.input_line),
+        layout_width,
+    );
     let content_rows = area.height.saturating_sub(2).max(1) as usize;
     let scroll_offset = input_scroll_offset(layout.lines.len(), content_rows, layout.cursor.row);
 
-    let content = if !input_text.is_empty() {
+    let content = if !input_display.text.is_empty() {
         input_content_lines(
             &layout,
+            &input_display.label_ranges,
             scroll_offset,
             content_rows,
             prompt_style,
             text_style,
+            label_style,
         )
     } else if state.models_picker.is_some() {
         // 浮层活跃时不显示输入提示(浮层是焦点),也避免右对齐提示从浮层旁露出。
@@ -1375,10 +1409,12 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
 
 fn input_content_lines<'a>(
     layout: &InputVisualLayout,
+    label_ranges: &[Range<usize>],
     scroll_offset: usize,
     content_rows: usize,
     prompt_style: Style,
     text_style: Style,
+    label_style: Style,
 ) -> Vec<Line<'a>> {
     let prompt_width = display_width(INPUT_PROMPT);
     layout
@@ -1393,12 +1429,60 @@ fn input_content_lines<'a>(
             } else {
                 " ".repeat(prompt_width)
             };
-            Line::from(vec![
-                Span::styled(gutter, prompt_style),
-                Span::styled(text.clone(), text_style),
-            ])
+            let mut spans = vec![Span::styled(gutter, prompt_style)];
+            spans.extend(input_content_spans(
+                text,
+                layout.line_starts[visual_row],
+                label_ranges,
+                text_style,
+                label_style,
+            ));
+            Line::from(spans)
         })
         .collect()
+}
+
+fn input_content_spans<'a>(
+    text: &str,
+    line_start: usize,
+    label_ranges: &[Range<usize>],
+    text_style: Style,
+    label_style: Style,
+) -> Vec<Span<'a>> {
+    let line_end = line_start + text.len();
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+
+    for range in label_ranges {
+        let start = range.start.max(line_start);
+        let end = range.end.min(line_end);
+        if start >= end {
+            continue;
+        }
+
+        let local_start = start - line_start;
+        let local_end = end - line_start;
+        if cursor < local_start {
+            spans.push(Span::styled(
+                text[cursor..local_start].to_string(),
+                text_style,
+            ));
+        }
+        spans.push(Span::styled(
+            text[local_start..local_end].to_string(),
+            label_style,
+        ));
+        cursor = local_end;
+    }
+
+    if cursor < text.len() {
+        spans.push(Span::styled(text[cursor..].to_string(), text_style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), text_style));
+    }
+
+    spans
 }
 
 fn render_command_completion(
@@ -1695,8 +1779,8 @@ pub fn bubble_sort<T: PartialOrd>(slice: &mut [T]) {
 mod tests {
     use super::{
         collapsed_tool_summary, diff_body_lines, display_cursor, expand_for_display, fold_label,
-        render, selection_text, tool_card_lines, transcript_line_count, DIFF_COLLAPSED_MAX_ROWS,
-        DIFF_MAX_ROWS,
+        input_content_spans, render, selection_text, tool_card_lines, transcript_line_count,
+        DIFF_COLLAPSED_MAX_ROWS, DIFF_MAX_ROWS,
     };
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::PermissionMode;
@@ -1706,6 +1790,7 @@ mod tests {
         ToolCardStatus, TranscriptBlock,
     };
     use crate::tui::channel::{AgentEvent, PermissionRequest};
+    use crate::tui::input_buffer::PastedChunk;
     use crate::tui::selection::{Point, Selection, SelectionState};
     use crate::tui::theme::Theme;
     use crate::tui::width::display_width;
@@ -1765,6 +1850,20 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, state, theme)).unwrap();
         buffer_to_plain(terminal.backend().buffer())
+    }
+
+    fn render_input_to_buffer(
+        state: &AppState,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| super::render_input(frame, Rect::new(0, 0, width, height), state, theme))
+            .unwrap();
+        terminal.backend().buffer().clone()
     }
 
     fn buffer_to_plain(buffer: &Buffer) -> String {
@@ -2152,7 +2251,7 @@ mod tests {
             press_char(&mut state, ch, &tx);
         }
 
-        let display = expand_for_display(&state.input_line);
+        let display = expand_for_display(&state.input_line).text;
         assert!(display.starts_with("before "));
         assert!(display.contains("[Pasted text #1 +20 lines]"));
         assert!(display.ends_with(" after"));
@@ -2170,7 +2269,7 @@ mod tests {
         press_char(&mut state, '中', &tx);
         state.insert_paste_fold("B\nC".to_string());
 
-        let display = expand_for_display(&state.input_line);
+        let display = expand_for_display(&state.input_line).text;
         assert_eq!(
             display,
             format!(
@@ -2181,6 +2280,258 @@ mod tests {
         );
         assert!(display.contains("#1"));
         assert!(display.contains("#2"));
+    }
+
+    #[test]
+    fn fold_label_uses_line_count_for_multiline_and_char_count_for_single_line() {
+        let multiline = (1..=14)
+            .map(|_| "x".repeat(40))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let multiline_chunk = PastedChunk {
+            seq: 0,
+            text: multiline,
+            line_count: 14,
+        };
+        let single_line_chunk = PastedChunk {
+            seq: 1,
+            text: "abc中文".to_string(),
+            line_count: 1,
+        };
+
+        assert_eq!(
+            fold_label(&multiline_chunk),
+            "[Pasted text #1 +14 lines]"
+        );
+        assert_eq!(
+            fold_label(&single_line_chunk),
+            "[Pasted text #2 +5 chars]"
+        );
+    }
+
+    #[test]
+    fn display_expansion_has_no_label_ranges_without_folds() {
+        let mut state = AppState::new();
+        state.set_input_text("plain text");
+
+        let expansion = expand_for_display(&state.input_line);
+
+        assert_eq!(expansion.text, "plain text");
+        assert!(expansion.label_ranges.is_empty());
+    }
+
+    #[test]
+    fn display_expansion_records_single_fold_label_range() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        for ch in "before ".chars() {
+            press_char(&mut state, ch, &tx);
+        }
+        state.insert_paste_fold("A\nB".to_string());
+        for ch in " after".chars() {
+            press_char(&mut state, ch, &tx);
+        }
+        let label = fold_label(state.input_line.pasted.values().next().unwrap());
+
+        let expansion = expand_for_display(&state.input_line);
+        let start = "before ".len();
+        let end = start + label.len();
+
+        assert_eq!(expansion.label_ranges, vec![start..end]);
+        assert_eq!(&expansion.text[start..end], label);
+    }
+
+    #[test]
+    fn display_expansion_records_multiple_fold_label_ranges_in_order() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.insert_paste_fold("A".to_string());
+        press_char(&mut state, '中', &tx);
+        state.insert_paste_fold("B\nC".to_string());
+        let first = fold_label(
+            state
+                .input_line
+                .pasted
+                .get(&char::from_u32(0xE000).unwrap())
+                .unwrap(),
+        );
+        let second = fold_label(
+            state
+                .input_line
+                .pasted
+                .get(&char::from_u32(0xE001).unwrap())
+                .unwrap(),
+        );
+
+        let expansion = expand_for_display(&state.input_line);
+        let first_start = 0;
+        let first_end = first.len();
+        let second_start = first_end + "中".len();
+        let second_end = second_start + second.len();
+
+        assert_eq!(
+            expansion.label_ranges,
+            vec![first_start..first_end, second_start..second_end]
+        );
+        assert_eq!(&expansion.text[first_start..first_end], first);
+        assert_eq!(&expansion.text[second_start..second_end], second);
+    }
+
+    #[test]
+    fn input_content_spans_without_label_range_returns_single_body_span() {
+        let theme = Theme::midnight();
+        let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
+        let label_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+
+        let spans = input_content_spans("plain", 0, &[], text_style, label_style);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "plain");
+        assert_eq!(spans[0].style, text_style);
+    }
+
+    #[test]
+    fn input_content_spans_marks_whole_label_line() {
+        let theme = Theme::midnight();
+        let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
+        let label_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+        let text = "[Pasted text #1 +2 lines]";
+        let range = 0..text.len();
+
+        let spans = input_content_spans(
+            text,
+            0,
+            std::slice::from_ref(&range),
+            text_style,
+            label_style,
+        );
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), text);
+        assert_eq!(spans[0].style, label_style);
+    }
+
+    #[test]
+    fn input_content_spans_splits_label_in_middle() {
+        let theme = Theme::midnight();
+        let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
+        let label_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+        let range = 2..7;
+
+        let spans = input_content_spans(
+            "aaLABELzz",
+            0,
+            std::slice::from_ref(&range),
+            text_style,
+            label_style,
+        );
+
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "aa");
+        assert_eq!(spans[0].style, text_style);
+        assert_eq!(spans[1].content.as_ref(), "LABEL");
+        assert_eq!(spans[1].style, label_style);
+        assert_eq!(spans[2].content.as_ref(), "zz");
+        assert_eq!(spans[2].style, text_style);
+    }
+
+    #[test]
+    fn input_content_spans_marks_cross_wrap_label_segment() {
+        let theme = Theme::midnight();
+        let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
+        let label_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+        let range = 2..12;
+
+        let spans = input_content_spans(
+            "BEL",
+            7,
+            std::slice::from_ref(&range),
+            text_style,
+            label_style,
+        );
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "BEL");
+        assert_eq!(spans[0].style, label_style);
+    }
+
+    #[test]
+    fn input_content_spans_clamps_label_range_end_to_line_end() {
+        let theme = Theme::midnight();
+        let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
+        let label_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+        let range = 2..12;
+
+        let spans = input_content_spans(
+            "aaLABEL",
+            0,
+            std::slice::from_ref(&range),
+            text_style,
+            label_style,
+        );
+
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content.as_ref(), "aa");
+        assert_eq!(spans[0].style, text_style);
+        assert_eq!(spans[1].content.as_ref(), "LABEL");
+        assert_eq!(spans[1].style, label_style);
+    }
+
+    #[test]
+    fn input_content_spans_splits_two_labels_on_same_line() {
+        let theme = Theme::midnight();
+        let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
+        let label_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+        let ranges = vec![1..3, 5..7];
+
+        let spans = input_content_spans("aL1bbL2z", 0, &ranges, text_style, label_style);
+
+        assert_eq!(spans.len(), 5);
+        assert_eq!(spans[0].content.as_ref(), "a");
+        assert_eq!(spans[0].style, text_style);
+        assert_eq!(spans[1].content.as_ref(), "L1");
+        assert_eq!(spans[1].style, label_style);
+        assert_eq!(spans[2].content.as_ref(), "bb");
+        assert_eq!(spans[2].style, text_style);
+        assert_eq!(spans[3].content.as_ref(), "L2");
+        assert_eq!(spans[3].style, label_style);
+        assert_eq!(spans[4].content.as_ref(), "z");
+        assert_eq!(spans[4].style, text_style);
+    }
+
+    #[test]
+    fn input_content_spans_handles_label_at_line_edges() {
+        let theme = Theme::midnight();
+        let text_style = Style::default().fg(theme.text_primary).bg(theme.bg_base);
+        let label_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+
+        let at_start_range = 0..5;
+        let at_start = input_content_spans(
+            "LABELzz",
+            0,
+            std::slice::from_ref(&at_start_range),
+            text_style,
+            label_style,
+        );
+        assert_eq!(at_start.len(), 2);
+        assert_eq!(at_start[0].content.as_ref(), "LABEL");
+        assert_eq!(at_start[0].style, label_style);
+        assert_eq!(at_start[1].content.as_ref(), "zz");
+        assert_eq!(at_start[1].style, text_style);
+
+        let at_end_range = 2..7;
+        let at_end = input_content_spans(
+            "aaLABEL",
+            0,
+            std::slice::from_ref(&at_end_range),
+            text_style,
+            label_style,
+        );
+        assert_eq!(at_end.len(), 2);
+        assert_eq!(at_end[0].content.as_ref(), "aa");
+        assert_eq!(at_end[0].style, text_style);
+        assert_eq!(at_end[1].content.as_ref(), "LABEL");
+        assert_eq!(at_end[1].style, label_style);
     }
 
     #[test]
@@ -2222,6 +2573,86 @@ mod tests {
         let output = buffer_to_plain(terminal.backend().buffer());
         assert!(output.contains("前缀文字[Pasted text #1 +20 lines]后缀文字"));
         insta::assert_snapshot!("tui_paste_fold_input", output);
+    }
+
+    #[test]
+    fn paste_fold_input_styles_label_muted_and_body_primary() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        for ch in "pre".chars() {
+            press_char(&mut state, ch, &tx);
+        }
+        state.insert_paste_fold("A\nB".to_string());
+        press_char(&mut state, 'z', &tx);
+        let label = fold_label(state.input_line.pasted.values().next().unwrap());
+
+        let buffer = render_input_to_buffer(&state, &theme, 80, 4);
+        let text_x = 3;
+        let label_x = text_x + "pre".len() as u16;
+        let suffix_x = label_x + display_width(&label) as u16;
+
+        assert_eq!(buffer[(text_x, 1)].symbol(), "p");
+        assert_eq!(buffer[(text_x, 1)].fg, theme.text_primary);
+        assert_eq!(buffer[(label_x, 1)].symbol(), "[");
+        assert_eq!(buffer[(label_x, 1)].fg, theme.text_muted);
+        assert_eq!(buffer[(suffix_x, 1)].symbol(), "z");
+        assert_eq!(buffer[(suffix_x, 1)].fg, theme.text_primary);
+    }
+
+    #[test]
+    fn paste_fold_input_styles_wrapped_label_segments_muted() {
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.insert_paste_fold("A\nB".to_string());
+
+        let buffer = render_input_to_buffer(&state, &theme, 16, 5);
+
+        assert_eq!(buffer[(3, 1)].symbol(), "[");
+        assert_eq!(buffer[(3, 1)].fg, theme.text_muted);
+        assert_eq!(buffer[(4, 2)].symbol(), "#");
+        assert_eq!(buffer[(4, 2)].fg, theme.text_muted);
+    }
+
+    #[test]
+    fn typed_literal_paste_label_text_stays_primary() {
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.set_input_text("[Pasted text #1 +2 lines]");
+
+        let buffer = render_input_to_buffer(&state, &theme, 80, 3);
+
+        assert_eq!(buffer[(3, 1)].symbol(), "[");
+        assert_eq!(buffer[(3, 1)].fg, theme.text_primary);
+    }
+
+    #[test]
+    fn paste_fold_input_styles_scrolled_label_with_global_line_start() {
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.set_input_text("line0\n");
+        state.insert_paste_fold("A\nB".to_string());
+
+        let buffer = render_input_to_buffer(&state, &theme, 80, 3);
+
+        assert_eq!(buffer[(3, 1)].symbol(), "[");
+        assert_eq!(buffer[(3, 1)].fg, theme.text_muted);
+    }
+
+    #[test]
+    fn paste_fold_single_line_input_renders_char_count_label() {
+        let mut state = AppState::new();
+        state.insert_paste_fold("x".repeat(600));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &Theme::midnight()))
+            .unwrap();
+
+        let output = buffer_to_plain(terminal.backend().buffer());
+        assert!(output.contains("[Pasted text #1 +600 chars]"));
+        insta::assert_snapshot!("tui_paste_fold_single_line_input", output);
     }
 
     fn tool_card(

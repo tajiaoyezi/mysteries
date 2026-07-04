@@ -759,9 +759,13 @@ fn process_event_batch(
     let press_keys = input_batch::press_key_events(&batch);
     let intents = input_batch::classify_key_batch(&press_keys);
 
-    // 批级折叠:整批为大段纯粘贴(全文本内容键、≥阈值行)时折叠为占位符并消费整批
+    // 批级折叠:整批为大段纯粘贴(全文本内容键、行/字符任一阈值达标)时折叠为占位符并消费整批
     if state.pending_permission.is_none() && state.models_picker.is_none() {
-        if let Some(text) = input_batch::fold_candidate(&batch, input_batch::PASTE_FOLD_MIN_LINES)
+        if let Some(text) = input_batch::fold_candidate(
+            &batch,
+            input_batch::PASTE_FOLD_MIN_LINES,
+            input_batch::PASTE_FOLD_MIN_CHARS,
+        )
         {
             state.insert_paste_fold(text);
             return Ok(false);
