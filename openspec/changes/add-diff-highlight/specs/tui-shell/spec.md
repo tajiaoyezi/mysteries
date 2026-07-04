@@ -6,13 +6,13 @@
 
 `AppState` SHALL 据 `ToolCallStarted` / `ToolCallFinished` 维护工具卡块;`render` SHALL 按 `设计规范/03` C5 渲染:头(状态 glyph `running`→spinner 动画帧 / `done`→`✓` / `error`→`✗` + 工具名 + args;只读工具带 `只读 · 自动运行` 徽章)、体(`output` 行;截断时 `⋯ +N 行已截断`)、脚(`exit {code}`)。着色契约见「themed 渲染」requirement,running 态 spinner 见「spinner 动画(确定性渲染)」requirement。
 
-**diff 体(write_file / edit_file)**:展开态 SHALL 在头行与 output 行之间渲染着色 diff 体,数据源为 `compute_diff(card.name, card.args)`(args 纯推导,MUST NOT 读文件):`Del` 行 `− ` 前缀 `error.fg`、`Add` 行 `+ ` 前缀 `success.fg`,各行带 `│ ` 边框前缀(`border_subtle`)、底色 `bg.base`(权限确认框的 warning_bg diff 风格与不设上限策略**不变**)。(实现 MAY 防御性处理 `Ctx` → `text.body`;`compute_diff` 现不产 `Ctx`,不在契约面。)
+**diff 体(write_file / edit_file)**:write_file / edit_file 卡 SHALL 渲染着色 diff 体,**与 `tools_expanded` 解耦、恒显**(分型策略:diff 是高价值内容默认露出,输出噪音默认收起)——展开态位于头行与 output 行之间;**折叠态位于单行头之后**(仍不渲 output 体 / 脚 / `┌─`/`└─` 边框,diff 行保留 `│ ` 前缀)。数据源为 `compute_diff(card.name, card.args)`(args 纯推导,MUST NOT 读文件):`Del` 行 `− ` 前缀 `error.fg`、`Add` 行 `+ ` 前缀 `success.fg`,各行带 `│ ` 边框前缀(`border_subtle`)、底色 `bg.base`(权限确认框的 warning_bg diff 风格与不设上限策略**不变**)。(实现 MAY 防御性处理 `Ctx` → `text.body`;`compute_diff` 现不产 `Ctx`,不在契约面。)
 
 **宽度与折行**:diff 行内容宽 MUST 为 `width.saturating_sub(4).max(1)`(整行宽 − `│ ` 2 列 − 标记 2 列;区别于 output 行的 −2),按既有 wrap 以显示宽度折行;续行以 `│ ` + 两空格占位起头(恰补标记列,首行续行内容同宽)、同色、MUST NOT 重复 `+ `/`− ` 标记;任一屏行显示宽 MUST NOT 超视口宽(不得溢出被截,保选区复制完整)。
 
-**截断(按屏行)**:diff 体 SHALL 以 `DIFF_MAX_ROWS`(= 24,具名常量)为**屏行预算**(按折行后的显示行计,允许止于某条 `DiffLine` 的折行中途);超预算时止于预算并渲尾行 `⋯ 其余 N 行`(N = 未被**完整**显示的 `DiffLine` 数,`text.muted`,带 `│ ` 边框前缀)。
+**截断(按屏行,双配额)**:diff 体 SHALL 按**屏行预算**截断(按折行后的显示行计,允许止于某条 `DiffLine` 的折行中途):**展开态** `DIFF_MAX_ROWS`(= 24)、**折叠态** `DIFF_COLLAPSED_MAX_ROWS`(= 8),均具名常量;超预算时止于预算并渲尾行 `⋯ 其余 N 行`(N = 未被**完整**显示的 `DiffLine` 数,`text.muted`,带 `│ ` 边框前缀)。
 
-**头行 args**:这两个工具的展开态头行 args 亦 SHALL 用既有 `tool_args_preview`(`path=...`;preview 缺 `path` 时沿用既有整段 JSON fallback),除该 fallback 外 MUST NOT 渲整段 JSON。展开态 diff 体与头行 preview SHALL **不分态**渲染(`Running` / `Error` 亦同,呈现"请求的变更")。
+**头行 args**:这两个工具的展开态头行 args 亦 SHALL 用既有 `tool_args_preview`(`path=...`;preview 缺 `path` 时沿用既有整段 JSON fallback),除该 fallback 外 MUST NOT 渲整段 JSON。diff 体(折叠与展开)与展开态头行 preview SHALL **不分态**渲染(`Running` / `Error` 亦同,呈现"请求的变更";折叠计数仍仅 `Done`,见下)。
 
 **空 diff 与其他工具**:`compute_diff` 为空(diff 参数缺失或为空串——write 的 `content`;edit 的 `old_string` 与 `new_string` **均**缺失/空串)或非 write/edit 工具时,MUST 不渲染任何 diff 体行:非 write/edit 工具行集与既有完全一致;空 diff 的 write/edit 卡折叠态与既有一致、展开态除头行 args 改 preview 外其余行一致。transcript 行数核算与渲染 MUST 共用同一行集来源(不另设第二套计数)。
 
@@ -58,6 +58,11 @@
 - **WHEN** `tools_expanded`,同一 edit_file args(含 `path`、old 2 行、new 2 行)分别以 `Running` / `Error`(output 非空)态渲染
 - **THEN** 两态头行 args 均为 `path=...` preview;头行后均渲 2 条 `− ` + 2 条 `+ `(着色同 Done);`Running` 的体行为「运行中…」占位、`Error` 的体行为 output 文本;与锁定带色快照一致
 
+#### Scenario: 折叠态 diff 体恒显与折叠配额截断
+
+- **WHEN** 折叠(默认,`tools_expanded == false`)下渲染:`Done` 的 edit_file 卡(old 2 行 / new 3 行)、`Done` 的 write_file 卡(content 12 行);另以同 edit args 渲染 `Running` 态
+- **THEN** edit 卡单行头(含 ` · +3 −2 ⌄`)之后渲 5 条 diff 行(2 `− ` + 3 `+ `,≤ 8 全显);write 卡单行头(含 ` · +12 ⌄`)之后渲 8 条 `+ ` + 尾行 `⋯ 其余 4 行`(折叠配额 8);`Running` 卡单行头(` · 运行中…`)之后亦渲 diff 体;三卡均**不**渲 output 体与 `┌─`/`└─` 边框;与锁定带色快照一致
+
 #### Scenario: 空 diff 与非 diff 工具零回归
 
 - **WHEN** run_shell / read_file 等非 write/edit 工具卡,以及**缺齐 diff 参数**(即 `compute_diff` 为空:write 缺 `content` 或 `content` 为空串;edit 的 `old_string`/`new_string` 均缺失)的 write/edit 卡,分别以折叠与展开渲染
@@ -65,7 +70,7 @@
 
 ### Requirement: 工具输出折叠与全局展开(ctrl+o)
 
-`AppState` SHALL 持折叠态 `tools_expanded: bool`(默认 `false` = 折叠)。`render` MUST 据 `tools_expanded` 对每个 `TranscriptBlock::Tool(ToolCard)` 块二选一渲染:**折叠**态仅渲染 `设计规范/03` C5 的**单行头**(状态 glyph + 工具名 + args 摘要 + 结果摘要),**不**渲染 output 体与脚,且单行头 **MUST NOT 含** `┌─` 边框前缀(`┌─` / `└─` 边框仅展开态用);**展开**态渲染**全量**(头 / diff 体(仅 write_file / edit_file 且 diff 非空,见「工具卡 C5 渲染」)/ 体 / 脚 + 截断标记)。折叠行结果摘要 SHALL 按序判定:`running` → ` · 运行中…`;携 `exit` → ` · exit {code}`(非 0 用 `error.fg`);`done` 且为 write_file / edit_file 且 diff 非空 → ` · +A −D ⌄`(定义与着色见「工具卡 C5 渲染」);其余 output 非空 → ` · {N} 行 ⌄`(N = output 行数,`⌄` 提示可展开)。
+`AppState` SHALL 持折叠态 `tools_expanded: bool`(默认 `false` = 折叠)。`render` MUST 据 `tools_expanded` 对每个 `TranscriptBlock::Tool(ToolCard)` 块二选一渲染:**折叠**态渲染 `设计规范/03` C5 的**单行头**(状态 glyph + 工具名 + args 摘要 + 结果摘要)+ **diff 体**(仅 write_file / edit_file 且 diff 非空,折叠配额 `DIFF_COLLAPSED_MAX_ROWS`,见「工具卡 C5 渲染」),**不**渲染 output 体与脚,且单行头 **MUST NOT 含** `┌─` 边框前缀(`┌─` / `└─` 边框仅展开态用);**展开**态渲染**全量**(头 / diff 体(仅 write_file / edit_file 且 diff 非空,展开配额,见「工具卡 C5 渲染」)/ 体 / 脚 + 截断标记)。折叠行结果摘要 SHALL 按序判定:`running` → ` · 运行中…`;携 `exit` → ` · exit {code}`(非 0 用 `error.fg`);`done` 且为 write_file / edit_file 且 diff 非空 → ` · +A −D ⌄`(定义与着色见「工具卡 C5 渲染」);其余 output 非空 → ` · {N} 行 ⌄`(N = output 行数,`⌄` 提示可展开)。
 
 连续的 `Tool` 块 SHALL 视为一组:**组内相邻 `Tool` 块之间 MUST NOT 插入空行**(紧凑呈现);组边界(相邻块非 `Tool`,或位于 transcript 端点)仍插入空行分隔。折叠态下,每个连续 `Tool` 组的**组首**卡片 SHALL 在结果摘要后追加 ` · ctrl+o 展开`(`text.muted`);**组内非组首**卡片与**展开**态 MUST NOT 追加该提示(每组仅一次、补展开可发现性)。
 
@@ -73,8 +78,8 @@
 
 #### Scenario: 工具卡默认折叠为单行(带色快照)
 
-- **WHEN** 一个 `done` 且 output 多行的 `Tool` 块(transcript 中唯一,即所在组组首)在 `tools_expanded == false`(默认)下渲染到 `TestBackend`
-- **THEN** 带色快照仅含该卡的单行头(glyph + 工具名 + args + ` · {N} 行 ⌄` + ` · ctrl+o 展开`),**不**含 `┌─` 头边框、output 体行与 `└─` 脚,与锁定一致
+- **WHEN** 一个 `done` 且 output 多行、**diff 为空**(非 write/edit 工具,或 write/edit 而缺齐 diff 参数)的 `Tool` 块(transcript 中唯一,即所在组组首)在 `tools_expanded == false`(默认)下渲染到 `TestBackend`
+- **THEN** 带色快照仅含该卡的单行头(glyph + 工具名 + args + ` · {N} 行 ⌄` + ` · ctrl+o 展开`),**不**含 `┌─` 头边框、output 体行与 `└─` 脚,与锁定一致(diff 非空的 write/edit 折叠卡另见「工具卡 C5 渲染」的折叠态 diff 体 scenario)
 
 #### Scenario: ctrl+o 全局展开再折回(逻辑 + 快照)
 
