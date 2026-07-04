@@ -8,7 +8,9 @@ pub const SUMMARY_HEADER: &str = "\n\n# 此前对话摘要\n";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionSettings {
-    pub model_context_window: u32,
+    /// 显式窗口覆盖(config `model_context_window`);`None` 时按当前 model 经
+    /// 内置表 / 保守默认解析(见 `provider::model_meta`)。
+    pub model_context_window: Option<u32>,
     pub compact_trigger_ratio: f32,
     pub keep_recent_turns: u32,
 }
@@ -51,8 +53,13 @@ impl Compacting {
         let Some(usage) = last_usage else {
             return false;
         };
-        let threshold =
-            self.settings.model_context_window as f32 * self.settings.compact_trigger_ratio;
+        // 有效窗口在判定时按当前 model 解析(显式配置 > 内置表 > 保守默认),
+        // 使 /model、/models 运行时切换后窗口自动跟随。
+        let window = crate::provider::model_meta::resolve_context_window(
+            self.settings.model_context_window,
+            &self.model,
+        );
+        let threshold = window as f32 * self.settings.compact_trigger_ratio;
         usage.input_tokens as f32 > threshold
     }
 
@@ -225,17 +232,9 @@ pub struct CompactCommandOutcome {
 
 /// headless `/compact` 执行:立即压缩当前 history,返回 notice。
 pub async fn run_compact_command(
-    compacting: Option<&Compacting>,
+    compacting: &Compacting,
     history: &mut Vec<Message>,
 ) -> CompactCommandOutcome {
-    let Some(compacting) = compacting else {
-        return CompactCommandOutcome {
-            notice: "压缩未启用:请在配置中设置 model_context_window".to_string(),
-            changed: false,
-        };
-    };
-
-    let before = history.len();
     let original = history.clone();
 
     match compacting.compact_now(&original).await {
@@ -253,10 +252,9 @@ pub async fn run_compact_command(
             }
         }
         Ok(compacted) => {
-            let after = compacted.len();
             *history = compacted;
             CompactCommandOutcome {
-                notice: format!("已压缩上下文:{before} → {after} 条消息"),
+                notice: "已压缩上下文".to_string(),
                 changed: true,
             }
         }
@@ -292,7 +290,7 @@ mod tests {
 
     fn default_settings() -> CompactionSettings {
         CompactionSettings {
-            model_context_window: 100,
+            model_context_window: Some(100),
             compact_trigger_ratio: 0.8,
             keep_recent_turns: 1,
         }
@@ -353,6 +351,68 @@ mod tests {
 
     fn compacting_with_provider(provider: Arc<MockProvider>) -> Compacting {
         Compacting::new(provider, "compact-model".to_string(), default_settings())
+    }
+
+    #[tokio::test]
+    async fn window_follows_current_model_via_builtin_table() {
+        // 无显式覆盖:构造于表内大窗口 model(claude 200k),7k tokens 不触发;
+        // set_model 切到表内小窗口 model(gpt-4 8k)后,同一 usage 必须触发压缩。
+        let provider = Arc::new(MockProvider::new(vec![summary_response_with(SUMMARY_TEXT)]));
+        let settings = CompactionSettings {
+            model_context_window: None,
+            ..default_settings()
+        };
+        let mut compacting =
+            Compacting::new(provider, "claude-sonnet-4".to_string(), settings);
+        let history = multi_turn_history();
+        let usage = Usage {
+            input_tokens: 7_000,
+            output_tokens: 10,
+        };
+
+        let unchanged = compacting
+            .prepare(&history, Some(&usage))
+            .await
+            .expect("prepare should succeed");
+        assert_eq!(
+            unchanged, history,
+            "7k input tokens must not trigger under claude's 200k window"
+        );
+
+        compacting.set_model("gpt-4".to_string());
+        let compacted = compacting
+            .prepare(&history, Some(&usage))
+            .await
+            .expect("prepare should succeed");
+        assert_ne!(
+            compacted, history,
+            "same usage must trigger under gpt-4's 8k window (resolved at check time)"
+        );
+        assert!(
+            matches!(&compacted[0], Message::System(text) if text.contains(SUMMARY_TEXT)),
+            "compacted history must carry the summary in System"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_override_beats_builtin_table() {
+        // 显式 Some(100) 覆盖表值:model 在表内是 200k,阈值仍按 100 算(81 > 80 触发)。
+        let provider = Arc::new(MockProvider::new(vec![summary_response_with(SUMMARY_TEXT)]));
+        let compacting = Compacting::new(
+            provider,
+            "claude-sonnet-4".to_string(),
+            default_settings(),
+        );
+        let history = multi_turn_history();
+
+        let compacted = compacting
+            .prepare(&history, Some(&over_threshold_usage()))
+            .await
+            .expect("prepare should succeed");
+        assert_ne!(
+            compacted, history,
+            "explicit 100-token window must trigger at 81 input tokens regardless of table"
+        );
     }
 
     #[tokio::test]
@@ -673,21 +733,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_compact_command_replaces_history_and_reports_counts() {
+    async fn run_compact_command_replaces_history_with_plain_notice() {
         let provider = Arc::new(MockProvider::new(vec![summary_response()]));
         let compacting = compacting_with_provider(provider);
         let mut history = multi_turn_history();
         let before = history.len();
 
-        let outcome = run_compact_command(Some(&compacting), &mut history).await;
+        let outcome = run_compact_command(&compacting, &mut history).await;
 
         assert!(outcome.changed, "compact command should replace history");
         assert!(history.len() < before);
-        assert!(
-            outcome.notice.contains(&before.to_string())
-                && outcome.notice.contains(&history.len().to_string()),
-            "notice should report before/after message counts: {}",
-            outcome.notice
+        assert_eq!(
+            outcome.notice, "已压缩上下文",
+            "success notice must be plain, without message counts"
         );
     }
 
@@ -698,29 +756,13 @@ mod tests {
         let mut history = multi_turn_history();
         let original = history.clone();
 
-        let outcome = run_compact_command(Some(&compacting), &mut history).await;
+        let outcome = run_compact_command(&compacting, &mut history).await;
 
         assert!(!outcome.changed);
         assert_eq!(history, original);
         assert!(
             outcome.notice.contains("失败") || outcome.notice.contains("重试"),
             "failure notice should mention retry: {}",
-            outcome.notice
-        );
-    }
-
-    #[tokio::test]
-    async fn run_compact_command_disabled_when_compacting_missing() {
-        let mut history = multi_turn_history();
-        let original = history.clone();
-
-        let outcome = run_compact_command(None, &mut history).await;
-
-        assert!(!outcome.changed);
-        assert_eq!(history, original);
-        assert!(
-            outcome.notice.contains("model_context_window") || outcome.notice.contains("未启用"),
-            "disabled notice should explain config requirement: {}",
             outcome.notice
         );
     }

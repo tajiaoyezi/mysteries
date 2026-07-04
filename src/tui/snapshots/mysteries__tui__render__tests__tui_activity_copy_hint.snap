@@ -1,0 +1,5 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.muted›↓ 120 tok · 60 t/s‹/›‹text.primary›                                                  ‹/›‹text.muted›已复制 35 字‹/›

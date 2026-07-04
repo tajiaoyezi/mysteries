@@ -27,6 +27,8 @@ pub enum Phase {
     CallingModel,
     ExecutingTool(String),
     WaitingForPermission,
+    /// 手动 /compact 进行中:activity line 显示压缩动画,提交入队,CompactDone 收场。
+    Compacting,
 }
 
 impl Phase {
@@ -380,6 +382,16 @@ pub fn estimate_streaming_rate_tps(chars: u32, elapsed: Duration) -> Option<f64>
     Some(estimate_tokens_from_chars(chars) as f64 / elapsed.as_secs_f64())
 }
 
+/// 复制成功轻提示的存续时长(activity line 右侧;过期由渲染侧按 TTL 过滤,
+/// 重绘由既有 120ms tick 驱动,不另设定时器)。
+pub const COPY_HINT_TTL: Duration = Duration::from_secs(4);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyHint {
+    pub text: String,
+    pub set_at: Instant,
+}
+
 pub struct AppState {
     pub session: SessionSnapshot,
     pub agent_history: Arc<AsyncMutex<Vec<Message>>>,
@@ -410,6 +422,7 @@ pub struct AppState {
     pub pending_queue: Vec<String>,
     /// 最近一次「第 1 次取消键」时刻;Task 4 时间窗两级取消用。
     last_cancel_at: Option<Instant>,
+    copy_hint: Option<CopyHint>,
 }
 
 impl AppState {
@@ -458,6 +471,7 @@ impl AppState {
             idle_rate_is_approximate: false,
             pending_queue: Vec::new(),
             last_cancel_at: None,
+            copy_hint: None,
         }
     }
 
@@ -494,6 +508,21 @@ impl AppState {
 
     pub(crate) fn set_last_cancel_at(&mut self, at: Instant) {
         self.last_cancel_at = Some(at);
+    }
+
+    /// 记录复制成功轻提示(现在开始计时;新复制覆盖旧 hint 并重新计时)。
+    pub fn set_copy_hint(&mut self, text: String) {
+        self.copy_hint = Some(CopyHint {
+            text,
+            set_at: Instant::now(),
+        });
+    }
+
+    /// TTL 内返回 hint 文案,过期返回 `None`(渲染侧据此显示 / 隐藏)。
+    pub fn active_copy_hint(&self, now: Instant) -> Option<&str> {
+        self.copy_hint.as_ref().and_then(|hint| {
+            (now.duration_since(hint.set_at) < COPY_HINT_TTL).then_some(hint.text.as_str())
+        })
     }
 
     pub fn follows_bottom(&self) -> bool {
@@ -935,6 +964,9 @@ impl AppState {
             AgentEvent::Notice(message) => {
                 self.transcript.push(TranscriptBlock::Notice(message));
             }
+            AgentEvent::CompactDone => {
+                self.phase = Phase::Ready;
+            }
             AgentEvent::Interrupted => {
                 let was_busy = self.phase != Phase::Ready;
                 self.pending_permission = None;
@@ -1135,7 +1167,16 @@ impl AppState {
                 let _ = _input_tx.send(UserInput::SetModel(model));
             }
             Command::Compact => {
-                let _ = _input_tx.send(UserInput::Compact);
+                // 仅就绪且无排队时可发起:压缩期间 phase 非 Ready,后续提交自然入队;
+                // 运行中/有排队时拒绝,避免 Compact 在 channel 里排到轮后延迟执行。
+                if self.phase == Phase::Ready && !self.has_queue() {
+                    self.phase = Phase::Compacting;
+                    let _ = _input_tx.send(UserInput::Compact);
+                } else {
+                    self.transcript.push(TranscriptBlock::Notice(
+                        "当前有任务进行中,/compact 请稍后再试".to_string(),
+                    ));
+                }
             }
             Command::Models => self.open_models_picker(),
         }
@@ -3299,5 +3340,98 @@ mod tests {
             other => panic!("lone Enter should submit a prompt, got {other:?}"),
         }
         assert_eq!(state.input(), "");
+    }
+
+    #[test]
+    fn compact_command_starts_compacting_phase_when_ready() {
+        use crate::tui::command::Command;
+
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+
+        state.execute_command(Command::Compact, &input_tx);
+
+        assert_eq!(state.phase, Phase::Compacting);
+        assert_eq!(input_rx.try_recv().unwrap(), UserInput::Compact);
+    }
+
+    #[test]
+    fn compact_command_rejected_while_running_or_queued() {
+        use crate::tui::command::Command;
+
+        // 运行中:不发 Compact、phase 不动、回 notice。
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.phase = Phase::CallingModel;
+
+        state.execute_command(Command::Compact, &input_tx);
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "running: Compact must not be sent"
+        );
+        assert_eq!(state.phase, Phase::CallingModel);
+        assert!(
+            matches!(
+                state.transcript.last(),
+                Some(TranscriptBlock::Notice(text)) if text.contains("/compact")
+            ),
+            "rejection must leave an explanatory notice"
+        );
+
+        // Ready 但有排队:同样拒绝(避免 Compact 插到排队消息之前延迟执行)。
+        let mut state = AppState::new();
+        state.enqueue_prompt("queued".to_string());
+
+        state.execute_command(Command::Compact, &input_tx);
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "queued: Compact must not be sent"
+        );
+        assert_ne!(state.phase, Phase::Compacting);
+    }
+
+    #[test]
+    fn apply_compact_done_returns_ready() {
+        let mut state = AppState::new();
+        state.phase = Phase::Compacting;
+
+        state.apply(AgentEvent::CompactDone);
+
+        assert_eq!(state.phase, Phase::Ready);
+    }
+
+    #[test]
+    fn copy_hint_active_within_ttl_and_expires_after() {
+        use super::COPY_HINT_TTL;
+        use std::time::Instant;
+
+        let mut state = AppState::new();
+        assert_eq!(state.active_copy_hint(Instant::now()), None);
+
+        state.set_copy_hint("已复制 5 字".to_string());
+        let now = Instant::now();
+        assert_eq!(state.active_copy_hint(now), Some("已复制 5 字"));
+        assert_eq!(
+            state.active_copy_hint(now + COPY_HINT_TTL + Duration::from_millis(1)),
+            None,
+            "hint must expire after COPY_HINT_TTL"
+        );
+    }
+
+    #[test]
+    fn copy_hint_overwrite_replaces_previous_text() {
+        use std::time::Instant;
+
+        let mut state = AppState::new();
+        state.set_copy_hint("已复制 5 字".to_string());
+        state.set_copy_hint("已复制 9 字".to_string());
+
+        assert_eq!(
+            state.active_copy_hint(Instant::now()),
+            Some("已复制 9 字"),
+            "a new copy must overwrite the previous hint"
+        );
     }
 }

@@ -10,6 +10,7 @@ pub mod anthropic;
 pub mod anthropic_stream;
 pub mod anthropic_wire;
 pub mod mock;
+pub mod model_meta;
 pub mod openai;
 pub mod registry;
 pub mod stream;

@@ -212,6 +212,7 @@ fn handle_agent_event(
         channel::AgentEvent::TurnComplete
             | channel::AgentEvent::Interrupted
             | channel::AgentEvent::Error(_)
+            | channel::AgentEvent::CompactDone
     );
     apply_ui_event(state, event, calling_model_started_at, first_token_at);
     if is_terminal && state.has_queue() {
@@ -845,7 +846,7 @@ fn process_event_batch(
 pub async fn run_agent_task(
     mut agent: Agent,
     agent_history: Arc<Mutex<Vec<Message>>>,
-    mut compacting: Option<Compacting>,
+    mut compacting: Compacting,
     task_config: RunAgentTaskConfig,
     mut input_rx: mpsc::UnboundedReceiver<channel::UserInput>,
     mut interrupt_rx: mpsc::UnboundedReceiver<channel::UserInput>,
@@ -868,7 +869,7 @@ pub async fn run_agent_task(
                     &id,
                     &model,
                     &mut agent,
-                    compacting.as_mut(),
+                    &mut compacting,
                 ) {
                     let _ = ui_tx.send(channel::AgentEvent::Notice(notice));
                 }
@@ -876,8 +877,10 @@ pub async fn run_agent_task(
             channel::UserInput::Interrupt => {}
             channel::UserInput::Compact => {
                 let mut history = agent_history.lock().await;
-                let outcome = run_compact_command(compacting.as_ref(), &mut history).await;
+                let outcome = run_compact_command(&compacting, &mut history).await;
                 let _ = ui_tx.send(channel::AgentEvent::Notice(outcome.notice));
+                // 成功/失败都要收场:置回 Ready 并驱动排队推进。
+                let _ = ui_tx.send(channel::AgentEvent::CompactDone);
             }
             channel::UserInput::Prompt(prompt) => {
                 while interrupt_rx.try_recv().is_ok() {}
@@ -926,7 +929,7 @@ fn apply_set_provider(
     id: &str,
     model: &str,
     agent: &mut Agent,
-    compacting: Option<&mut Compacting>,
+    compacting: &mut Compacting,
 ) -> Result<(), String> {
     let Some(profile) = profiles.get(id) else {
         return Err(format!("未知 provider: {id}"));
@@ -955,10 +958,8 @@ fn apply_set_provider(
     let provider = select_provider(&transient, credentials).map_err(|err| err.to_string())?;
     agent.set_provider(provider.clone());
     agent.set_model(model.to_string());
-    if let Some(compacting) = compacting {
-        compacting.set_provider(provider);
-        compacting.set_model(model.to_string());
-    }
+    compacting.set_provider(provider);
+    compacting.set_model(model.to_string());
 
     Ok(())
 }
@@ -1381,6 +1382,28 @@ mod tests {
             state.transcript.last(),
             Some(&super::app::TranscriptBlock::User("B".to_string()))
         );
+    }
+
+    #[test]
+    fn compact_done_advances_exactly_one_queued_prompt() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.phase = super::app::Phase::Compacting;
+        state.enqueue_prompt("B".to_string());
+        state.enqueue_prompt("C".to_string());
+
+        feed_agent_event(&mut state, AgentEvent::CompactDone, &input_tx);
+
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            UserInput::Prompt("B".to_string())
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "channel must hold at most one advanced prompt"
+        );
+        assert_eq!(state.pending_queue, vec!["C".to_string()]);
+        assert_eq!(state.phase, super::app::Phase::Busy);
     }
 
     #[test]
@@ -1875,7 +1898,7 @@ mod tests {
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,
@@ -1992,7 +2015,7 @@ mod tests {
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,
@@ -2062,7 +2085,7 @@ mod tests {
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,
@@ -2118,7 +2141,7 @@ mod tests {
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             history.clone(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,
@@ -2194,7 +2217,7 @@ mod tests {
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,
@@ -2258,7 +2281,7 @@ mod tests {
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,
@@ -2342,7 +2365,7 @@ mod tests {
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             history.clone(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,
@@ -2396,7 +2419,7 @@ mod tests {
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,
@@ -2464,7 +2487,7 @@ mod tests {
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             agent_history(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,
@@ -2556,7 +2579,7 @@ model = "zhipu/glm-5.2"
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
             history.clone(),
-            None,
+            assembled.compacting,
             task_config,
             input_rx,
             interrupt_rx,

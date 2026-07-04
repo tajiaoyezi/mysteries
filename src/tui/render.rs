@@ -18,6 +18,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use std::time::Instant;
 
 const STATUS_TOP_GAP_LINES: u16 = 2;
 const INPUT_PROMPT: &str = "> ";
@@ -1000,10 +1001,34 @@ fn diff_line(line: DiffLine, theme: &Theme) -> Line<'static> {
 }
 
 fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
-    let spans = activity_spans(state, theme);
+    let spans = activity_line_spans(state, theme, area.width, Instant::now());
     let paragraph = Paragraph::new(Line::from(spans))
         .style(Style::default().fg(theme.text_primary).bg(theme.bg_base));
     frame.render_widget(paragraph, area);
+}
+
+/// activity line 整行内容:左侧活动指示;复制 hint 在 TTL 内且宽度允许时
+/// 右对齐追加(以补白撑到行宽),宽度不足则整体让位、不截断左侧。
+fn activity_line_spans(
+    state: &AppState,
+    theme: &Theme,
+    width: u16,
+    now: Instant,
+) -> Vec<Span<'static>> {
+    let mut spans = activity_spans(state, theme);
+    let Some(hint) = state.active_copy_hint(now) else {
+        return spans;
+    };
+    let left: usize = spans.iter().map(|span| span.width()).sum();
+    let hint_width = display_width(hint);
+    let total = width as usize;
+    if left + 1 + hint_width > total {
+        return spans;
+    }
+    let base = Style::default().bg(theme.bg_base);
+    spans.push(Span::styled(" ".repeat(total - left - hint_width), base));
+    spans.push(Span::styled(hint.to_string(), base.fg(theme.text_muted)));
+    spans
 }
 
 fn queue_message_display(message: &str) -> String {
@@ -1079,6 +1104,11 @@ fn activity_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
             spans.extend(token_rate_spans(state, theme));
             spans
         }
+        // 压缩不可中断(v1),不提示 esc;spinner 由既有 120ms tick 驱动。
+        Phase::Compacting => vec![Span::styled(
+            format!("{} 压缩上下文…", state.spinner_glyph()),
+            base.fg(theme.accent_primary),
+        )],
     }
 }
 
@@ -1715,6 +1745,7 @@ mod tests {
                     || line.contains("执行 ")
                     || line.contains("等待授权")
                     || line.contains("处理…")
+                    || line.contains("压缩上下文")
                     || line.contains("↓ ")
                     || line.contains("t/s")
             })
@@ -2967,5 +2998,84 @@ mod tests {
 
         println!("\n--- activity token rates ---\n{text}--- end activity token rates ---");
         insta::assert_snapshot!("tui_activity_token_rates", text);
+    }
+
+    #[test]
+    fn activity_compacting_snapshot() {
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.phase = Phase::Compacting;
+        state.spinner_frame = 3;
+
+        let text = activity_line(&render_to_styled(&state, &theme));
+
+        println!("\n--- activity compacting ---\n{text}\n--- end activity compacting ---");
+        insta::assert_snapshot!("tui_activity_compacting", text);
+    }
+
+    #[test]
+    fn activity_copy_hint_snapshot() {
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.record_usage(
+            Usage {
+                input_tokens: 10,
+                output_tokens: 120,
+            },
+            Duration::from_secs(2),
+        );
+        state.apply(AgentEvent::TurnComplete);
+        state.set_copy_hint("已复制 35 字".to_string());
+
+        let text = activity_line(&render_to_styled(&state, &theme));
+
+        println!("\n--- activity copy hint ---\n{text}\n--- end activity copy hint ---");
+        insta::assert_snapshot!("tui_activity_copy_hint", text);
+    }
+
+    #[test]
+    fn activity_line_spans_hint_fills_width_then_expires_and_yields_when_narrow() {
+        use super::activity_line_spans;
+        use crate::tui::app::COPY_HINT_TTL;
+        use ratatui::text::Span;
+        use std::time::Instant;
+
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.set_copy_hint("已复制 5 字".to_string());
+        let now = Instant::now();
+
+        let joined = |spans: &[Span<'_>]| -> String {
+            spans.iter().map(|span| span.content.as_ref()).collect()
+        };
+
+        let with_hint = activity_line_spans(&state, &theme, 80, now);
+        let line = joined(&with_hint);
+        assert!(line.contains("已复制 5 字"), "fresh hint must render: {line}");
+        assert_eq!(
+            display_width(&line),
+            80,
+            "hint must be right-aligned by padding to the full width"
+        );
+
+        let expired = activity_line_spans(
+            &state,
+            &theme,
+            80,
+            now + COPY_HINT_TTL + Duration::from_millis(1),
+        );
+        let line = joined(&expired);
+        assert!(!line.contains("已复制"), "expired hint must vanish: {line}");
+
+        let narrow = activity_line_spans(&state, &theme, 12, now);
+        let line = joined(&narrow);
+        assert!(
+            !line.contains("已复制"),
+            "narrow width must drop the hint entirely: {line}"
+        );
+        assert!(
+            line.contains("就绪"),
+            "left activity content must stay intact when hint yields: {line}"
+        );
     }
 }

@@ -1,0 +1,5 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹accent.primary›⠸ 压缩上下文…‹/›

@@ -24,6 +24,8 @@ pub enum AgentEvent {
     PermissionRequired(PermissionRequest),
     Interrupted,
     TurnComplete,
+    /// 手动 /compact 完成(成功或失败均发):置回 Ready 并作为排队推进闸门事件。
+    CompactDone,
     Notice(String),
     Usage {
         input_tokens: u32,

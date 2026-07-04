@@ -1,4 +1,4 @@
-use crate::agent::context::{ContextStrategy, Passthrough};
+use crate::agent::context::ContextStrategy;
 use crate::agent::{Agent, Compacting, CompactionSettings};
 use crate::config::{self, Config, ConfigError, ProviderKind, RawConfig};
 use crate::credential::CredentialChain;
@@ -127,24 +127,23 @@ pub fn default_registry() -> ToolRegistry {
     registry
 }
 
-fn compaction_settings(config: &Config) -> Option<CompactionSettings> {
-    config
-        .model_context_window
-        .map(|window| CompactionSettings {
-            model_context_window: window,
-            compact_trigger_ratio: config.compact_trigger_ratio,
-            keep_recent_turns: config.keep_recent_turns,
-        })
+fn compaction_settings(config: &Config) -> CompactionSettings {
+    CompactionSettings {
+        model_context_window: config.model_context_window,
+        compact_trigger_ratio: config.compact_trigger_ratio,
+        keep_recent_turns: config.keep_recent_turns,
+    }
 }
 
-pub fn build_compacting(provider: Arc<dyn Provider>, config: &Config) -> Option<Compacting> {
-    compaction_settings(config)
-        .map(|settings| Compacting::new(provider, config.model.clone(), settings))
+/// 压缩默认启用:`model_context_window` 未配时,有效窗口由 `Compacting` 在
+/// 判定时按当前 model 解析(内置表 / 保守默认,见 `provider::model_meta`)。
+pub fn build_compacting(provider: Arc<dyn Provider>, config: &Config) -> Compacting {
+    Compacting::new(provider, config.model.clone(), compaction_settings(config))
 }
 
 pub struct AssembledAgent {
     pub agent: Agent,
-    pub compacting: Option<Compacting>,
+    pub compacting: Compacting,
 }
 
 pub fn assemble_agent(
@@ -153,14 +152,7 @@ pub fn assemble_agent(
     decider: Box<dyn PermissionDecider>,
 ) -> AssembledAgent {
     let compacting = build_compacting(provider.clone(), config);
-    let strategy: Box<dyn ContextStrategy> = match compaction_settings(config) {
-        Some(settings) => Box::new(Compacting::new(
-            provider.clone(),
-            config.model.clone(),
-            settings,
-        )),
-        None => Box::new(Passthrough),
-    };
+    let strategy: Box<dyn ContextStrategy> = Box::new(build_compacting(provider.clone(), config));
     let mut agent = Agent::new(
         provider,
         default_registry(),
@@ -527,33 +519,80 @@ kind = "mock"
         let recorded = provider.recorded_requests();
         assert_eq!(recorded[0].model, "configured-model");
         assert_eq!(recorded[0].tools.len(), 7);
-        assert!(assembled.compacting.is_none());
     }
 
     #[tokio::test]
-    async fn assemble_agent_installs_compacting_when_window_configured() {
-        let config = Config {
-            provider: ProviderConfig {
-                id: String::new(),
-                kind: ProviderKind::Mock,
-                base_url: None,
-                auth_type: AuthType::ApiKey,
+    async fn assemble_agent_compacts_by_default_and_respects_explicit_window() {
+        use crate::agent::context::ContextStrategy;
+        use crate::provider::Usage;
+
+        fn config_with_window(window: Option<u32>) -> Config {
+            Config {
+                provider: ProviderConfig {
+                    id: String::new(),
+                    kind: ProviderKind::Mock,
+                    base_url: None,
+                    auth_type: AuthType::ApiKey,
+                },
+                model: "configured-model".to_string(),
+                max_iterations: 4,
+                timeout_secs: 30,
+                model_context_window: window,
+                compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
+                keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
+            }
+        }
+        let history = vec![
+            Message::System("sys".to_string()),
+            Message::User("one".to_string()),
+            Message::Assistant {
+                text: "r1".to_string(),
+                tool_calls: Vec::new(),
             },
-            model: "configured-model".to_string(),
-            max_iterations: 4,
-            timeout_secs: 30,
-            model_context_window: Some(128_000),
-            compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
-            keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
+            Message::User("two".to_string()),
+            Message::Assistant {
+                text: "r2".to_string(),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let usage = Usage {
+            input_tokens: 60_000,
+            output_tokens: 10,
         };
+
+        // 未配 window:未知 model 走保守默认 65_536,60k > 52_428(0.8 阈值)触发压缩。
         let provider = Arc::new(MockProvider::new(vec![ModelResponse {
-            text: "ok".to_string(),
+            text: "SUMMARY".to_string(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
         }]));
-        let assembled = assemble_agent(provider, &config, Box::new(AllowAll));
+        let assembled = assemble_agent(provider, &config_with_window(None), Box::new(AllowAll));
+        let compacted = assembled
+            .compacting
+            .prepare(&history, Some(&usage))
+            .await
+            .expect("prepare should succeed");
+        assert_ne!(
+            compacted, history,
+            "without configured window compaction must still trigger via default window"
+        );
 
-        assert!(assembled.compacting.is_some());
+        // 显式 128k:同一 usage 不触发(60k < 102_400),原样返回。
+        let provider = Arc::new(MockProvider::new(Vec::new()));
+        let assembled = assemble_agent(
+            provider,
+            &config_with_window(Some(128_000)),
+            Box::new(AllowAll),
+        );
+        let unchanged = assembled
+            .compacting
+            .prepare(&history, Some(&usage))
+            .await
+            .expect("prepare should succeed");
+        assert_eq!(
+            unchanged, history,
+            "explicit 128k window must not trigger at 60k input tokens"
+        );
     }
 }
