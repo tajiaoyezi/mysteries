@@ -6,7 +6,7 @@
 
 ## What Changes
 
-1. **展开态 diff 体**:write_file / edit_file 卡片在头行与 output 行之间渲染着色 diff(复用 `compute_diff`:`Del` 红 `− ` / `Add` 绿 `+ `,`│ ` 边框前缀、`bg.base` 底、超宽折行);diff 逻辑行数上限 `DIFF_MAX_ROWS = 24`,超出渲尾行 `⋯ 其余 N 行`。这两个工具展开态头行 args 改用既有 preview(`path=...`),不再整段 JSON(内容由 diff 体承载)。
+1. **展开态 diff 体**:write_file / edit_file 卡片在头行与 output 行之间渲染着色 diff(复用 `compute_diff`:`Del` 红 `− ` / `Add` 绿 `+ `,`│ ` 边框前缀、`bg.base` 底、超宽折行,内容宽 = 整行宽 − 4);**屏行预算** `DIFF_MAX_ROWS = 24`(按折行后显示行计,minified 单行大文件同样被截住),超出渲尾行 `⋯ 其余 N 行`。这两个工具展开态头行 args 无条件改用既有 preview(`path=...`),不再整段 JSON(内容由 diff 体承载)。
 2. **折叠态计数**:`Done` 且 diff 非空的 edit/write 摘要显示 ` · +A −D ⌄`(各自着色,为 0 的一侧省略),替代 ` · N 行 ⌄`;`Running` / `Error` 折叠摘要维持既有(不显计数,防误读为已应用)。
 3. **零外溢**:权限框 diff 渲染、`compute_diff` 语义、其他工具卡行为全部不变。
 
