@@ -24,6 +24,8 @@ const STATUS_TOP_GAP_LINES: u16 = 2;
 const INPUT_PROMPT: &str = "> ";
 const INPUT_MAX_CONTENT_ROWS: u16 = 10;
 pub(crate) const QUEUE_MAX_ROWS: usize = 5;
+const DIFF_MAX_ROWS: usize = 24;
+const DIFF_COLLAPSED_MAX_ROWS: usize = 8;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     let area = frame.area();
@@ -476,6 +478,72 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     lines
 }
 
+fn diff_body_lines(
+    diff: &[DiffLine],
+    theme: &Theme,
+    width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    if diff.is_empty() {
+        return Vec::new();
+    }
+
+    let content_width = width.saturating_sub(4).max(1);
+    let prefix_style = Style::default().fg(theme.border_subtle).bg(theme.bg_base);
+    let muted_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+    let mut lines = Vec::new();
+    let mut screen_rows = 0;
+
+    for (line_index, line) in diff.iter().enumerate() {
+        let (marker, color) = match line.kind {
+            DiffKind::Add => ("+ ", theme.success_fg),
+            DiffKind::Del => ("− ", theme.error_fg),
+            DiffKind::Ctx => ("  ", theme.text_body),
+        };
+        let body_style = Style::default().fg(color).bg(theme.bg_base);
+        let wrapped = wrap_text(&line.text, content_width);
+        let wrapped = if wrapped.is_empty() {
+            vec![String::new()]
+        } else {
+            wrapped
+        };
+
+        for (chunk_index, chunk) in wrapped.iter().enumerate() {
+            if screen_rows == max_rows {
+                let remaining = diff.len() - line_index;
+                lines.push(diff_tail_line(remaining, prefix_style, muted_style));
+                return lines;
+            }
+
+            let line_marker = if chunk_index == 0 { marker } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled("│ ", prefix_style),
+                Span::styled(line_marker, body_style),
+                Span::styled(chunk.clone(), body_style),
+            ]));
+            screen_rows += 1;
+
+            if screen_rows == max_rows {
+                let line_complete = chunk_index + 1 == wrapped.len();
+                let remaining = diff.len() - line_index - usize::from(line_complete);
+                if remaining > 0 {
+                    lines.push(diff_tail_line(remaining, prefix_style, muted_style));
+                }
+                return lines;
+            }
+        }
+    }
+
+    lines
+}
+
+fn diff_tail_line(remaining: usize, prefix_style: Style, muted_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("│ ", prefix_style),
+        Span::styled(format!("⋯ 其余 {remaining} 行"), muted_style),
+    ])
+}
+
 fn block_top_border(
     title: &str,
     width: usize,
@@ -685,19 +753,30 @@ fn tool_card_lines(
     width: usize,
     is_group_first: bool,
 ) -> Vec<Line<'static>> {
-    let args = if state.tools_expanded {
+    let args = if state.tools_expanded && matches!(card.name.as_str(), "write_file" | "edit_file") {
+        tool_args_preview(&card.name, &card.args)
+    } else if state.tools_expanded {
         card.args.to_string()
     } else {
         tool_args_preview(&card.name, &card.args)
     };
     let collapsed = !state.tools_expanded;
     let mut head = tool_card_head(card, state, theme, args, collapsed);
+    let diff = compute_diff(&card.name, &card.args);
     if collapsed {
         head.extend(collapsed_tool_summary(card, theme, width, is_group_first));
-        return vec![Line::from(head)];
+        let mut lines = vec![Line::from(head)];
+        lines.extend(diff_body_lines(
+            &diff,
+            theme,
+            width,
+            DIFF_COLLAPSED_MAX_ROWS,
+        ));
+        return lines;
     }
 
     let mut lines = vec![Line::from(head)];
+    lines.extend(diff_body_lines(&diff, theme, width, DIFF_MAX_ROWS));
 
     match &card.output {
         Some(output) if output.is_empty() => lines.push(tool_output_line("", theme)),
@@ -812,12 +891,17 @@ fn collapsed_tool_summary(
             Style::default().fg(color).bg(theme.bg_base),
         )]
     } else {
-        match &card.output {
-            Some(output) if !output.is_empty() => {
-                let line_count = visible_tool_output_lines(card, output, width).len();
-                vec![Span::styled(format!(" · {line_count} 行 ⌄"), secondary)]
+        let diff = compute_diff(&card.name, &card.args);
+        if matches!(card.status, ToolCardStatus::Done) && !diff.is_empty() {
+            collapsed_diff_summary_spans(&diff, theme).unwrap_or_default()
+        } else {
+            match &card.output {
+                Some(output) if !output.is_empty() => {
+                    let line_count = visible_tool_output_lines(card, output, width).len();
+                    vec![Span::styled(format!(" · {line_count} 行 ⌄"), secondary)]
+                }
+                _ => Vec::new(),
             }
-            _ => Vec::new(),
         }
     };
 
@@ -825,6 +909,42 @@ fn collapsed_tool_summary(
         spans.push(Span::styled(" · ctrl+o 展开", muted));
     }
     spans
+}
+
+fn collapsed_diff_summary_spans(diff: &[DiffLine], theme: &Theme) -> Option<Vec<Span<'static>>> {
+    let mut adds = 0;
+    let mut dels = 0;
+    for line in diff {
+        match &line.kind {
+            DiffKind::Add => adds += 1,
+            DiffKind::Del => dels += 1,
+            DiffKind::Ctx => {}
+        }
+    }
+
+    if adds == 0 && dels == 0 {
+        return None;
+    }
+
+    let secondary = Style::default().fg(theme.text_secondary).bg(theme.bg_base);
+    let mut spans = vec![Span::styled(" · ", secondary)];
+    if adds > 0 {
+        spans.push(Span::styled(
+            format!("+{adds}"),
+            Style::default().fg(theme.success_fg).bg(theme.bg_base),
+        ));
+    }
+    if adds > 0 && dels > 0 {
+        spans.push(Span::styled(" ", secondary));
+    }
+    if dels > 0 {
+        spans.push(Span::styled(
+            format!("−{dels}"),
+            Style::default().fg(theme.error_fg).bg(theme.bg_base),
+        ));
+    }
+    spans.push(Span::styled(" ⌄", secondary));
+    Some(spans)
 }
 
 fn tool_args_preview(tool_name: &str, args: &serde_json::Value) -> String {
@@ -1552,17 +1672,38 @@ fn input_cursor_position(area: Rect, layout: &InputVisualLayout, scroll_offset: 
     Position::new(x, y)
 }
 
+pub fn bubble_sort<T: PartialOrd>(slice: &mut [T]) {
+    let len = slice.len();
+    if len <= 1 {
+        return;
+    }
+    for i in 0..len {
+        let mut swapped = false;
+        for j in 0..len - 1 - i {
+            if slice[j] > slice[j + 1] {
+                slice.swap(j, j + 1);
+                swapped = true;
+            }
+        }
+        if !swapped {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        display_cursor, expand_for_display, fold_label, render, selection_text,
-        transcript_line_count,
+        collapsed_tool_summary, diff_body_lines, display_cursor, expand_for_display, fold_label,
+        render, selection_text, tool_card_lines, transcript_line_count, DIFF_COLLAPSED_MAX_ROWS,
+        DIFF_MAX_ROWS,
     };
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::PermissionMode;
     use crate::provider::Usage;
     use crate::tui::app::{
-        AppState, ModelsPicker, Phase, SessionSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
+        AppState, DiffKind, DiffLine, ModelsPicker, Phase, SessionSnapshot, ToolCard,
+        ToolCardStatus, TranscriptBlock,
     };
     use crate::tui::channel::{AgentEvent, PermissionRequest};
     use crate::tui::selection::{Point, Selection, SelectionState};
@@ -2102,6 +2243,267 @@ mod tests {
         }
     }
 
+    fn diff_fixture(kind: DiffKind, text: impl Into<String>) -> DiffLine {
+        DiffLine {
+            kind,
+            text: text.into(),
+        }
+    }
+
+    fn tool_card_with_args(
+        name: &str,
+        status: ToolCardStatus,
+        args: serde_json::Value,
+        output: Option<&str>,
+    ) -> ToolCard {
+        ToolCard {
+            id: format!("{name}-diff"),
+            name: name.to_string(),
+            args,
+            readonly: false,
+            status,
+            output: output.map(str::to_string),
+            truncated: false,
+            exit: None,
+        }
+    }
+
+    fn spans_plain(spans: &[ratatui::text::Span<'_>]) -> String {
+        spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn diff_body_lines_caps_by_screen_rows() {
+        let theme = Theme::midnight();
+        let exact = (1..=DIFF_MAX_ROWS)
+            .map(|n| diff_fixture(DiffKind::Add, format!("line {n}")))
+            .collect::<Vec<_>>();
+        let exact_lines = diff_body_lines(&exact, &theme, 32, DIFF_MAX_ROWS);
+        assert_eq!(exact_lines.len(), DIFF_MAX_ROWS);
+        assert!(!exact_lines
+            .iter()
+            .any(|line| line_plain(line).contains("⋯ 其余")));
+
+        let over = (1..=DIFF_MAX_ROWS + 1)
+            .map(|n| diff_fixture(DiffKind::Add, format!("line {n}")))
+            .collect::<Vec<_>>();
+        let over_lines = diff_body_lines(&over, &theme, 32, DIFF_MAX_ROWS);
+        assert_eq!(over_lines.len(), DIFF_MAX_ROWS + 1);
+        assert_eq!(line_plain(over_lines.last().unwrap()), "│ ⋯ 其余 1 行");
+    }
+
+    #[test]
+    fn diff_body_lines_truncates_single_long_line_mid_wrap() {
+        let theme = Theme::midnight();
+        let diff = vec![diff_fixture(DiffKind::Add, "x".repeat(120))];
+        let lines = diff_body_lines(&diff, &theme, 8, DIFF_MAX_ROWS);
+
+        assert_eq!(lines.len(), DIFF_MAX_ROWS + 1);
+        assert_eq!(line_plain(lines.last().unwrap()), "│ ⋯ 其余 1 行");
+        assert!(lines[..DIFF_MAX_ROWS]
+            .iter()
+            .all(|line| display_width(&line_plain(line)) <= 8));
+    }
+
+    #[test]
+    fn diff_body_lines_wraps_continuations_without_repeating_marker() {
+        let theme = Theme::midnight();
+        let diff = vec![diff_fixture(DiffKind::Add, "中文abcdef中文")];
+        let lines = diff_body_lines(&diff, &theme, 10, DIFF_MAX_ROWS);
+        let rendered = lines.iter().map(line_plain).collect::<Vec<_>>();
+
+        assert!(rendered.len() > 1);
+        assert!(rendered[0].starts_with("│ + "));
+        assert!(rendered[1].starts_with("│   "));
+        assert!(!rendered[1].contains("+ "));
+        assert!(rendered.iter().all(|line| display_width(line) <= 10));
+    }
+
+    #[test]
+    fn diff_body_lines_empty_diff_returns_no_lines() {
+        let theme = Theme::midnight();
+
+        assert!(diff_body_lines(&[], &theme, 80, DIFF_MAX_ROWS).is_empty());
+    }
+
+    #[test]
+    fn collapsed_diff_summary_counts_done_only_and_omits_zero_sides() {
+        let theme = Theme::midnight();
+        let done_edit = tool_card_with_args(
+            "edit_file",
+            ToolCardStatus::Done,
+            json!({
+                "path": "note.txt",
+                "old_string": "old one\nold two",
+                "new_string": "new one\nnew two\nnew three"
+            }),
+            Some("ok"),
+        );
+        let add_only = tool_card_with_args(
+            "write_file",
+            ToolCardStatus::Done,
+            json!({
+                "path": "note.txt",
+                "content": (1..=12).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n")
+            }),
+            Some("ok"),
+        );
+        let del_only = tool_card_with_args(
+            "edit_file",
+            ToolCardStatus::Done,
+            json!({
+                "path": "note.txt",
+                "old_string": "old one\nold two",
+                "new_string": ""
+            }),
+            Some("ok"),
+        );
+        let running = tool_card_with_args(
+            "edit_file",
+            ToolCardStatus::Running,
+            done_edit.args.clone(),
+            None,
+        );
+        let error = tool_card_with_args(
+            "edit_file",
+            ToolCardStatus::Error,
+            done_edit.args.clone(),
+            Some("line one\nline two"),
+        );
+
+        assert_eq!(
+            spans_plain(&collapsed_tool_summary(&done_edit, &theme, 80, false)),
+            " · +3 −2 ⌄"
+        );
+        assert_eq!(
+            spans_plain(&collapsed_tool_summary(&add_only, &theme, 80, false)),
+            " · +12 ⌄"
+        );
+        assert_eq!(
+            spans_plain(&collapsed_tool_summary(&del_only, &theme, 80, false)),
+            " · −2 ⌄"
+        );
+        assert_eq!(
+            spans_plain(&collapsed_tool_summary(&running, &theme, 80, false)),
+            " · 运行中…"
+        );
+        assert_eq!(
+            spans_plain(&collapsed_tool_summary(&error, &theme, 80, false)),
+            " · 2 行 ⌄"
+        );
+    }
+
+    #[test]
+    fn empty_diff_tool_card_preserves_collapsed_output_summary() {
+        let theme = Theme::midnight();
+        let card = tool_card_with_args(
+            "write_file",
+            ToolCardStatus::Done,
+            json!({ "path": "note.txt" }),
+            Some("line one\nline two"),
+        );
+
+        assert!(diff_body_lines(&[], &theme, 80, DIFF_MAX_ROWS).is_empty());
+        assert_eq!(
+            spans_plain(&collapsed_tool_summary(&card, &theme, 80, false)),
+            " · 2 行 ⌄"
+        );
+    }
+
+    #[test]
+    fn collapsed_diff_body_uses_collapsed_row_budget() {
+        let theme = Theme::midnight();
+        let state = AppState::new();
+        let card = tool_card_with_args(
+            "write_file",
+            ToolCardStatus::Done,
+            json!({
+                "path": "note.txt",
+                "content": (1..=12).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n")
+            }),
+            Some("hidden output"),
+        );
+
+        let lines = tool_card_lines(&card, &state, &theme, 80, false);
+        let plain = lines.iter().map(line_plain).collect::<Vec<_>>();
+
+        assert_eq!(plain.len(), 1 + DIFF_COLLAPSED_MAX_ROWS + 1);
+        assert!(plain[0].contains(" · +12 ⌄"));
+        assert!(plain[1].starts_with("│ + line 1"));
+        assert!(plain[DIFF_COLLAPSED_MAX_ROWS].starts_with("│ + line 8"));
+        assert_eq!(
+            plain[DIFF_COLLAPSED_MAX_ROWS + 1],
+            "│ ⋯ 其余 4 行"
+        );
+        assert!(!plain.iter().any(|line| line.contains("hidden output")));
+        assert!(!plain.iter().any(|line| line.contains("┌─") || line.contains("└─")));
+    }
+
+    #[test]
+    fn collapsed_running_and_error_cards_still_render_diff_body() {
+        let theme = Theme::midnight();
+        let state = AppState::new();
+        let args = json!({
+            "path": "note.txt",
+            "old_string": "old one\nold two",
+            "new_string": "new one\nnew two"
+        });
+        let running = tool_card_with_args("edit_file", ToolCardStatus::Running, args.clone(), None);
+        let error = tool_card_with_args(
+            "edit_file",
+            ToolCardStatus::Error,
+            args,
+            Some("line one\nline two"),
+        );
+
+        let running_plain = tool_card_lines(&running, &state, &theme, 80, false)
+            .iter()
+            .map(line_plain)
+            .collect::<Vec<_>>();
+        let error_plain = tool_card_lines(&error, &state, &theme, 80, false)
+            .iter()
+            .map(line_plain)
+            .collect::<Vec<_>>();
+
+        assert!(running_plain[0].contains(" · 运行中…"));
+        assert!(running_plain.iter().any(|line| line.starts_with("│ − old one")));
+        assert!(running_plain.iter().any(|line| line.starts_with("│ + new one")));
+        assert!(error_plain[0].contains(" · 2 行 ⌄"));
+        assert!(error_plain.iter().any(|line| line.starts_with("│ − old one")));
+        assert!(error_plain.iter().any(|line| line.starts_with("│ + new one")));
+    }
+
+    #[test]
+    fn collapsed_non_diff_and_empty_diff_cards_remain_single_line() {
+        let theme = Theme::midnight();
+        let state = AppState::new();
+        let read = tool_card_with_args(
+            "read_file",
+            ToolCardStatus::Done,
+            json!({ "path": "note.txt" }),
+            Some("line one\nline two"),
+        );
+        let empty_write = tool_card_with_args(
+            "write_file",
+            ToolCardStatus::Done,
+            json!({ "path": "note.txt" }),
+            Some("line one\nline two"),
+        );
+
+        let read_lines = tool_card_lines(&read, &state, &theme, 80, false);
+        let write_lines = tool_card_lines(&empty_write, &state, &theme, 80, false);
+
+        assert_eq!(read_lines.len(), 1);
+        assert_eq!(write_lines.len(), 1);
+        assert_eq!(
+            spans_plain(&collapsed_tool_summary(&empty_write, &theme, 80, false)),
+            " · 2 行 ⌄"
+        );
+    }
+
     fn session() -> SessionSnapshot {
         SessionSnapshot {
             provider: "anthropic".to_string(),
@@ -2496,6 +2898,191 @@ mod tests {
             "\n--- tool card expanded done frame ---\n{text}\n--- end tool card expanded done frame ---"
         );
         insta::assert_snapshot!("tui_tool_card_expanded_done", text);
+    }
+
+    #[test]
+    fn tool_card_edit_diff_body_snapshot() {
+        let mut state = AppState::new();
+        state.tools_expanded = true;
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "edit_file",
+                ToolCardStatus::Done,
+                json!({
+                    "path": "src/config.rs",
+                    "old_string": "timeout = 10\nretries = 1",
+                    "new_string": "timeout = 30\nretries = 3"
+                }),
+                Some("edited src/config.rs"),
+            )));
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!("\n--- tool card edit diff frame ---\n{text}\n--- end ---");
+        insta::assert_snapshot!("tui_tool_card_edit_diff_body", text);
+    }
+
+    #[test]
+    fn tool_card_write_diff_body_snapshot() {
+        let mut state = AppState::new();
+        state.tools_expanded = true;
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "write_file",
+                ToolCardStatus::Done,
+                json!({
+                    "path": "src/new_config.rs",
+                    "content": "pub struct Config {\n    pub timeout_secs: u64,\n}"
+                }),
+                Some("created src/new_config.rs"),
+            )));
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!("\n--- tool card write diff frame ---\n{text}\n--- end ---");
+        insta::assert_snapshot!("tui_tool_card_write_diff_body", text);
+    }
+
+    #[test]
+    fn tool_card_collapsed_diff_counts_snapshot() {
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "edit_file",
+                ToolCardStatus::Done,
+                json!({
+                    "path": "src/config.rs",
+                    "old_string": "old one\nold two",
+                    "new_string": "new one\nnew two\nnew three"
+                }),
+                Some("edited"),
+            )));
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "write_file",
+                ToolCardStatus::Done,
+                json!({
+                    "path": "src/long.rs",
+                    "content": (1..=12).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n")
+                }),
+                Some("written"),
+            )));
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "edit_file",
+                ToolCardStatus::Done,
+                json!({
+                    "path": "src/remove.rs",
+                    "old_string": "remove one\nremove two",
+                    "new_string": ""
+                }),
+                Some("removed"),
+            )));
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 40);
+
+        println!("\n--- tool card collapsed diff counts frame ---\n{text}\n--- end ---");
+        insta::assert_snapshot!("tui_tool_card_collapsed_diff_counts", text);
+    }
+
+    #[test]
+    fn tool_card_diff_short_rows_truncated_snapshot() {
+        let mut state = AppState::new();
+        state.tools_expanded = true;
+        let content = (1..=30)
+            .map(|n| format!("short line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "write_file",
+                ToolCardStatus::Done,
+                json!({
+                    "path": "src/generated.rs",
+                    "content": content
+                }),
+                Some("created generated file"),
+            )));
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 40);
+
+        println!("\n--- tool card diff short rows truncated frame ---\n{text}\n--- end ---");
+        insta::assert_snapshot!("tui_tool_card_diff_short_rows_truncated", text);
+    }
+
+    #[test]
+    fn tool_card_diff_long_line_truncated_snapshot() {
+        let mut state = AppState::new();
+        state.tools_expanded = true;
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "write_file",
+                ToolCardStatus::Done,
+                json!({
+                    "path": "dist/app.min.js",
+                    "content": "x".repeat(1200)
+                }),
+                Some("created minified file"),
+            )));
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 40, 40);
+
+        println!("\n--- tool card diff long line truncated frame ---\n{text}\n--- end ---");
+        insta::assert_snapshot!("tui_tool_card_diff_long_line_truncated", text);
+    }
+
+    #[test]
+    fn tool_card_diff_cjk_wrap_narrow_snapshot() {
+        let mut state = AppState::new();
+        state.tools_expanded = true;
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "write_file",
+                ToolCardStatus::Done,
+                json!({
+                    "path": "docs/说明.md",
+                    "content": "第一段包含中文宽字符并且需要在窄视口中折行abcdef"
+                }),
+                Some("created docs/说明.md"),
+            )));
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 40, 24);
+
+        println!("\n--- tool card diff cjk wrap narrow frame ---\n{text}\n--- end ---");
+        insta::assert_snapshot!("tui_tool_card_diff_cjk_wrap_narrow", text);
+    }
+
+    #[test]
+    fn tool_card_diff_running_error_expanded_snapshot() {
+        let mut state = AppState::new();
+        state.tools_expanded = true;
+        let args = json!({
+            "path": "src/config.rs",
+            "old_string": "timeout = 10\nretries = 1",
+            "new_string": "timeout = 30\nretries = 3"
+        });
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "edit_file",
+                ToolCardStatus::Running,
+                args.clone(),
+                None,
+            )));
+        state
+            .transcript
+            .push(TranscriptBlock::Tool(tool_card_with_args(
+                "edit_file",
+                ToolCardStatus::Error,
+                args,
+                Some("failed to edit"),
+            )));
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 32);
+
+        println!("\n--- tool card diff running error expanded frame ---\n{text}\n--- end ---");
+        insta::assert_snapshot!("tui_tool_card_diff_running_error_expanded", text);
     }
 
     #[test]

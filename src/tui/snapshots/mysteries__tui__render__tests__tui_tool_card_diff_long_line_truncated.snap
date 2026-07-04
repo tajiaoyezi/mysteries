@@ -1,0 +1,44 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────‹/›
+‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› path=dist/app.min.js‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹success.fg›  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx‹/›
+‹border.subtle›│ ‹/›‹text.muted›⋯ 其余 1 行‹/›
+‹border.subtle›│ ‹/›‹text.body›created minified file‹/›
+‹border.subtle›└───────────────────────────────────────‹/›
+
+
+
+‹text.muted›◇ 就绪‹/›
+‹border.subtle›┌──────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›             ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs ·‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

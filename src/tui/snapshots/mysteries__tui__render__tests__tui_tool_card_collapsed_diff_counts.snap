@@ -1,0 +1,44 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›edit_file‹/›‹text.muted› path=src/config.rs‹/›‹text.secondary› · ‹/›‹success.fg›+3‹/›‹text.secondary› ‹/›‹error.fg›−2‹/›‹text.secondary› ⌄‹/›‹text.muted› · ctrl+o 展开‹/›
+‹border.subtle›│ ‹/›‹error.fg›− old one‹/›
+‹border.subtle›│ ‹/›‹error.fg›− old two‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ new one‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ new two‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ new three‹/›
+‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› path=src/long.rs‹/›‹text.secondary› · ‹/›‹success.fg›+12‹/›‹text.secondary› ⌄‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ line 1‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ line 2‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ line 3‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ line 4‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ line 5‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ line 6‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ line 7‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ line 8‹/›
+‹border.subtle›│ ‹/›‹text.muted›⋯ 其余 4 行‹/›
+‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›edit_file‹/›‹text.muted› path=src/remove.rs‹/›‹text.secondary› · ‹/›‹error.fg›−2‹/›‹text.secondary› ⌄‹/›
+‹border.subtle›│ ‹/›‹error.fg›− remove one‹/›
+‹border.subtle›│ ‹/›‹error.fg›− remove two‹/›
+
+
+
+
+
+
+
+
+
+
+
+
+‹text.muted›◇ 就绪‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

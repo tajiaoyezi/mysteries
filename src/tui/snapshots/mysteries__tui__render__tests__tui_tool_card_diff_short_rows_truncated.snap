@@ -1,0 +1,44 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› path=src/generated.rs‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 01‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 02‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 03‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 04‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 05‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 06‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 07‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 08‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 09‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 10‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 11‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 12‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 13‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 14‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 15‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 16‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 17‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 18‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 19‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 20‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 21‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 22‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 23‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ short line 24‹/›
+‹border.subtle›│ ‹/›‹text.muted›⋯ 其余 6 行‹/›
+‹border.subtle›│ ‹/›‹text.body›created generated file‹/›
+‹border.subtle›└───────────────────────────────────────────────────────────────────────────────‹/›
+
+
+
+‹text.muted›◇ 就绪‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

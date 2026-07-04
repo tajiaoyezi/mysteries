@@ -16,12 +16,12 @@
 
 - [x] 3.1 `cargo test --lib` 全绿;`cargo clippy --all-targets -- -D warnings` 零警告
 - [x] 3.2 `openspec validate add-diff-highlight --strict` 通过
-- [ ] 3.3 真机:edit/write 卡折叠见 `+A −D`、ctrl+o 展开见着色 diff、写 minified 单行大文件时 diff 体止于 24 屏行(主 agent / 用户执行)
+- [x] 3.3 真机:edit/write 卡折叠见 `+A −D`、ctrl+o 展开见着色 diff(用户截图证实:`+21 −2 ⌄` 计数、展开红绿 diff、头行 preview 化);minified 单行未真机单验,由快照 `tui_tool_card_diff_long_line_truncated` 与同一截断 machinery(真机已验 8+15)覆盖
 
 ## 4. 真机反馈修订:diff 恒显、与 tools_expanded 解耦(D6)
 
-- [ ] 4.1 实现:`tool_card_lines` 折叠分支在单行头之后追加 diff 体(仅 write/edit 且 diff 非空);屏行预算参数化——折叠 `DIFF_COLLAPSED_MAX_ROWS = 8` / 展开 `DIFF_MAX_ROWS = 24`(均具名常量,`diff_body_lines` 增 max_rows 参数);折叠态仍不渲 output / 脚 / `┌─└─` 边框,diff 行保留 `│ ` 前缀
-- [ ] 4.2 单测:折叠配额截断(12 行 → 8 + `⋯ 其余 4 行`)、折叠 `Running` / `Error` 亦渲 diff 体、非 write/edit 与空 diff 折叠卡行集零变化(仍单行)
-- [ ] 4.3 快照:更新 `tui_tool_card_collapsed_diff_counts`(体现折叠 diff 体 + 12 行卡截断到 8);churn 判据更新为「change 前既有 .snap 仅 `tui_tool_card_expanded_done` 修改;本 change 内新增 .snap 可更新」;`git status --short` 原文贴报告
-- [ ] 4.4 门禁:`cargo test --lib` 全绿、`cargo clippy --all-targets -- -D warnings` 零警告、`openspec validate add-diff-highlight --strict`
-- [ ] 4.5 真机:默认折叠即见 diff(5 行全显、12 行截断到 8 + 尾行)、ctrl+o 展开配额 24、read/run_shell 默认仍单行(主 agent / 用户执行)
+- [x] 4.1 实现:`tool_card_lines` 折叠分支在单行头之后追加 diff 体(仅 write/edit 且 diff 非空);屏行预算参数化——折叠 `DIFF_COLLAPSED_MAX_ROWS = 8` / 展开 `DIFF_MAX_ROWS = 24`(均具名常量,`diff_body_lines` 增 max_rows 参数);折叠态仍不渲 output / 脚 / `┌─└─` 边框,diff 行保留 `│ ` 前缀
+- [x] 4.2 单测:折叠配额截断(12 行 → 8 + `⋯ 其余 4 行`)、折叠 `Running` / `Error` 亦渲 diff 体、非 write/edit 与空 diff 折叠卡行集零变化(仍单行)
+- [x] 4.3 快照:更新 `tui_tool_card_collapsed_diff_counts`(体现折叠 diff 体 + 12 行卡截断到 8);churn 判据更新为「change 前既有 .snap 仅 `tui_tool_card_expanded_done` 修改;本 change 内新增 .snap 可更新」;`git status --short` 原文贴报告
+- [x] 4.4 门禁:`cargo test --lib` 全绿、`cargo clippy --all-targets -- -D warnings` 零警告、`openspec validate add-diff-highlight --strict`
+- [x] 4.5 真机:默认折叠即见 diff、ctrl+o 展开配额 24、read/run_shell 默认仍单行(用户截图证实:折叠态 diff 体 + `⋯ 其余 15 行`(23 条 = 配额 8 + 其余 15,严丝合缝)、read/glob/grep/run_shell 均单行摘要)

@@ -1,0 +1,36 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹border.subtle›┌─ ‹/›‹accent.primary›⠋‹/›‹text.muted› ‹/›‹accent.primary +bold›edit_file‹/›‹text.muted› path=src/config.rs‹/›
+‹border.subtle›│ ‹/›‹error.fg›− timeout = 10‹/›
+‹border.subtle›│ ‹/›‹error.fg›− retries = 1‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ timeout = 30‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ retries = 3‹/›
+‹border.subtle›│ ‹/›‹text.body›运行中…‹/›
+‹border.subtle›└───────────────────────────────────────────────────────────────────────────────‹/›
+‹border.subtle›┌─ ‹/›‹error.fg›✗‹/›‹text.muted› ‹/›‹accent.primary +bold›edit_file‹/›‹text.muted› path=src/config.rs‹/›
+‹border.subtle›│ ‹/›‹error.fg›− timeout = 10‹/›
+‹border.subtle›│ ‹/›‹error.fg›− retries = 1‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ timeout = 30‹/›
+‹border.subtle›│ ‹/›‹success.fg›+ retries = 3‹/›
+‹border.subtle›│ ‹/›‹text.body›failed to edit‹/›
+‹border.subtle›└───────────────────────────────────────────────────────────────────────────────‹/›
+
+
+
+
+
+
+
+
+
+‹text.muted›◇ 就绪‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›
