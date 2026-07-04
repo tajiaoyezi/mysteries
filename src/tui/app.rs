@@ -6,6 +6,7 @@ use crate::provider::registry::models_for;
 use crate::provider::Usage;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
 use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
+use crate::tui::input_batch::{PasteTailMatcher, TailAction};
 use crate::tui::input_buffer::{reduce_input_buffer, InputBufferAction, InputBufferState};
 use crate::tui::jump_to_bottom::{bump_new_message_count, new_message_count_on_follow_bottom};
 use crate::tui::selection::{reduce_selection, SelectionAction, SelectionState};
@@ -385,11 +386,18 @@ pub fn estimate_streaming_rate_tps(chars: u32, elapsed: Duration) -> Option<f64>
 /// 复制成功轻提示的存续时长(activity line 右侧;过期由渲染侧按 TTL 过滤,
 /// 重绘由既有 120ms tick 驱动,不另设定时器)。
 pub const COPY_HINT_TTL: Duration = Duration::from_secs(4);
+pub const PASTE_TAIL_QUIET_FALLBACK: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CopyHint {
     pub text: String,
     pub set_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct PasteTailState {
+    pub matcher: PasteTailMatcher,
+    pub last_key_at: Instant,
 }
 
 pub struct AppState {
@@ -423,6 +431,8 @@ pub struct AppState {
     /// 最近一次「第 1 次取消键」时刻;Task 4 时间窗两级取消用。
     last_cancel_at: Option<Instant>,
     copy_hint: Option<CopyHint>,
+    pub paste_tail: Option<PasteTailState>,
+    paste_receiving_hint: bool,
 }
 
 impl AppState {
@@ -472,6 +482,8 @@ impl AppState {
             pending_queue: Vec::new(),
             last_cancel_at: None,
             copy_hint: None,
+            paste_tail: None,
+            paste_receiving_hint: false,
         }
     }
 
@@ -523,6 +535,48 @@ impl AppState {
         self.copy_hint.as_ref().and_then(|hint| {
             (now.duration_since(hint.set_at) < COPY_HINT_TTL).then_some(hint.text.as_str())
         })
+    }
+
+    pub fn set_paste_tail(&mut self, matcher: PasteTailMatcher, now: Instant) {
+        self.paste_tail = Some(PasteTailState {
+            matcher,
+            last_key_at: now,
+        });
+    }
+
+    pub fn paste_tail_active(&self) -> bool {
+        self.paste_tail.is_some()
+    }
+
+    pub fn set_paste_receiving_hint(&mut self, active: bool) {
+        self.paste_receiving_hint = active;
+    }
+
+    pub fn paste_receiving_hint_active(&self) -> bool {
+        self.paste_receiving_hint
+    }
+
+    pub fn clear_paste_tail(&mut self) {
+        self.paste_tail = None;
+    }
+
+    pub fn record_paste_tail_action(&mut self, action: TailAction, now: Instant) {
+        if action == TailAction::Drop {
+            if let Some(tail) = self.paste_tail.as_mut() {
+                tail.last_key_at = now;
+            }
+        }
+    }
+
+    pub fn expire_paste_tail(&mut self, now: Instant) -> bool {
+        let Some(tail) = self.paste_tail.as_ref() else {
+            return false;
+        };
+        if now.saturating_duration_since(tail.last_key_at) >= PASTE_TAIL_QUIET_FALLBACK {
+            self.clear_paste_tail();
+            return true;
+        }
+        false
     }
 
     pub fn follows_bottom(&self) -> bool {
@@ -1127,8 +1181,7 @@ impl AppState {
                     self.reset_turn_token_usage();
                     self.iteration = 0;
                     self.phase = Phase::Busy;
-                    self.transcript
-                        .push(TranscriptBlock::User(prompt.clone()));
+                    self.transcript.push(TranscriptBlock::User(prompt.clone()));
                     let _ = input_tx.send(UserInput::Prompt(prompt));
                 } else {
                     self.enqueue_prompt(prompt);
@@ -1311,7 +1364,7 @@ mod tests {
     use super::{
         build_rows, compute_diff, estimate_streaming_rate_tps, estimate_tokens_from_chars,
         AppState, DiffKind, DiffLine, ModelsPicker, ModelsPickerRowKind, Phase, SessionSnapshot,
-        StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
+        StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock, PASTE_TAIL_QUIET_FALLBACK,
     };
     use crate::agent::AgentStatus;
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
@@ -1320,12 +1373,13 @@ mod tests {
     use crate::tool::ToolOutcome;
     use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
     use crate::tui::command::Command;
+    use crate::tui::input_batch::{PasteTailMatcher, TailAction};
     use crate::tui::selection::{Point, SelectionAction};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::{mpsc, oneshot};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -3160,7 +3214,9 @@ mod tests {
         input_tx: &mpsc::UnboundedSender<UserInput>,
         interrupt_tx: &mpsc::UnboundedSender<UserInput>,
     ) {
-        use crate::tui::app::{apply_batch_input_key, flush_merged_input_chars, ApplyBatchKeyResult};
+        use crate::tui::app::{
+            apply_batch_input_key, flush_merged_input_chars, ApplyBatchKeyResult,
+        };
         use crate::tui::input_batch::classify_key_batch;
 
         let intents = classify_key_batch(keys);
@@ -3433,5 +3489,39 @@ mod tests {
             Some("已复制 9 字"),
             "a new copy must overwrite the previous hint"
         );
+    }
+
+    #[test]
+    fn paste_tail_set_clear_and_active_query() {
+        let now = Instant::now();
+        let mut state = AppState::new();
+
+        assert!(!state.paste_tail_active());
+        state.set_paste_tail(PasteTailMatcher::new("abc".to_string()), now);
+
+        assert!(state.paste_tail_active());
+        assert!(state.paste_tail.is_some());
+        state.clear_paste_tail();
+        assert!(!state.paste_tail_active());
+        assert!(state.paste_tail.is_none());
+    }
+
+    #[test]
+    fn paste_tail_expires_after_quiet_fallback_and_only_drop_refreshes_key_time() {
+        let now = Instant::now();
+        let mut state = AppState::new();
+        state.set_paste_tail(PasteTailMatcher::new("abc".to_string()), now);
+
+        state.record_paste_tail_action(TailAction::Forward, now + Duration::from_secs(1));
+        assert!(state.expire_paste_tail(now + PASTE_TAIL_QUIET_FALLBACK));
+        assert!(!state.paste_tail_active());
+
+        state.set_paste_tail(PasteTailMatcher::new("abc".to_string()), now);
+        state.record_paste_tail_action(TailAction::Drop, now + Duration::from_secs(1));
+
+        assert!(!state.expire_paste_tail(now + PASTE_TAIL_QUIET_FALLBACK));
+        assert!(state.paste_tail_active());
+        assert!(state.expire_paste_tail(now + Duration::from_secs(1) + PASTE_TAIL_QUIET_FALLBACK));
+        assert!(!state.paste_tail_active());
     }
 }

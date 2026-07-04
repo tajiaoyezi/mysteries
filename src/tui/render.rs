@@ -156,7 +156,11 @@ fn input_box_height(area: Rect, state: &AppState) -> u16 {
     let inner_width = area.width.saturating_sub(2) as usize;
     let layout_width = inner_width.saturating_sub(display_width(INPUT_PROMPT));
     let display = expand_for_display(&state.input_line);
-    let layout = visual_input_layout(&display.text, display_cursor(&state.input_line), layout_width);
+    let layout = visual_input_layout(
+        &display.text,
+        display_cursor(&state.input_line),
+        layout_width,
+    );
     let cap = input_content_height_cap(
         area.height,
         status_top_gap_height(state),
@@ -1154,7 +1158,9 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &
     frame.render_widget(paragraph, area);
 }
 
-/// activity line 整行内容:左侧活动指示;复制 hint 在 TTL 内且宽度允许时
+const PASTE_RECEIVING_HINT: &str = "⋯ 接收粘贴";
+
+/// activity line 整行内容:左侧活动指示;复制 hint / 粘贴接收 hint 在宽度允许时
 /// 右对齐追加(以补白撑到行宽),宽度不足则整体让位、不截断左侧。
 fn activity_line_spans(
     state: &AppState,
@@ -1163,7 +1169,11 @@ fn activity_line_spans(
     now: Instant,
 ) -> Vec<Span<'static>> {
     let mut spans = activity_spans(state, theme);
-    let Some(hint) = state.active_copy_hint(now) else {
+    let hint = state.active_copy_hint(now).or_else(|| {
+        (state.paste_tail_active() || state.paste_receiving_hint_active())
+            .then_some(PASTE_RECEIVING_HINT)
+    });
+    let Some(hint) = hint else {
         return spans;
     };
     let left: usize = spans.iter().map(|span| span.width()).sum();
@@ -1790,6 +1800,7 @@ mod tests {
         ToolCardStatus, TranscriptBlock,
     };
     use crate::tui::channel::{AgentEvent, PermissionRequest};
+    use crate::tui::input_batch::PasteTailMatcher;
     use crate::tui::input_buffer::PastedChunk;
     use crate::tui::selection::{Point, Selection, SelectionState};
     use crate::tui::theme::Theme;
@@ -1803,7 +1814,7 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::{mpsc, oneshot};
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1852,12 +1863,7 @@ mod tests {
         buffer_to_plain(terminal.backend().buffer())
     }
 
-    fn render_input_to_buffer(
-        state: &AppState,
-        theme: &Theme,
-        width: u16,
-        height: u16,
-    ) -> Buffer {
+    fn render_input_to_buffer(state: &AppState, theme: &Theme, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -2225,11 +2231,12 @@ mod tests {
         insta::assert_snapshot!("tui_multiline_input_dynamic_height_soft_wrap", output);
     }
 
-    fn press_char(state: &mut AppState, ch: char, tx: &mpsc::UnboundedSender<crate::tui::channel::UserInput>) {
-        state.on_key(
-            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
-            tx,
-        );
+    fn press_char(
+        state: &mut AppState,
+        ch: char,
+        tx: &mpsc::UnboundedSender<crate::tui::channel::UserInput>,
+    ) {
+        state.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), tx);
     }
 
     fn twenty_line_paste_text() -> String {
@@ -2257,7 +2264,10 @@ mod tests {
         assert!(display.ends_with(" after"));
         assert_eq!(
             display,
-            format!("before {} after", fold_label(state.input_line.pasted.values().next().unwrap()))
+            format!(
+                "before {} after",
+                fold_label(state.input_line.pasted.values().next().unwrap())
+            )
         );
     }
 
@@ -2274,8 +2284,20 @@ mod tests {
             display,
             format!(
                 "{}中{}",
-                fold_label(state.input_line.pasted.get(&char::from_u32(0xE000).unwrap()).unwrap()),
-                fold_label(state.input_line.pasted.get(&char::from_u32(0xE001).unwrap()).unwrap()),
+                fold_label(
+                    state
+                        .input_line
+                        .pasted
+                        .get(&char::from_u32(0xE000).unwrap())
+                        .unwrap()
+                ),
+                fold_label(
+                    state
+                        .input_line
+                        .pasted
+                        .get(&char::from_u32(0xE001).unwrap())
+                        .unwrap()
+                ),
             )
         );
         assert!(display.contains("#1"));
@@ -2299,14 +2321,8 @@ mod tests {
             line_count: 1,
         };
 
-        assert_eq!(
-            fold_label(&multiline_chunk),
-            "[Pasted text #1 +14 lines]"
-        );
-        assert_eq!(
-            fold_label(&single_line_chunk),
-            "[Pasted text #2 +5 chars]"
-        );
+        assert_eq!(fold_label(&multiline_chunk), "[Pasted text #1 +14 lines]");
+        assert_eq!(fold_label(&single_line_chunk), "[Pasted text #2 +5 chars]");
     }
 
     #[test]
@@ -2865,12 +2881,11 @@ mod tests {
         assert!(plain[0].contains(" · +12 ⌄"));
         assert!(plain[1].starts_with("│ + line 1"));
         assert!(plain[DIFF_COLLAPSED_MAX_ROWS].starts_with("│ + line 8"));
-        assert_eq!(
-            plain[DIFF_COLLAPSED_MAX_ROWS + 1],
-            "│ ⋯ 其余 4 行"
-        );
+        assert_eq!(plain[DIFF_COLLAPSED_MAX_ROWS + 1], "│ ⋯ 其余 4 行");
         assert!(!plain.iter().any(|line| line.contains("hidden output")));
-        assert!(!plain.iter().any(|line| line.contains("┌─") || line.contains("└─")));
+        assert!(!plain
+            .iter()
+            .any(|line| line.contains("┌─") || line.contains("└─")));
     }
 
     #[test]
@@ -2900,11 +2915,19 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(running_plain[0].contains(" · 运行中…"));
-        assert!(running_plain.iter().any(|line| line.starts_with("│ − old one")));
-        assert!(running_plain.iter().any(|line| line.starts_with("│ + new one")));
+        assert!(running_plain
+            .iter()
+            .any(|line| line.starts_with("│ − old one")));
+        assert!(running_plain
+            .iter()
+            .any(|line| line.starts_with("│ + new one")));
         assert!(error_plain[0].contains(" · 2 行 ⌄"));
-        assert!(error_plain.iter().any(|line| line.starts_with("│ − old one")));
-        assert!(error_plain.iter().any(|line| line.starts_with("│ + new one")));
+        assert!(error_plain
+            .iter()
+            .any(|line| line.starts_with("│ − old one")));
+        assert!(error_plain
+            .iter()
+            .any(|line| line.starts_with("│ + new one")));
     }
 
     #[test]
@@ -3044,8 +3067,13 @@ mod tests {
         }
 
         let cap_without = input_content_height_cap(24, 2, 0, super::INPUT_MAX_CONTENT_ROWS, 0);
-        let cap_with =
-            input_content_height_cap(24, 2, 0, super::INPUT_MAX_CONTENT_ROWS, QUEUE_MAX_ROWS as u16);
+        let cap_with = input_content_height_cap(
+            24,
+            2,
+            0,
+            super::INPUT_MAX_CONTENT_ROWS,
+            QUEUE_MAX_ROWS as u16,
+        );
         assert!(cap_with < cap_without);
         assert_eq!(cap_with, cap_without.saturating_sub(QUEUE_MAX_ROWS as u16));
 
@@ -4052,6 +4080,20 @@ mod tests {
     }
 
     #[test]
+    fn activity_paste_receiving_snapshot() {
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.set_paste_tail(PasteTailMatcher::new("abc".to_string()), Instant::now());
+
+        let text = activity_line(&render_to_styled(&state, &theme));
+
+        println!(
+            "\n--- activity paste receiving ---\n{text}\n--- end activity paste receiving ---"
+        );
+        insta::assert_snapshot!("tui_activity_paste_receiving", text);
+    }
+
+    #[test]
     fn activity_line_spans_hint_fills_width_then_expires_and_yields_when_narrow() {
         use super::activity_line_spans;
         use crate::tui::app::COPY_HINT_TTL;
@@ -4069,7 +4111,10 @@ mod tests {
 
         let with_hint = activity_line_spans(&state, &theme, 80, now);
         let line = joined(&with_hint);
-        assert!(line.contains("已复制 5 字"), "fresh hint must render: {line}");
+        assert!(
+            line.contains("已复制 5 字"),
+            "fresh hint must render: {line}"
+        );
         assert_eq!(
             display_width(&line),
             80,
@@ -4095,5 +4140,49 @@ mod tests {
             line.contains("就绪"),
             "left activity content must stay intact when hint yields: {line}"
         );
+    }
+
+    #[test]
+    fn activity_line_spans_copy_hint_takes_priority_over_paste_tail() {
+        use super::activity_line_spans;
+        use crate::tui::app::COPY_HINT_TTL;
+        use ratatui::text::Span;
+
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.set_paste_tail(PasteTailMatcher::new("abc".to_string()), Instant::now());
+        state.set_copy_hint("已复制 5 字".to_string());
+        let now = Instant::now();
+
+        let joined = |spans: &[Span<'_>]| -> String {
+            spans.iter().map(|span| span.content.as_ref()).collect()
+        };
+
+        let with_copy_hint = activity_line_spans(&state, &theme, 80, now);
+        let line = joined(&with_copy_hint);
+        assert!(line.contains("已复制 5 字"));
+        assert!(!line.contains("接收粘贴"));
+        assert_eq!(
+            with_copy_hint.last().and_then(|span| span.style.fg),
+            Some(theme.text_muted)
+        );
+
+        let after_copy_hint_ttl = activity_line_spans(
+            &state,
+            &theme,
+            80,
+            now + COPY_HINT_TTL + Duration::from_millis(1),
+        );
+        let line = joined(&after_copy_hint_ttl);
+        assert!(line.contains("⋯ 接收粘贴"));
+        assert_eq!(
+            after_copy_hint_ttl.last().and_then(|span| span.style.fg),
+            Some(theme.text_muted)
+        );
+
+        let narrow = activity_line_spans(&state, &theme, 12, now + COPY_HINT_TTL);
+        let line = joined(&narrow);
+        assert!(!line.contains("接收粘贴"));
+        assert!(line.contains("就绪"));
     }
 }

@@ -1,0 +1,5 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.muted›◇ 就绪‹/›‹text.primary›                                                                ‹/›‹text.muted›⋯ 接收粘贴‹/›

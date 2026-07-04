@@ -4,6 +4,7 @@ use ratatui::buffer::Buffer;
 
 pub trait Clipboard {
     fn set_text(&mut self, text: String) -> Result<(), String>;
+    fn get_text(&mut self) -> Result<String, String>;
 }
 
 pub struct ArboardClipboard {
@@ -30,6 +31,13 @@ impl Clipboard for ArboardClipboard {
             return Err("剪贴板不可用".to_string());
         };
         clipboard.set_text(text).map_err(|err| err.to_string())
+    }
+
+    fn get_text(&mut self) -> Result<String, String> {
+        let Some(clipboard) = self.inner.as_mut() else {
+            return Err("剪贴板不可用".to_string());
+        };
+        clipboard.get_text().map_err(|err| err.to_string())
     }
 }
 
@@ -72,6 +80,7 @@ mod tests {
     struct MockClipboard {
         calls: Vec<String>,
         result: Result<(), String>,
+        get_result: Result<String, String>,
     }
 
     impl Default for MockClipboard {
@@ -79,6 +88,7 @@ mod tests {
             Self {
                 calls: Vec::new(),
                 result: Ok(()),
+                get_result: Ok(String::new()),
             }
         }
     }
@@ -87,6 +97,10 @@ mod tests {
         fn set_text(&mut self, text: String) -> Result<(), String> {
             self.calls.push(text);
             self.result.clone()
+        }
+
+        fn get_text(&mut self) -> Result<String, String> {
+            self.get_result.clone()
         }
     }
 
@@ -161,6 +175,7 @@ mod tests {
         let mut clipboard = MockClipboard {
             calls: Vec::new(),
             result: Err("clipboard unavailable".to_string()),
+            get_result: Ok(String::new()),
         };
 
         copy_selection(&mut state, Some(&buffer), &mut clipboard);
@@ -212,5 +227,35 @@ mod tests {
 
         assert!(clipboard.calls.is_empty());
         assert!(state.has_selection());
+    }
+
+    #[test]
+    fn mock_clipboard_get_text_returns_configured_text() {
+        let mut clipboard = MockClipboard {
+            get_result: Ok("from clipboard".to_string()),
+            ..MockClipboard::default()
+        };
+
+        assert_eq!(clipboard.get_text(), Ok("from clipboard".to_string()));
+    }
+
+    #[test]
+    fn mock_clipboard_get_text_returns_configured_error() {
+        let mut clipboard = MockClipboard {
+            get_result: Err("clipboard read failed".to_string()),
+            ..MockClipboard::default()
+        };
+
+        assert_eq!(
+            clipboard.get_text(),
+            Err("clipboard read failed".to_string())
+        );
+    }
+
+    #[test]
+    fn arboard_clipboard_get_text_reports_unavailable_when_inner_missing() {
+        let mut clipboard = super::ArboardClipboard { inner: None };
+
+        assert_eq!(clipboard.get_text(), Err("剪贴板不可用".to_string()));
     }
 }

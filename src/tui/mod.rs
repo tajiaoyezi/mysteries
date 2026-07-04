@@ -18,10 +18,10 @@ use crossterm::event::{
 use futures_util::StreamExt;
 use ratatui::buffer::Buffer;
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
@@ -51,6 +51,7 @@ const PASTE_CONTINUATION_GRACE: StdDuration = StdDuration::from_millis(10);
 const PASTE_COALESCE_MIN_EVENTS: usize = 4;
 /// 粘贴合批的 chunk 间桥接窗口(比 lone-enter 续读的 10ms 宽,容 ConPTY chunk 间隔)。真机可调。
 const PASTE_COALESCE_GRACE: StdDuration = StdDuration::from_millis(30);
+const PASTE_FAST_TOPUP_ROUNDS: usize = 5;
 const CANCEL_DOUBLE_TAP: StdDuration = StdDuration::from_millis(600);
 
 pub struct RunAgentTaskConfig {
@@ -132,30 +133,107 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let mut clipboard = ArboardClipboard::new();
     let mut last_frame: Option<Buffer> = None;
 
-    terminal
-        .terminal_mut()
-        .draw(|frame| render::render(frame, &state, &theme))?;
+    draw_frame(&mut terminal, &state, &theme, &mut last_frame)?;
 
     loop {
+        let mut skip_frame = false;
         tokio::select! {
             event = events.next() => {
                 match event {
                     Some(Ok(ev0)) => {
-                        let batch = drain_event_batch(ev0)?;
-                        if process_event_batch(
-                            batch,
-                            EventBatchContext {
-                                state: &mut state,
-                                terminal: &mut terminal,
-                                last_frame: &last_frame,
-                                clipboard: &mut clipboard,
-                                theme: &theme,
-                                input_tx: &input_tx,
-                                interrupt_tx: &interrupt_tx,
-                                debug_events,
-                            },
-                        )? {
-                            break;
+                        let mut batch = drain_immediate(ev0)?;
+                        state.expire_paste_tail(Instant::now());
+                        if batch.len() >= EVENT_BATCH_CAP {
+                            if process_event_batch(
+                                batch,
+                                EventBatchContext {
+                                    state: &mut state,
+                                    terminal: &mut terminal,
+                                    last_frame: &last_frame,
+                                    clipboard: &mut clipboard,
+                                    theme: &theme,
+                                    input_tx: &input_tx,
+                                    interrupt_tx: &interrupt_tx,
+                                    debug_events,
+                                },
+                            )? {
+                                break;
+                            }
+                        } else if state.paste_tail_active() {
+                            let forwarded = process_paste_tail_batch(&mut state, batch, debug_events);
+                            if forwarded.is_empty() {
+                                skip_frame = true;
+                            } else if process_event_batch(
+                                forwarded,
+                                EventBatchContext {
+                                    state: &mut state,
+                                    terminal: &mut terminal,
+                                    last_frame: &last_frame,
+                                    clipboard: &mut clipboard,
+                                    theme: &theme,
+                                    input_tx: &input_tx,
+                                    interrupt_tx: &interrupt_tx,
+                                    debug_events,
+                                },
+                            )?
+                            {
+                                break;
+                            }
+                        } else if can_try_fast_paste(&state, &batch) {
+                            batch = top_up_fast_paste_batch(batch)?;
+                            match input_batch::try_fast_paste_decision(&batch, || clipboard.get_text()) {
+                                input_batch::FastPasteDecision::Matched(fast) => {
+                                    if debug_events {
+                                        log_debug_events_with_disposition(&batch, "fast-paste");
+                                    }
+                                    state.insert_paste_fold(fast.fold_text);
+                                    if !fast.tail.is_done() {
+                                        state.set_paste_tail(fast.tail, Instant::now());
+                                    }
+                                }
+                                input_batch::FastPasteDecision::Declined(decline) => {
+                                    if debug_events {
+                                        append_debug_event_line(&debug_fast_paste_decline_line(decline));
+                                        flush_debug_event_log();
+                                    }
+                                    state.set_paste_receiving_hint(true);
+                                    draw_frame(&mut terminal, &state, &theme, &mut last_frame)?;
+                                    state.set_paste_receiving_hint(false);
+                                    batch = bridge_event_batch(batch)?;
+                                    if process_event_batch(
+                                        batch,
+                                        EventBatchContext {
+                                            state: &mut state,
+                                            terminal: &mut terminal,
+                                            last_frame: &last_frame,
+                                            clipboard: &mut clipboard,
+                                            theme: &theme,
+                                            input_tx: &input_tx,
+                                            interrupt_tx: &interrupt_tx,
+                                            debug_events,
+                                        },
+                                    )? {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            batch = bridge_event_batch(batch)?;
+                            if process_event_batch(
+                                batch,
+                                EventBatchContext {
+                                    state: &mut state,
+                                    terminal: &mut terminal,
+                                    last_frame: &last_frame,
+                                    clipboard: &mut clipboard,
+                                    theme: &theme,
+                                    input_tx: &input_tx,
+                                    interrupt_tx: &interrupt_tx,
+                                    debug_events,
+                                },
+                            )? {
+                                break;
+                            }
                         }
                     }
                     Some(Err(err)) => return Err(CliError::Io(err.to_string())),
@@ -185,16 +263,12 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
             }
             _ = spinner_tick.tick() => {
                 state.advance_spinner();
+                state.expire_paste_tail(Instant::now());
             }
         }
 
-        let completed = terminal
-            .terminal_mut()
-            .draw(|frame| render::render(frame, &state, &theme))?;
-        if state.has_selection() {
-            last_frame = Some(completed.buffer.clone());
-        } else {
-            last_frame = None;
+        if !skip_frame {
+            draw_frame(&mut terminal, &state, &theme, &mut last_frame)?;
         }
     }
 
@@ -281,11 +355,53 @@ fn debug_events_enabled() -> bool {
         .is_some_and(|value| !value.as_os_str().is_empty())
 }
 
+static DEBUG_EVENT_LOG: OnceLock<Option<StdMutex<BufWriter<File>>>> = OnceLock::new();
+
+fn debug_event_log() -> Option<&'static StdMutex<BufWriter<File>>> {
+    DEBUG_EVENT_LOG
+        .get_or_init(|| {
+            let path = std::env::temp_dir().join("mysteries-tui-events.log");
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(|file| StdMutex::new(BufWriter::new(file)))
+        })
+        .as_ref()
+}
+
 fn append_debug_event_line(line: &str) {
-    let path = std::env::temp_dir().join("mysteries-tui-events.log");
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
+    if let Some(log) = debug_event_log() {
+        if let Ok(mut writer) = log.lock() {
+            let _ = writeln!(writer, "{line}");
+        }
     }
+}
+
+fn flush_debug_event_log() {
+    if let Some(log) = debug_event_log() {
+        if let Ok(mut writer) = log.lock() {
+            let _ = writer.flush();
+        }
+    }
+}
+
+fn draw_frame(
+    terminal: &mut terminal::TerminalGuard,
+    state: &app::AppState,
+    theme: &theme::Theme,
+    last_frame: &mut Option<Buffer>,
+) -> Result<(), CliError> {
+    let completed = terminal
+        .terminal_mut()
+        .draw(|frame| render::render(frame, state, theme))?;
+    if state.has_selection() {
+        *last_frame = Some(completed.buffer.clone());
+    } else {
+        *last_frame = None;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -628,6 +744,35 @@ fn debug_event_line(event: &Event) -> String {
     }
 }
 
+fn debug_event_line_with_disposition(event: &Event, disposition: &str) -> String {
+    format!("{} disposition={disposition}", debug_event_line(event))
+}
+
+fn log_debug_events_with_disposition(batch: &[Event], disposition: &str) {
+    for event in batch {
+        append_debug_event_line(&debug_event_line_with_disposition(event, disposition));
+    }
+    flush_debug_event_log();
+}
+
+fn debug_fast_paste_decline_line(decline: input_batch::FastPasteDecline) -> String {
+    format!(
+        "paste-fast decline reason={} rebuilt_chars={} batch_len={}",
+        decline.reason.as_str(),
+        decline.rebuilt_chars,
+        decline.batch_len
+    )
+}
+
+fn debug_paste_tail_abort_line(matcher: &input_batch::PasteTailMatcher) -> String {
+    format!(
+        "paste-tail abort streak={} cursor={} normalized_len={}",
+        input_batch::PASTE_TAIL_ABORT_MISMATCHES,
+        matcher.cursor(),
+        matcher.normalized_len()
+    )
+}
+
 fn debug_modifiers(modifiers: KeyModifiers) -> String {
     if modifiers.is_empty() {
         return "NONE".to_string();
@@ -686,16 +831,55 @@ fn is_key_press(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
 }
 
-fn drain_event_batch(ev0: Event) -> Result<Vec<Event>, CliError> {
+fn drain_immediate(ev0: Event) -> Result<Vec<Event>, CliError> {
     let mut batch = vec![ev0];
-    loop {
-        while crossterm::event::poll(StdDuration::ZERO).map_err(|e| CliError::Io(e.to_string()))? {
+    while crossterm::event::poll(StdDuration::ZERO).map_err(|e| CliError::Io(e.to_string()))? {
+        batch.push(crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?);
+        if batch.len() >= EVENT_BATCH_CAP {
+            return Ok(batch);
+        }
+    }
+    Ok(batch)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchReadOutcome {
+    Key,
+    NonKey,
+    Quiet,
+    Cap,
+}
+
+fn read_event_batch_round(
+    batch: &mut Vec<Event>,
+    grace: StdDuration,
+) -> Result<BatchReadOutcome, CliError> {
+    if crossterm::event::poll(grace).map_err(|e| CliError::Io(e.to_string()))? {
+        let ev = crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?;
+        let is_key = matches!(ev, Event::Key(_));
+        batch.push(ev);
+        if batch.len() >= EVENT_BATCH_CAP {
+            return Ok(BatchReadOutcome::Cap);
+        }
+        if !is_key {
+            return Ok(BatchReadOutcome::NonKey);
+        }
+        while crossterm::event::poll(StdDuration::ZERO)
+            .map_err(|e| CliError::Io(e.to_string()))?
+        {
             batch.push(crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?);
             if batch.len() >= EVENT_BATCH_CAP {
-                return Ok(batch);
+                return Ok(BatchReadOutcome::Cap);
             }
         }
+        Ok(BatchReadOutcome::Key)
+    } else {
+        Ok(BatchReadOutcome::Quiet)
+    }
+}
 
+fn bridge_event_batch(mut batch: Vec<Event>) -> Result<Vec<Event>, CliError> {
+    loop {
         if batch.len() >= EVENT_BATCH_CAP {
             break;
         }
@@ -711,18 +895,93 @@ fn drain_event_batch(ev0: Event) -> Result<Vec<Event>, CliError> {
             break;
         };
 
-        if crossterm::event::poll(grace).map_err(|e| CliError::Io(e.to_string()))? {
-            let ev = crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?;
-            let is_key = matches!(ev, Event::Key(_));
-            batch.push(ev);
-            if !is_key {
-                break; // 非键事件(鼠标 Moved/Focus/Resize)即收批,防高频事件令合批不退出
-            }
-        } else {
-            break; // 静默超过 grace:粘贴/续读结束
+        match read_event_batch_round(&mut batch, grace)? {
+            BatchReadOutcome::Key => {}
+            BatchReadOutcome::NonKey => break, // 非键事件(鼠标 Moved/Focus/Resize)即收批,防高频事件令合批不退出
+            BatchReadOutcome::Quiet => break, // 静默超过 grace:粘贴/续读结束
+            BatchReadOutcome::Cap => return Ok(batch),
         }
     }
     Ok(batch)
+}
+
+fn top_up_fast_paste_batch(mut batch: Vec<Event>) -> Result<Vec<Event>, CliError> {
+    for _ in 0..PASTE_FAST_TOPUP_ROUNDS {
+        let Some(chars) = fast_paste_rebuilt_chars(&batch) else {
+            break;
+        };
+        if chars >= input_batch::PASTE_FAST_MIN_MATCH_CHARS {
+            break;
+        }
+        match read_event_batch_round(&mut batch, PASTE_COALESCE_GRACE)? {
+            BatchReadOutcome::Key => {}
+            BatchReadOutcome::NonKey | BatchReadOutcome::Quiet => break,
+            BatchReadOutcome::Cap => return Ok(batch),
+        }
+    }
+    Ok(batch)
+}
+
+fn fast_paste_rebuilt_chars(batch: &[Event]) -> Option<usize> {
+    let keys = input_batch::press_key_events(batch);
+    input_batch::rebuild_fast_text(&keys).map(|text| text.chars().count())
+}
+
+fn can_try_fast_paste(state: &app::AppState, batch: &[Event]) -> bool {
+    batch.len() >= PASTE_COALESCE_MIN_EVENTS
+        && state.pending_permission.is_none()
+        && state.models_picker.is_none()
+}
+
+fn process_paste_tail_batch(
+    state: &mut app::AppState,
+    batch: Vec<Event>,
+    debug_events: bool,
+) -> Vec<Event> {
+    let mut forwarded = Vec::new();
+    let mut events = batch.into_iter();
+    while let Some(event) = events.next() {
+        let Some(tail) = state.paste_tail.as_mut() else {
+            forwarded.push(event);
+            forwarded.extend(events);
+            break;
+        };
+        let was_aborted = tail.matcher.is_aborted();
+        let action = tail.matcher.on_event(&event);
+        let done = tail.matcher.is_done();
+        let abort_line = (!was_aborted && tail.matcher.is_aborted())
+            .then(|| debug_paste_tail_abort_line(&tail.matcher));
+
+        if debug_events {
+            if let Some(line) = abort_line {
+                append_debug_event_line(&line);
+            }
+        }
+        match action {
+            input_batch::TailAction::Drop => {
+                if debug_events {
+                    append_debug_event_line(&debug_event_line_with_disposition(
+                        &event,
+                        "tail-drop",
+                    ));
+                }
+                if matches!(event, Event::Key(key) if is_key_press(key)) {
+                    state.record_paste_tail_action(input_batch::TailAction::Drop, Instant::now());
+                }
+            }
+            input_batch::TailAction::Forward => forwarded.push(event),
+        }
+
+        if done {
+            state.clear_paste_tail();
+            forwarded.extend(events);
+            break;
+        }
+    }
+    if debug_events {
+        flush_debug_event_log();
+    }
+    forwarded
 }
 
 struct EventBatchContext<'a> {
@@ -736,10 +995,7 @@ struct EventBatchContext<'a> {
     debug_events: bool,
 }
 
-fn process_event_batch(
-    batch: Vec<Event>,
-    ctx: EventBatchContext<'_>,
-) -> Result<bool, CliError> {
+fn process_event_batch(batch: Vec<Event>, ctx: EventBatchContext<'_>) -> Result<bool, CliError> {
     let EventBatchContext {
         state,
         terminal,
@@ -755,6 +1011,9 @@ fn process_event_batch(
             append_debug_event_line(&debug_event_line(event));
         }
     }
+    if debug_events {
+        flush_debug_event_log();
+    }
 
     let press_keys = input_batch::press_key_events(&batch);
     let intents = input_batch::classify_key_batch(&press_keys);
@@ -765,8 +1024,7 @@ fn process_event_batch(
             &batch,
             input_batch::PASTE_FOLD_MIN_LINES,
             input_batch::PASTE_FOLD_MIN_CHARS,
-        )
-        {
+        ) {
             state.insert_paste_fold(text);
             return Ok(false);
         }
@@ -994,10 +1252,9 @@ mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
     use super::{
         apply_mouse_wheel_scroll_to_state, arrows_route_to_completion, cancel_action,
-        handle_mouse_selection_event, handle_queue_cancel_key, handle_resize,
-        handle_selection_key, run_agent_task, scroll_action_for_key, selection_key_action,
-        should_exit, CancelAction, MouseWheelScrollAction, RunAgentTaskConfig,
-        SelectionKeyAction, DEFAULT_SYSTEM_PROMPT,
+        handle_mouse_selection_event, handle_queue_cancel_key, handle_resize, handle_selection_key,
+        run_agent_task, scroll_action_for_key, selection_key_action, should_exit, CancelAction,
+        MouseWheelScrollAction, RunAgentTaskConfig, SelectionKeyAction, DEFAULT_SYSTEM_PROMPT,
     };
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
@@ -1165,6 +1422,10 @@ mod tests {
         fn set_text(&mut self, text: String) -> Result<(), String> {
             self.calls.push(text);
             Ok(())
+        }
+
+        fn get_text(&mut self) -> Result<String, String> {
+            Ok(String::new())
         }
     }
 
@@ -1476,10 +1737,7 @@ mod tests {
             input_rx.try_recv().is_err(),
             "submit in Idle window must enqueue, not direct-send"
         );
-        assert_eq!(
-            state.pending_queue,
-            vec!["B".to_string(), "X".to_string()]
-        );
+        assert_eq!(state.pending_queue, vec!["B".to_string(), "X".to_string()]);
 
         // 随后 TurnComplete:恰推进一条(队首 B),无 double-send
         feed_agent_event(&mut state, AgentEvent::TurnComplete, &input_tx);
