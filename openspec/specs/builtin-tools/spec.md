@@ -1,7 +1,7 @@
 # builtin-tools Specification
 
 ## Purpose
-定义 7 个内置工具的行为契约:4 个只读工具(`list_dir` / `read_file` / `glob` / `grep`,权限级别 `ReadOnly`)与 3 个变更类工具(`write_file` / `edit_file` / `run_shell`,`RequiresConfirmation`),覆盖各自的输入语义、输出截断(`max_output_bytes` / `truncated`)与 exit code 编码。关键立场是失败一律编码为 `ToolOutcome{is_error}` 回给模型而非 panic,变更类工具经权限门 `Deny` 时零副作用,`edit_file` 要求 `old_string` 唯一匹配、否则不写入。工具抽象与注册调度属 tool-system,权限判定机制属 permission-gate;本域仅约定各实体工具自身的行为。
+定义 7 个内置工具的行为契约:4 个只读工具(`list_dir` / `read_file` / `glob` / `grep`,权限级别 `ReadOnly`)与 3 个变更类工具(`write_file` / `edit_file`,`Edit`;`run_shell`,`Execute`),覆盖各自的输入语义、输出截断(`max_output_bytes` / `truncated`)与 exit code 编码。关键立场是失败一律编码为 `ToolOutcome{is_error}` 回给模型而非 panic,变更类工具经权限门 `Deny` 时零副作用,`edit_file` 要求 `old_string` 唯一匹配、否则不写入。工具抽象与注册调度属 tool-system,权限判定机制属 permission-gate;本域仅约定各实体工具自身的行为。
 ## Requirements
 ### Requirement: list_dir 列目录(ReadOnly)
 
@@ -74,9 +74,9 @@
 - **WHEN** 匹配输出超过 `max_output_bytes`
 - **THEN** `truncated = true`
 
-### Requirement: write_file 写入(RequiresConfirmation)
+### Requirement: write_file 写入(Edit)
 
-`write_file` SHALL 新建或覆盖写入文件内容;权限级别 `RequiresConfirmation`;写入失败 → is_error。
+`write_file` SHALL 新建或覆盖写入文件内容;权限级别 `Edit`;写入失败 → is_error。
 
 #### Scenario: 写入新文件
 
@@ -88,9 +88,9 @@
 - **WHEN** `write_file` 到一个已存在的文件
 - **THEN** 内容被覆盖
 
-### Requirement: edit_file 唯一匹配替换(RequiresConfirmation)
+### Requirement: edit_file 唯一匹配替换(Edit)
 
-`edit_file` SHALL 以 str-replace 编辑文件,要求 `old_string` 在文件中**恰好出现一次**;0 次或多于一次匹配 SHALL → is_error 且**不写入**;权限级别 `RequiresConfirmation`。
+`edit_file` SHALL 以 str-replace 编辑文件,要求 `old_string` 在文件中**恰好出现一次**;0 次或多于一次匹配 SHALL → is_error 且**不写入**;权限级别 `Edit`。
 
 #### Scenario: 唯一匹配替换
 
@@ -102,9 +102,9 @@
 - **WHEN** `old_string` 在文件中出现 0 次或多于一次
 - **THEN** `is_error = true`,且文件未被修改
 
-### Requirement: run_shell 执行(RequiresConfirmation)
+### Requirement: run_shell 执行(Execute)
 
-`run_shell` SHALL 经平台 shell(Windows `cmd /C`、Unix `sh -c`)执行命令,捕获 stdout / stderr / exit code;SHALL 受 timeout 约束,超时则终止命令并 → is_error;输出超 `max_output_bytes` 时截断置 `truncated`;非零 exit → is_error;权限级别 `RequiresConfirmation`。
+`run_shell` SHALL 经平台 shell(Windows `cmd /C`、Unix `sh -c`)执行命令,捕获 stdout / stderr / exit code;SHALL 受 timeout 约束,超时则终止命令并 → is_error;输出超 `max_output_bytes` 时截断置 `truncated`;非零 exit → is_error;权限级别 `Execute`。
 
 **console 独立性(Windows)**:子进程 SHALL 以 `CREATE_NO_WINDOW`(`0x0800_0000`,具名常量、`#[cfg(windows)]`)创建——不 attach 调用方 console,防止子进程重置 TUI 已设置的终端输入模式(`ENABLE_MOUSE_INPUT` 等,重置后终端把滚轮降级为方向键);stdout / stderr 经 pipe 捕获,MUST 不受该标志影响。非 Windows 平台无此问题,不加标志。
 

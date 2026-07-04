@@ -53,7 +53,7 @@
 
 ### Requirement: stdin y/n 权限 decider
 
-系统 SHALL 提供 `StdinDecider`(impl `PermissionDecider`),用于 CLI(TUI 前过渡):对 `RequiresConfirmation` 工具,展示工具名 + 参数后读取一行,经一个**可单测的纯解析函数**判定 —— `y` / `yes`(忽略大小写与首尾空白)→ `Allow`,其余(含空行 / EOF)→ `Deny`(fail-safe)。stdin 读取 MUST 为薄壳(异步下经 `spawn_blocking`),决策解析与读取解耦。
+系统 SHALL 提供 `StdinDecider`(impl `PermissionDecider`),用于 CLI(TUI 前过渡):对非 `ReadOnly`(`Edit` / `Execute`)工具,展示工具名 + 参数后读取一行,经一个**可单测的纯解析函数**判定 —— `y` / `yes`(忽略大小写与首尾空白)→ `Allow`,其余(含空行 / EOF)→ `Deny`(fail-safe)。stdin 读取 MUST 为薄壳(异步下经 `spawn_blocking`),决策解析与读取解耦。
 
 #### Scenario: 确认输入 y 放行
 

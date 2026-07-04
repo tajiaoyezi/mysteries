@@ -37,11 +37,11 @@
 
 ### Requirement: agent-task 一轮编排(Mock 驱动 · 无终端)
 
-系统 SHALL 提供可在**无终端**下以 Mock provider 驱动的 agent-task 编排:投入一个 prompt,经 `ChannelSink`(文本)与 `ChannelDecider`(权限)跑完一轮 `Agent.run`,把事件流回 channel。含 `RequiresConfirmation` 工具的脚本 MUST 能走通「`PermissionRequired` → 回送决策 → 继续 / 拒绝入 history」。
+系统 SHALL 提供可在**无终端**下以 Mock provider 驱动的 agent-task 编排:投入一个 prompt,经 `ChannelSink`(文本)与 `ChannelDecider`(权限)跑完一轮 `Agent.run`,把事件流回 channel。含非 `ReadOnly`(`Edit` / `Execute`)工具的脚本 MUST 能走通「`PermissionRequired` → 回送决策 → 继续 / 拒绝入 history」。
 
 #### Scenario: 含权限的一轮编排
 
-- **WHEN** Mock 脚本为「轮1 → 一个 RequiresConfirmation 工具的 tool_call、轮2 → 终复文本」,投入 prompt 并对 `PermissionRequired` 回送 `Allow`
+- **WHEN** Mock 脚本为「轮1 → 一个非 `ReadOnly`(`Edit` / `Execute`)工具的 tool_call、轮2 → 终复文本」,投入 prompt 并对 `PermissionRequired` 回送 `Allow`
 - **THEN** channel 依次见到权限请求与文本事件,工具被执行,最终 `TurnComplete`;全程无终端、不触网
 
 ### Requirement: ratatui 四区最小外壳渲染
