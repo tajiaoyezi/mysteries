@@ -33,6 +33,11 @@ impl TerminalGuard {
     pub fn terminal_mut(&mut self) -> &mut TuiTerminal {
         &mut self.terminal
     }
+
+    pub fn reassert_mouse_capture(&mut self) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        execute!(stdout, EnableMouseCapture)
+    }
 }
 
 impl Drop for TerminalGuard {

@@ -7,6 +7,9 @@ use tokio::time::{timeout, Duration};
 
 pub struct RunShellTool;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[async_trait]
 impl Tool for RunShellTool {
     fn name(&self) -> &str {
@@ -80,6 +83,8 @@ impl Tool for RunShellTool {
 fn platform_command(command: &str) -> Command {
     let mut cmd = Command::new("cmd");
     cmd.arg("/C").arg(command);
+    // 避免子进程 attach 当前 console 后重置 TUI 已启用的输入模式(如鼠标捕获)。
+    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
 }
 

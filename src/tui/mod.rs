@@ -165,6 +165,10 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
             event = ui_rx.recv() => {
                 match event {
                     Some(event) => {
+                        let reassert_mouse_capture = matches!(
+                            event,
+                            channel::AgentEvent::ToolCallFinished { .. }
+                        );
                         handle_agent_event(
                             &mut state,
                             event,
@@ -172,6 +176,9 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                             &mut first_token_at,
                             &input_tx,
                         );
+                        if reassert_mouse_capture {
+                            terminal.reassert_mouse_capture()?;
+                        }
                     }
                     None => break,
                 }
