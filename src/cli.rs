@@ -110,10 +110,7 @@ fn login_wps_codingplan(
         .select("Select protocol", &protocol_options)?
         .ok_or(AuthError::Cancelled)?;
     let (provider_kind, base_url) = match protocol_index {
-        1 => (
-            ProviderKind::Anthropic,
-            WPS_CODEPLAN_ANTHROPIC_BASE_URL,
-        ),
+        1 => (ProviderKind::Anthropic, WPS_CODEPLAN_ANTHROPIC_BASE_URL),
         _ => (ProviderKind::OpenAi, WPS_CODEPLAN_OPENAI_BASE_URL),
     };
 
@@ -991,7 +988,9 @@ mod tests {
 
     #[test]
     fn load_config_or_onboard_skips_onboarding_when_config_exists() {
-        use super::{load_config_or_onboard, preset_patch, ANTHROPIC_DEFAULT_MODEL, ProviderPreset};
+        use super::{
+            load_config_or_onboard, preset_patch, ProviderPreset, ANTHROPIC_DEFAULT_MODEL,
+        };
 
         let temp = tempfile::tempdir().unwrap();
         let paths = temp_cli_paths(&temp);
@@ -1056,11 +1055,9 @@ mod tests {
     fn cli_error_not_configured_display_contains_auth_login_command() {
         use super::CliError;
 
-        assert!(
-            CliError::NotConfigured
-                .to_string()
-                .contains("mysteries auth login")
-        );
+        assert!(CliError::NotConfigured
+            .to_string()
+            .contains("mysteries auth login"));
     }
 
     #[test]
@@ -1105,9 +1102,7 @@ mod tests {
 
     #[test]
     fn login_wps_codingplan_anthropic_protocol_uses_anthropic_endpoint() {
-        use super::{
-            login_wps_codingplan, WPS_CODEPLAN_ANTHROPIC_BASE_URL, WPS_DEFAULT_MODEL,
-        };
+        use super::{login_wps_codingplan, WPS_CODEPLAN_ANTHROPIC_BASE_URL, WPS_DEFAULT_MODEL};
 
         let mut prompter = ScriptedAuthPrompter::new(vec![], vec![Some("sk-wps2".to_string())])
             .with_select_script(vec![Some(1)]);
@@ -1129,8 +1124,7 @@ mod tests {
     fn login_wps_codingplan_cancelled_at_protocol_returns_cancelled() {
         use super::login_wps_codingplan;
 
-        let mut prompter =
-            ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![None]);
+        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![]).with_select_script(vec![None]);
 
         assert_eq!(
             login_wps_codingplan(&mut prompter).unwrap_err(),
@@ -1142,8 +1136,8 @@ mod tests {
     fn login_wps_codingplan_cancelled_at_key_returns_cancelled() {
         use super::login_wps_codingplan;
 
-        let mut prompter = ScriptedAuthPrompter::new(vec![], vec![None])
-            .with_select_script(vec![Some(0)]);
+        let mut prompter =
+            ScriptedAuthPrompter::new(vec![], vec![None]).with_select_script(vec![Some(0)]);
 
         assert_eq!(
             login_wps_codingplan(&mut prompter).unwrap_err(),

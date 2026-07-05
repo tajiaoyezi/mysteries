@@ -362,8 +362,7 @@ mod tests {
             model_context_window: None,
             ..default_settings()
         };
-        let mut compacting =
-            Compacting::new(provider, "claude-sonnet-4".to_string(), settings);
+        let mut compacting = Compacting::new(provider, "claude-sonnet-4".to_string(), settings);
         let history = multi_turn_history();
         let usage = Usage {
             input_tokens: 7_000,
@@ -398,11 +397,8 @@ mod tests {
     async fn explicit_override_beats_builtin_table() {
         // 显式 Some(100) 覆盖表值:model 在表内是 200k,阈值仍按 100 算(81 > 80 触发)。
         let provider = Arc::new(MockProvider::new(vec![summary_response_with(SUMMARY_TEXT)]));
-        let compacting = Compacting::new(
-            provider,
-            "claude-sonnet-4".to_string(),
-            default_settings(),
-        );
+        let compacting =
+            Compacting::new(provider, "claude-sonnet-4".to_string(), default_settings());
         let history = multi_turn_history();
 
         let compacted = compacting

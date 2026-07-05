@@ -1,6 +1,6 @@
 use mysteries::cli::{
-    AuthPaths, CliError, CliPaths, run_auth_list, run_auth_login_interactive,
-    run_auth_logout_interactive, run_cli,
+    run_auth_list, run_auth_login_interactive, run_auth_logout_interactive, run_cli, AuthPaths,
+    CliError, CliPaths,
 };
 use mysteries::tui::{run_tui, startup_mode};
 use std::env;

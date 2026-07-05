@@ -394,8 +394,8 @@ mod tests {
         classify_key_batch, fold_candidate, normalize_newlines, press_key_events,
         rebuild_fast_text, rebuild_text, try_fast_paste, try_fast_paste_decision,
         would_submit_lone_enter, FastPasteDecision, FastPasteDecline, FastPasteDeclineReason,
-        KeyIntent, PasteTailMatcher, TailAction, PASTE_FAST_MIN_MATCH_CHARS,
-        PASTE_FOLD_MIN_CHARS, PASTE_FOLD_MIN_LINES, PASTE_TAIL_ABORT_MISMATCHES,
+        KeyIntent, PasteTailMatcher, TailAction, PASTE_FAST_MIN_MATCH_CHARS, PASTE_FOLD_MIN_CHARS,
+        PASTE_FOLD_MIN_LINES, PASTE_TAIL_ABORT_MISMATCHES,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -839,10 +839,7 @@ mod tests {
             matcher.on_event(&press_event(KeyCode::Esc)),
             TailAction::Forward
         );
-        assert_eq!(
-            matcher.on_event(&moved_event()),
-            TailAction::Forward
-        );
+        assert_eq!(matcher.on_event(&moved_event()), TailAction::Forward);
     }
 
     #[test]
@@ -870,8 +867,7 @@ mod tests {
 
     #[test]
     fn unreliable_astral_flag_can_be_swallowed_without_tail_leak() {
-        let (actions, matcher) =
-            tail_actions("🇭🇰 GOMA", paste_events_from_text(" GOMA", false));
+        let (actions, matcher) = tail_actions("🇭🇰 GOMA", paste_events_from_text(" GOMA", false));
 
         assert_eq!(actions, vec![TailAction::Drop; 5]);
         assert!(matcher.is_done());
@@ -879,10 +875,8 @@ mod tests {
 
     #[test]
     fn unreliable_astral_before_newline_run_keeps_single_and_double_enter_matching() {
-        let (single_actions, single) =
-            tail_actions("🇭🇰\nG", paste_events_from_text("\nG", false));
-        let (double_actions, double) =
-            tail_actions("🇭🇰\nG", paste_events_from_text("\nG", true));
+        let (single_actions, single) = tail_actions("🇭🇰\nG", paste_events_from_text("\nG", false));
+        let (double_actions, double) = tail_actions("🇭🇰\nG", paste_events_from_text("\nG", true));
 
         assert_eq!(single_actions, vec![TailAction::Drop, TailAction::Drop]);
         assert!(single.is_done());
@@ -923,8 +917,7 @@ mod tests {
 
     #[test]
     fn unreliable_consecutive_emoji_are_skipped_as_one_expected_run() {
-        let (actions, matcher) =
-            tail_actions("🇭🇰🇺🇸 x", paste_events_from_text(" x", false));
+        let (actions, matcher) = tail_actions("🇭🇰🇺🇸 x", paste_events_from_text(" x", false));
 
         assert_eq!(actions, vec![TailAction::Drop, TailAction::Drop]);
         assert!(matcher.is_done());
@@ -932,8 +925,7 @@ mod tests {
 
     #[test]
     fn unreliable_real_astral_event_uses_normal_match_path_boundary() {
-        let (actions, matcher) =
-            tail_actions("🇭🇰 GOMA", paste_events_from_text("🇭🇰 GOMA", false));
+        let (actions, matcher) = tail_actions("🇭🇰 GOMA", paste_events_from_text("🇭🇰 GOMA", false));
 
         assert_eq!(
             actions,
@@ -1032,7 +1024,10 @@ mod tests {
 
         assert_eq!(FastPasteDeclineReason::TooShort.as_str(), "too-short");
         assert_eq!(FastPasteDeclineReason::NoMatch.as_str(), "no-match");
-        assert_eq!(FastPasteDeclineReason::ClipboardErr.as_str(), "clipboard-err");
+        assert_eq!(
+            FastPasteDeclineReason::ClipboardErr.as_str(),
+            "clipboard-err"
+        );
         assert_eq!(
             FastPasteDeclineReason::BelowThreshold.as_str(),
             "below-threshold"
@@ -1092,8 +1087,9 @@ mod tests {
             .map(|_| "x".repeat(34))
             .collect::<Vec<_>>()
             .join("\n");
-        let below_threshold_decline =
-            decline(try_fast_paste_decision(&below_threshold, || Ok(below_clipboard)));
+        let below_threshold_decline = decline(try_fast_paste_decision(&below_threshold, || {
+            Ok(below_clipboard)
+        }));
         assert_eq!(
             below_threshold_decline.reason,
             FastPasteDeclineReason::BelowThreshold

@@ -162,10 +162,7 @@ mod tests {
             .await;
 
         assert_eq!(tool.name(), "write_file");
-        assert_eq!(
-            tool.permission_level(),
-            PermissionLevel::Edit
-        );
+        assert_eq!(tool.permission_level(), PermissionLevel::Edit);
         assert!(!outcome.is_error);
         assert_eq!(outcome.exit, None);
         assert_eq!(
@@ -245,10 +242,7 @@ mod tests {
             .await;
 
         assert_eq!(tool.name(), "edit_file");
-        assert_eq!(
-            tool.permission_level(),
-            PermissionLevel::Edit
-        );
+        assert_eq!(tool.permission_level(), PermissionLevel::Edit);
         assert!(!outcome.is_error);
         assert_eq!(outcome.exit, None);
         assert_eq!(

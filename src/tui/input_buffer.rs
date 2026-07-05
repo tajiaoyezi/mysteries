@@ -607,7 +607,10 @@ mod tests {
         );
 
         assert_eq!(state.pasted.len(), 1);
-        let chunk = state.pasted.get(&sentinel).expect("sentinel mapped in pasted");
+        let chunk = state
+            .pasted
+            .get(&sentinel)
+            .expect("sentinel mapped in pasted");
         assert_eq!(
             chunk,
             &PastedChunk {
@@ -669,7 +672,10 @@ mod tests {
 
     #[test]
     fn expand_folds_expands_mixed_text_and_single_fold() {
-        let state = reduce(&InputBufferState::default(), InputBufferAction::InsertChar('a'));
+        let state = reduce(
+            &InputBufferState::default(),
+            InputBufferAction::InsertChar('a'),
+        );
         let state = reduce(
             &state,
             InputBufferAction::InsertPasteFold("X\nY".to_string()),
@@ -686,10 +692,7 @@ mod tests {
             InputBufferAction::InsertPasteFold("A".to_string()),
         );
         let state = reduce(&state, InputBufferAction::InsertChar('中'));
-        let state = reduce(
-            &state,
-            InputBufferAction::InsertPasteFold("B".to_string()),
-        );
+        let state = reduce(&state, InputBufferAction::InsertPasteFold("B".to_string()));
 
         assert_eq!(state.expand_folds(), "A中B");
     }

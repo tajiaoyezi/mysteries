@@ -213,11 +213,11 @@ pub fn replace_system_head(history: &mut Vec<Message>, prompt: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionLine, SessionMeta, SessionStore, SessionSummary, replace_system_head};
+    use super::{replace_system_head, SessionLine, SessionMeta, SessionStore, SessionSummary};
     use crate::agent::message::Message;
     use crate::provider::ToolCall;
     use crate::tui::app::{StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock};
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::thread;

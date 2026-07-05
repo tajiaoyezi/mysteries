@@ -216,10 +216,7 @@ mod tests {
             .await;
 
         assert_eq!(tool.name(), "run_shell");
-        assert_eq!(
-            tool.permission_level(),
-            PermissionLevel::Execute
-        );
+        assert_eq!(tool.permission_level(), PermissionLevel::Execute);
         assert!(!outcome.is_error);
         assert_eq!(outcome.exit, Some(0));
         assert!(outcome.content.contains("exit: 0"));

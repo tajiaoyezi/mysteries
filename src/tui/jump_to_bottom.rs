@@ -22,7 +22,9 @@ pub fn jump_to_bottom_pill_text(count: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{bump_new_message_count, jump_to_bottom_pill_text, new_message_count_on_follow_bottom};
+    use super::{
+        bump_new_message_count, jump_to_bottom_pill_text, new_message_count_on_follow_bottom,
+    };
 
     #[test]
     fn bump_increments_when_not_following_bottom() {
