@@ -9,6 +9,7 @@ use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSour
 use crate::error::AgentError;
 use crate::permission::PermissionMode;
 use crate::provider::Usage;
+use crate::session::{replace_system_head, SessionMeta, SessionStore};
 use crate::tool::ToolContext;
 use crate::tui::clipboard::{copy_selection, ArboardClipboard, Clipboard};
 use crate::tui::selection::{Point, SelectionAction};
@@ -24,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration as StdDuration;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{Duration, MissedTickBehavior};
 
@@ -61,18 +63,28 @@ pub struct RunAgentTaskConfig {
     pub tool_ctx: ToolContext,
 }
 
-pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
+struct SessionStartup {
+    meta: SessionMeta,
+    history: Vec<Message>,
+    transcript: Vec<app::TranscriptBlock>,
+    resume_provider: Option<(String, String)>,
+}
+
+pub async fn run_tui(paths: CliPaths, resume: bool) -> Result<(), CliError> {
     let mut prompter = StdinAuthPrompter;
     let config = load_config_or_onboard(&paths, &mut prompter)?;
     let profiles =
         crate::app::provider_profiles_from_paths(&paths.user_config, &paths.project_config)
             .map_err(CliError::from)?;
+    let store = SessionStore::new(paths.config_dir.join("sessions"));
+    let session_startup = prepare_session_startup(&store, &paths, &config, resume)?;
+    let session_meta = session_startup.meta.clone();
+    let resume_provider = session_startup.resume_provider.clone();
     let credentials = CredentialChain::new(vec![
         Box::new(EnvCredentialSource::new()),
         Box::new(FileCredentialSource::new(paths.credentials.clone())),
     ]);
     let provider = crate::app::select_provider(&config, credentials)?;
-    let provider_id = config.provider.id.clone();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
@@ -87,10 +99,8 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     );
     let compacting = assembled.compacting;
     let agent = assembled.agent;
-    let agent_history = Arc::new(Mutex::new(vec![Message::System(
-        DEFAULT_SYSTEM_PROMPT.to_string(),
-    )]));
-    let cwd = paths.cwd.clone();
+    let agent_history = Arc::new(Mutex::new(session_startup.history));
+    let cwd = session_startup.meta.cwd.clone();
     let ctx = ToolContext {
         cwd: cwd.clone(),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -113,8 +123,8 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let mut terminal = terminal::TerminalGuard::new()?;
     let mut state = app::AppState::with_session_and_history(
         app::SessionSnapshot {
-            provider: provider_id,
-            model: config.model.clone(),
+            provider: session_startup.meta.provider.clone(),
+            model: session_startup.meta.model.clone(),
             max_iterations: config.max_iterations,
             cwd,
             tools: crate::app::default_registry().schemas().len(),
@@ -123,6 +133,10 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     );
     state.provider_profiles = profiles;
     state.permission_mode = permission_mode;
+    state.transcript = session_startup.transcript;
+    if let Some((id, model)) = resume_provider {
+        let _ = input_tx.send(channel::UserInput::SetProvider { id, model });
+    }
     let mut events = EventStream::new();
     let theme = theme::Theme::midnight();
     let debug_events = debug_events_enabled();
@@ -243,8 +257,9 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
             event = ui_rx.recv() => {
                 match event {
                     Some(event) => {
+                        let is_terminal = terminal_session_event(&event);
                         let reassert_mouse_capture = matches!(
-                            event,
+                            &event,
                             channel::AgentEvent::ToolCallFinished { .. }
                         );
                         handle_agent_event(
@@ -254,6 +269,13 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
                             &mut first_token_at,
                             &input_tx,
                         );
+                        if is_terminal {
+                            let h = state.agent_history.lock().await;
+                            let save_result =
+                                write_session_snapshot(&store, &session_meta, &state, &h);
+                            drop(h);
+                            push_session_save_notice_if_error(&mut state, save_result);
+                        }
                         if reassert_mouse_capture {
                             terminal.reassert_mouse_capture()?;
                         }
@@ -277,6 +299,84 @@ pub async fn run_tui(paths: CliPaths) -> Result<(), CliError> {
     let _ = agent_handle.await;
 
     Ok(())
+}
+
+fn prepare_session_startup(
+    store: &SessionStore,
+    paths: &CliPaths,
+    config: &Config,
+    resume: bool,
+) -> Result<SessionStartup, CliError> {
+    if resume {
+        if let Some(id) = store.latest().map_err(cli_io_error)? {
+            let (meta, mut history, transcript) = store.load(&id).map_err(cli_io_error)?;
+            replace_system_head(&mut history, DEFAULT_SYSTEM_PROMPT);
+            let resume_provider = Some((meta.provider.clone(), meta.model.clone()));
+            return Ok(SessionStartup {
+                meta,
+                history,
+                transcript,
+                resume_provider,
+            });
+        }
+    }
+
+    let meta = SessionMeta {
+        id: SessionStore::new_session_id(),
+        provider: config.provider.id.clone(),
+        model: config.model.clone(),
+        created_at: created_at_now(),
+        cwd: paths.cwd.clone(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    Ok(SessionStartup {
+        meta,
+        history: vec![Message::System(DEFAULT_SYSTEM_PROMPT.to_string())],
+        transcript: Vec::new(),
+        resume_provider: None,
+    })
+}
+
+fn created_at_now() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn write_session_snapshot(
+    store: &SessionStore,
+    base_meta: &SessionMeta,
+    state: &app::AppState,
+    history: &[Message],
+) -> std::io::Result<()> {
+    let mut meta = base_meta.clone();
+    meta.provider = state.session.provider.clone();
+    meta.model = state.session.model.clone();
+    store.write(&meta, history, &state.transcript)
+}
+
+fn push_session_save_notice_if_error(state: &mut app::AppState, save_result: std::io::Result<()>) {
+    if save_result.is_err() {
+        state
+            .transcript
+            .push(app::TranscriptBlock::Notice("会话保存失败".to_string()));
+    }
+}
+
+fn cli_io_error(err: std::io::Error) -> CliError {
+    CliError::Io(err.to_string())
+}
+
+fn terminal_session_event(event: &channel::AgentEvent) -> bool {
+    matches!(
+        event,
+        channel::AgentEvent::TurnComplete
+            | channel::AgentEvent::CompactDone
+            | channel::AgentEvent::Interrupted
+            | channel::AgentEvent::Error(_)
+    )
 }
 
 /// ui_rx 臂的完整处理:apply 事件 + 三终止事件推进排队(同一调用内,先算 is_terminal 再 apply)。
@@ -1253,12 +1353,15 @@ mod tests {
     use super::{
         apply_mouse_wheel_scroll_to_state, arrows_route_to_completion, cancel_action,
         handle_mouse_selection_event, handle_queue_cancel_key, handle_resize, handle_selection_key,
-        run_agent_task, scroll_action_for_key, selection_key_action, should_exit, CancelAction,
-        MouseWheelScrollAction, RunAgentTaskConfig, SelectionKeyAction, DEFAULT_SYSTEM_PROMPT,
+        prepare_session_startup, push_session_save_notice_if_error, run_agent_task,
+        scroll_action_for_key, selection_key_action, should_exit, terminal_session_event,
+        write_session_snapshot, CancelAction, MouseWheelScrollAction, RunAgentTaskConfig,
+        SelectionKeyAction, DEFAULT_SYSTEM_PROMPT,
     };
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
     use crate::app::assemble_agent;
+    use crate::cli::CliPaths;
     use crate::config::{
         AuthType, Config, ProviderConfig, ProviderKind, ProviderProfile,
         DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS,
@@ -1269,8 +1372,9 @@ mod tests {
     use crate::provider::{
         DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, ToolCall,
     };
+    use crate::session::{SessionMeta, SessionStore};
     use crate::tool::ToolContext;
-    use crate::tui::app::CommandCompletion;
+    use crate::tui::app::{CommandCompletion, TranscriptBlock};
     use crate::tui::clipboard::Clipboard;
     use crate::tui::command::command_metadata;
     use crate::tui::selection::{Point, SelectionAction};
@@ -1285,6 +1389,7 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Instant as StdInstant;
@@ -1339,6 +1444,27 @@ mod tests {
         }
     }
 
+    fn cli_paths(temp: &tempfile::TempDir) -> CliPaths {
+        CliPaths {
+            user_config: temp.path().join("config.toml"),
+            project_config: temp.path().join("mysteries.toml"),
+            credentials: temp.path().join("credentials"),
+            config_dir: temp.path().join("config"),
+            cwd: temp.path().join("cwd"),
+        }
+    }
+
+    fn session_meta(id: &str) -> SessionMeta {
+        SessionMeta {
+            id: id.to_string(),
+            provider: "alt".to_string(),
+            model: "alt-model".to_string(),
+            created_at: "123".to_string(),
+            cwd: PathBuf::from("stored-cwd"),
+            app_version: "1.1.0".to_string(),
+        }
+    }
+
     fn task_hotswap(
         temp: &tempfile::TempDir,
         profiles: BTreeMap<String, ProviderProfile>,
@@ -1352,6 +1478,85 @@ mod tests {
                 max_output_bytes: 4096,
             },
         }
+    }
+
+    #[test]
+    fn prepare_session_startup_resumes_latest_replaces_system_and_returns_provider_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = cli_paths(&temp);
+        let store = SessionStore::new(paths.config_dir.join("sessions"));
+        let meta = session_meta("resume-session");
+        let history = vec![
+            Message::System("old system".to_string()),
+            Message::User("keep user".to_string()),
+        ];
+        let transcript = vec![TranscriptBlock::Notice("restored".to_string())];
+        store.write(&meta, &history, &transcript).unwrap();
+
+        let startup = prepare_session_startup(&store, &paths, &config(), true).unwrap();
+
+        assert_eq!(startup.meta, meta);
+        assert_eq!(
+            startup.history,
+            vec![
+                Message::System(DEFAULT_SYSTEM_PROMPT.to_string()),
+                Message::User("keep user".to_string()),
+            ]
+        );
+        assert_eq!(startup.transcript, transcript);
+        assert_eq!(
+            startup.resume_provider,
+            Some(("alt".to_string(), "alt-model".to_string()))
+        );
+    }
+
+    #[test]
+    fn terminal_session_event_matches_only_persisted_turn_boundaries() {
+        assert!(terminal_session_event(&AgentEvent::TurnComplete));
+        assert!(terminal_session_event(&AgentEvent::CompactDone));
+        assert!(terminal_session_event(&AgentEvent::Interrupted));
+        assert!(terminal_session_event(&AgentEvent::Error(
+            "boom".to_string()
+        )));
+        assert!(!terminal_session_event(&AgentEvent::TextDelta(
+            "delta".to_string()
+        )));
+        assert!(!terminal_session_event(&AgentEvent::Notice(
+            "notice".to_string()
+        )));
+    }
+
+    #[test]
+    fn session_save_failure_appends_notice_without_touching_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let bad_root = temp.path().join("not-a-directory");
+        fs::write(&bad_root, "file blocks create_dir_all").unwrap();
+        let store = SessionStore::new(bad_root);
+        let mut state = super::app::AppState::with_session(super::app::SessionSnapshot {
+            provider: "current-provider".to_string(),
+            model: "current-model".to_string(),
+            max_iterations: 4,
+            cwd: temp.path().to_path_buf(),
+            tools: 7,
+        });
+        state
+            .transcript
+            .push(TranscriptBlock::User("before".to_string()));
+        let history = vec![
+            Message::System(DEFAULT_SYSTEM_PROMPT.to_string()),
+            Message::User("kept".to_string()),
+        ];
+        let original_history = history.clone();
+
+        let save_result =
+            write_session_snapshot(&store, &session_meta("failed-save"), &state, &history);
+        push_session_save_notice_if_error(&mut state, save_result);
+
+        assert_eq!(history, original_history);
+        assert_eq!(
+            state.transcript.last(),
+            Some(&TranscriptBlock::Notice("会话保存失败".to_string()))
+        );
     }
 
     struct HangingProvider {

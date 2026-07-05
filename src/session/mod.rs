@@ -1,0 +1,532 @@
+use crate::agent::message::Message;
+use crate::tui::app::TranscriptBlock;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: String,
+    pub provider: String,
+    pub model: String,
+    pub created_at: String,
+    pub cwd: PathBuf,
+    pub app_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SessionLine {
+    Meta(SessionMeta),
+    Msg(Message),
+    Block(TranscriptBlock),
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionStore {
+    root: PathBuf,
+}
+
+impl SessionStore {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn new_session_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    pub fn session_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.jsonl"))
+    }
+
+    pub fn write(
+        &self,
+        meta: &SessionMeta,
+        history: &[Message],
+        transcript: &[TranscriptBlock],
+    ) -> io::Result<()> {
+        fs::create_dir_all(&self.root)?;
+        let mut lines = Vec::with_capacity(1 + history.len() + transcript.len());
+        lines.push(serialize_line(&SessionLine::Meta(meta.clone()))?);
+        for message in history {
+            lines.push(serialize_line(&SessionLine::Msg(message.clone()))?);
+        }
+        for block in transcript {
+            lines.push(serialize_line(&SessionLine::Block(block.clone()))?);
+        }
+
+        fs::write(
+            self.session_path(&meta.id),
+            format!("{}\n", lines.join("\n")),
+        )
+    }
+
+    pub fn load(&self, id: &str) -> io::Result<(SessionMeta, Vec<Message>, Vec<TranscriptBlock>)> {
+        let body = fs::read_to_string(self.session_path(id))?;
+        let mut meta = None;
+        let mut history = Vec::new();
+        let mut transcript = Vec::new();
+
+        for line in body.lines() {
+            match parse_line(line)? {
+                SessionLine::Meta(next_meta) => {
+                    if meta.replace(next_meta).is_some() {
+                        return Err(invalid_data("session contains more than one Meta line"));
+                    }
+                }
+                SessionLine::Msg(message) => history.push(message),
+                SessionLine::Block(block) => transcript.push(block),
+            }
+        }
+
+        let meta = meta.ok_or_else(|| invalid_data("session is missing Meta line"))?;
+        Ok((meta, history, transcript))
+    }
+
+    pub fn latest(&self) -> io::Result<Option<String>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let mut latest = None;
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let metadata = entry.metadata()?;
+            if !metadata.is_file() {
+                continue;
+            }
+            let modified = metadata.modified()?;
+            let is_newer = match latest.as_ref() {
+                Some((_, latest_modified)) => modified > *latest_modified,
+                None => true,
+            };
+            if is_newer {
+                latest = Some((id.to_string(), modified));
+            }
+        }
+
+        Ok(latest.map(|(id, _)| id))
+    }
+}
+
+fn serialize_line(line: &SessionLine) -> io::Result<String> {
+    serde_json::to_string(line).map_err(|err| invalid_data(err.to_string()))
+}
+
+fn parse_line(line: &str) -> io::Result<SessionLine> {
+    serde_json::from_str(line).map_err(|err| invalid_data(err.to_string()))
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[allow(clippy::ptr_arg)]
+pub fn replace_system_head(history: &mut Vec<Message>, prompt: &str) {
+    if let Some(Message::System(system)) = history.first_mut() {
+        *system = prompt.to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{replace_system_head, SessionLine, SessionMeta, SessionStore};
+    use crate::agent::message::Message;
+    use crate::provider::ToolCall;
+    use crate::tui::app::{StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock};
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::thread;
+    use std::time::Duration;
+
+    fn meta(id: &str) -> SessionMeta {
+        SessionMeta {
+            id: id.to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+            created_at: "2026-07-04T14:30:22Z".to_string(),
+            cwd: PathBuf::from("workspace"),
+            app_version: "1.1.0".to_string(),
+        }
+    }
+
+    fn history() -> Vec<Message> {
+        vec![
+            Message::System("system prompt".to_string()),
+            Message::User("run a command".to_string()),
+            Message::Assistant {
+                text: "I'll run it.".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({ "command": "echo hi" }),
+                }],
+            },
+            Message::ToolResult {
+                call_id: "call-1".to_string(),
+                content: "hi\n".to_string(),
+                is_error: false,
+            },
+            Message::Assistant {
+                text: "done".to_string(),
+                tool_calls: vec![],
+            },
+        ]
+    }
+
+    fn status_snapshot() -> StatusSnapshot {
+        StatusSnapshot {
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+            iteration: 1,
+            max_iterations: 8,
+            messages: 5,
+            cwd: PathBuf::from("workspace"),
+            tools: 7,
+        }
+    }
+
+    fn tool_card(exit: Option<i32>, truncated: bool) -> ToolCard {
+        ToolCard {
+            id: "call-1".to_string(),
+            name: "shell".to_string(),
+            args: json!({ "command": "echo hi", "cwd": "workspace" }),
+            readonly: false,
+            status: ToolCardStatus::Error,
+            output: Some("stderr".to_string()),
+            truncated,
+            exit,
+        }
+    }
+
+    fn transcript() -> Vec<TranscriptBlock> {
+        vec![
+            TranscriptBlock::User("run a command".to_string()),
+            TranscriptBlock::Tool(tool_card(Some(2), true)),
+            TranscriptBlock::Assistant("done".to_string()),
+        ]
+    }
+
+    fn store_at(root: &Path) -> SessionStore {
+        SessionStore::new(root.to_path_buf())
+    }
+
+    fn write_lines(root: &Path, id: &str, lines: &[SessionLine]) {
+        fs::create_dir_all(root).expect("session root should be created");
+        let store = store_at(root);
+        let body = lines
+            .iter()
+            .map(|line| serde_json::to_string(line).expect("session line should serialize"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(store.session_path(id), format!("{body}\n"))
+            .expect("session file should be written");
+    }
+
+    fn single_tag(value: Value) -> String {
+        let object = value.as_object().expect("session line should be object");
+        assert_eq!(object.len(), 1);
+        object
+            .keys()
+            .next()
+            .expect("tag key should exist")
+            .to_string()
+    }
+
+    fn looks_like_uuid_v4(id: &str) -> bool {
+        let bytes = id.as_bytes();
+        id.len() == 36
+            && [8, 13, 18, 23].into_iter().all(|i| bytes[i] == b'-')
+            && bytes[14] == b'4'
+            && matches!(bytes[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
+            && id
+                .chars()
+                .enumerate()
+                .all(|(i, ch)| [8, 13, 18, 23].contains(&i) || ch.is_ascii_hexdigit())
+    }
+
+    #[test]
+    fn session_line_uses_external_tags() {
+        assert_eq!(
+            single_tag(serde_json::to_value(SessionLine::Meta(meta("session-1"))).unwrap()),
+            "Meta"
+        );
+        assert_eq!(
+            single_tag(
+                serde_json::to_value(SessionLine::Msg(Message::User("hi".to_string()))).unwrap()
+            ),
+            "Msg"
+        );
+        assert_eq!(
+            single_tag(
+                serde_json::to_value(SessionLine::Block(TranscriptBlock::Status(
+                    status_snapshot()
+                )))
+                .unwrap()
+            ),
+            "Block"
+        );
+    }
+
+    #[test]
+    fn write_then_load_round_trips_meta_history_and_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let store = store_at(&root);
+        let meta = meta("session-round-trip");
+        let history = history();
+        let transcript = transcript();
+
+        store.write(&meta, &history, &transcript).unwrap();
+        let loaded = store.load(&meta.id).unwrap();
+
+        assert_eq!(loaded, (meta, history, transcript));
+    }
+
+    #[test]
+    fn load_dispatches_lines_without_requiring_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let id = "session-interleaved";
+        let meta = meta(id);
+        let msg = Message::User("hi".to_string());
+        let block = TranscriptBlock::Tool(tool_card(None, false));
+        write_lines(
+            &root,
+            id,
+            &[
+                SessionLine::Block(block.clone()),
+                SessionLine::Meta(meta.clone()),
+                SessionLine::Msg(msg.clone()),
+            ],
+        );
+
+        let loaded = store_at(&root).load(id).unwrap();
+
+        assert_eq!(loaded, (meta, vec![msg], vec![block]));
+    }
+
+    #[test]
+    fn latest_returns_none_for_empty_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_at(&temp.path().join("sessions"));
+
+        assert_eq!(store.latest().unwrap(), None);
+    }
+
+    #[test]
+    fn latest_returns_newest_jsonl_and_ignores_other_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("older.jsonl"), "{}\n").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        fs::write(root.join("ignored.txt"), "{}\n").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        fs::write(root.join("newer.jsonl"), "{}\n").unwrap();
+        let store = store_at(&root);
+
+        assert_eq!(store.latest().unwrap(), Some("newer".to_string()));
+    }
+
+    #[test]
+    fn new_session_id_is_uuid_v4_and_unique() {
+        let first = SessionStore::new_session_id();
+        let second = SessionStore::new_session_id();
+
+        assert!(
+            looks_like_uuid_v4(&first),
+            "{first} should look like uuid v4"
+        );
+        assert!(
+            looks_like_uuid_v4(&second),
+            "{second} should look like uuid v4"
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn write_uses_meta_id_as_file_name_and_load_preserves_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let store = store_at(&root);
+        let id = SessionStore::new_session_id();
+        let meta = meta(&id);
+
+        store.write(&meta, &history(), &transcript()).unwrap();
+
+        let path = store.session_path(&id);
+        assert!(path.exists(), "{} should exist", path.display());
+        assert_eq!(path.file_name().unwrap(), format!("{id}.jsonl").as_str());
+        let (loaded_meta, _, _) = store.load(&id).unwrap();
+        assert_eq!(loaded_meta.id, id);
+    }
+
+    #[test]
+    fn load_returns_err_for_invalid_json_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let id = "session-invalid-json";
+        fs::write(
+            store_at(&root).session_path(id),
+            format!(
+                "{}\nnot json\n",
+                serde_json::to_string(&SessionLine::Meta(meta(id))).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(store_at(&root).load(id).is_err());
+    }
+
+    #[test]
+    fn load_returns_err_for_unknown_tag() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let id = "session-unknown-tag";
+        fs::write(
+            store_at(&root).session_path(id),
+            format!(
+                "{}\n{{\"Unknown\":{{}}}}\n",
+                serde_json::to_string(&SessionLine::Meta(meta(id))).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(store_at(&root).load(id).is_err());
+    }
+
+    #[test]
+    fn load_returns_err_when_meta_line_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let id = "session-no-meta";
+        write_lines(
+            &root,
+            id,
+            &[SessionLine::Msg(Message::User("hi".to_string()))],
+        );
+
+        assert!(store_at(&root).load(id).is_err());
+    }
+
+    #[test]
+    fn load_returns_err_when_meta_line_is_duplicated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let id = "session-two-meta";
+        write_lines(
+            &root,
+            id,
+            &[
+                SessionLine::Meta(meta(id)),
+                SessionLine::Msg(Message::User("hi".to_string())),
+                SessionLine::Meta(meta(id)),
+            ],
+        );
+
+        assert!(store_at(&root).load(id).is_err());
+    }
+
+    #[test]
+    fn second_write_rewrites_file_without_stale_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let store = store_at(&root);
+        let meta = meta("session-compact");
+        let first_history = (0..10)
+            .map(|i| Message::User(format!("before compact {i}")))
+            .collect::<Vec<_>>();
+        let second_history = (0..4)
+            .map(|i| Message::User(format!("after compact {i}")))
+            .collect::<Vec<_>>();
+
+        store.write(&meta, &first_history, &[]).unwrap();
+        store.write(&meta, &second_history, &[]).unwrap();
+
+        let body = fs::read_to_string(store.session_path(&meta.id)).unwrap();
+        let msg_lines = body
+            .lines()
+            .filter(|line| line.starts_with("{\"Msg\""))
+            .count();
+        assert_eq!(msg_lines, 4);
+        assert!(!body.contains("before compact"));
+    }
+
+    #[test]
+    fn empty_history_and_transcript_round_trip_as_meta_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let store = store_at(&root);
+        let meta = meta("session-empty");
+
+        store.write(&meta, &[], &[]).unwrap();
+        let (loaded_meta, loaded_history, loaded_transcript) = store.load(&meta.id).unwrap();
+        let body = fs::read_to_string(store.session_path(&meta.id)).unwrap();
+
+        assert_eq!(loaded_meta, meta);
+        assert!(loaded_history.is_empty());
+        assert!(loaded_transcript.is_empty());
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.starts_with("{\"Meta\""));
+    }
+
+    #[test]
+    fn replace_system_head_replaces_only_existing_system_head() {
+        let mut history = vec![
+            Message::System("old system".to_string()),
+            Message::User("keep user".to_string()),
+            Message::Assistant {
+                text: "keep assistant".to_string(),
+                tool_calls: vec![],
+            },
+        ];
+
+        replace_system_head(&mut history, "new system");
+
+        assert_eq!(history[0], Message::System("new system".to_string()));
+        assert_eq!(history[1], Message::User("keep user".to_string()));
+        assert_eq!(
+            history[2],
+            Message::Assistant {
+                text: "keep assistant".to_string(),
+                tool_calls: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn replace_system_head_leaves_empty_history_unchanged() {
+        let mut history = Vec::new();
+
+        replace_system_head(&mut history, "new system");
+
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn replace_system_head_leaves_non_system_head_unchanged() {
+        let mut history = vec![
+            Message::User("first user".to_string()),
+            Message::System("not the head".to_string()),
+        ];
+        let original = history.clone();
+
+        replace_system_head(&mut history, "new system");
+
+        assert_eq!(history, original);
+    }
+}

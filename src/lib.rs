@@ -6,6 +6,7 @@ pub mod credential;
 pub mod error;
 pub mod permission;
 pub mod provider;
+pub mod session;
 pub mod tool;
 pub mod tui;
 

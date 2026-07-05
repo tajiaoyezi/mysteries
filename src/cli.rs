@@ -26,6 +26,7 @@ pub struct CliPaths {
     pub user_config: PathBuf,
     pub project_config: PathBuf,
     pub credentials: PathBuf,
+    pub config_dir: PathBuf,
     pub cwd: PathBuf,
 }
 
@@ -960,6 +961,7 @@ mod tests {
             user_config: temp.path().join("config.toml"),
             project_config: temp.path().join("mysteries.toml"),
             credentials: temp.path().join("credentials"),
+            config_dir: temp.path().to_path_buf(),
             cwd: temp.path().to_path_buf(),
         }
     }

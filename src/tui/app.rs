@@ -11,6 +11,7 @@ use crate::tui::input_buffer::{reduce_input_buffer, InputBufferAction, InputBuff
 use crate::tui::jump_to_bottom::{bump_new_message_count, new_message_count_on_follow_bottom};
 use crate::tui::selection::{reduce_selection, SelectionAction, SelectionState};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,7 +39,7 @@ impl Phase {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TranscriptBlock {
     User(String),
     Assistant(String),
@@ -70,7 +71,7 @@ impl Default for SessionSnapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub provider: String,
     pub model: String,
@@ -81,14 +82,14 @@ pub struct StatusSnapshot {
     pub tools: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolCardStatus {
     Running,
     Done,
     Error,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCard {
     pub id: String,
     pub name: String,
@@ -1376,8 +1377,10 @@ mod tests {
     use crate::tui::input_batch::{PasteTailMatcher, TailAction};
     use crate::tui::selection::{Point, SelectionAction};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use serde::{de::DeserializeOwned, Serialize};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::fmt::Debug;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use tokio::sync::{mpsc, oneshot};
@@ -1438,6 +1441,92 @@ mod tests {
             model: model.to_string(),
             auth_type: AuthType::ApiKey,
         }
+    }
+
+    fn assert_json_round_trip<T>(value: T)
+    where
+        T: Serialize + DeserializeOwned + PartialEq + Debug,
+    {
+        let encoded = serde_json::to_string(&value).expect("value should serialize");
+        let decoded: T = serde_json::from_str(&encoded).expect("value should deserialize");
+        assert_eq!(decoded, value);
+    }
+
+    fn status_snapshot() -> StatusSnapshot {
+        StatusSnapshot {
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+            iteration: 2,
+            max_iterations: 8,
+            messages: 5,
+            cwd: PathBuf::from("workspace"),
+            tools: 7,
+        }
+    }
+
+    fn tool_card(status: ToolCardStatus, exit: Option<i32>) -> ToolCard {
+        ToolCard {
+            id: format!("call-{status:?}-{exit:?}"),
+            name: "shell".to_string(),
+            args: json!({
+                "command": "echo hello",
+                "metadata": {
+                    "cwd": "workspace",
+                    "attempt": 1
+                }
+            }),
+            readonly: false,
+            status,
+            output: Some("hello\n".to_string()),
+            truncated: exit.is_none(),
+            exit,
+        }
+    }
+
+    #[test]
+    fn transcript_block_round_trips_all_variants() {
+        let blocks = vec![
+            TranscriptBlock::User("user input".to_string()),
+            TranscriptBlock::Assistant("assistant answer".to_string()),
+            TranscriptBlock::Tool(tool_card(ToolCardStatus::Done, Some(0))),
+            TranscriptBlock::Error("model failed".to_string()),
+            TranscriptBlock::Help,
+            TranscriptBlock::Status(status_snapshot()),
+            TranscriptBlock::Notice("session saved".to_string()),
+        ];
+
+        for block in blocks {
+            assert_json_round_trip(block);
+        }
+    }
+
+    #[test]
+    fn tool_card_round_trips_args_exit_and_statuses() {
+        let cards = [
+            tool_card(ToolCardStatus::Running, None),
+            tool_card(ToolCardStatus::Done, Some(0)),
+            tool_card(ToolCardStatus::Error, Some(2)),
+        ];
+
+        for card in cards {
+            assert_json_round_trip(card);
+        }
+    }
+
+    #[test]
+    fn tool_card_status_round_trips_all_variants() {
+        for status in [
+            ToolCardStatus::Running,
+            ToolCardStatus::Done,
+            ToolCardStatus::Error,
+        ] {
+            assert_json_round_trip(status);
+        }
+    }
+
+    #[test]
+    fn status_snapshot_round_trips() {
+        assert_json_round_trip(status_snapshot());
     }
 
     fn wps_openai_profiles() -> BTreeMap<String, ProviderProfile> {

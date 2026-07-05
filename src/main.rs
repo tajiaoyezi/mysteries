@@ -20,7 +20,18 @@ async fn main() -> ExitCode {
 }
 
 async fn real_main() -> Result<(), CliError> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
+    let mut resume = false;
+    let args = env::args()
+        .skip(1)
+        .filter_map(|arg| {
+            if arg == "--resume" {
+                resume = true;
+                None
+            } else {
+                Some(arg)
+            }
+        })
+        .collect::<Vec<_>>();
     let paths = default_paths()?;
 
     if args.first().map(String::as_str) == Some("auth") {
@@ -44,7 +55,7 @@ async fn real_main() -> Result<(), CliError> {
         let prompt = read_prompt(&args)?;
         run_cli(paths, &prompt).await
     } else {
-        run_tui(paths).await
+        run_tui(paths, resume).await
     }
 }
 
@@ -77,6 +88,7 @@ fn default_paths() -> io::Result<CliPaths> {
         user_config: config_dir.join("config.toml"),
         project_config: cwd.join("mysteries.toml"),
         credentials: config_dir.join("credentials"),
+        config_dir,
         cwd,
     })
 }
