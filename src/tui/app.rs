@@ -1,15 +1,16 @@
-use crate::agent::message::Message;
 use crate::agent::AgentStatus;
+use crate::agent::message::Message;
 use crate::config::ProviderProfile;
-use crate::permission::{cycle_permission_mode, PermissionDecision, PermissionMode};
-use crate::provider::registry::models_for;
+use crate::permission::{PermissionDecision, PermissionMode, cycle_permission_mode};
 use crate::provider::Usage;
+use crate::provider::registry::models_for;
+use crate::session::SessionSummary;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
-use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
+use crate::tui::command::{Command, CommandMetadata, command_metadata, parse_command};
 use crate::tui::input_batch::{PasteTailMatcher, TailAction};
-use crate::tui::input_buffer::{reduce_input_buffer, InputBufferAction, InputBufferState};
+use crate::tui::input_buffer::{InputBufferAction, InputBufferState, reduce_input_buffer};
 use crate::tui::jump_to_bottom::{bump_new_message_count, new_message_count_on_follow_bottom};
-use crate::tui::selection::{reduce_selection, SelectionAction, SelectionState};
+use crate::tui::selection::{SelectionAction, SelectionState, reduce_selection};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +18,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const ASCII_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
@@ -129,6 +130,18 @@ pub struct ModelsPicker {
     filter: String,
     visible_indices: Vec<usize>,
     highlight_visible_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRow {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionPicker {
+    pub rows: Vec<SessionRow>,
+    pub highlighted: usize,
 }
 
 pub fn build_rows(
@@ -332,6 +345,40 @@ impl ModelsPicker {
     }
 }
 
+impl SessionPicker {
+    pub fn new(summaries: Vec<SessionSummary>) -> Self {
+        let rows = summaries
+            .into_iter()
+            .map(|summary| {
+                let short_id = summary.id.chars().take(8).collect::<String>();
+                let first_user = summary.first_user.as_deref().unwrap_or("(无输入)");
+                SessionRow {
+                    id: summary.id,
+                    label: format!("{short_id} · {} · {first_user}", summary.created_at),
+                }
+            })
+            .collect();
+        Self {
+            rows,
+            highlighted: 0,
+        }
+    }
+
+    pub fn move_highlight(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            self.highlighted = 0;
+            return;
+        }
+
+        let max = self.rows.len().saturating_sub(1) as isize;
+        self.highlighted = (self.highlighted as isize + delta).clamp(0, max) as usize;
+    }
+
+    pub fn selected(&self) -> Option<&str> {
+        self.rows.get(self.highlighted).map(|row| row.id.as_str())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffKind {
     Add,
@@ -409,6 +456,7 @@ pub struct AppState {
     pub tools_expanded: bool,
     pub command_completion: Option<CommandCompletion>,
     pub models_picker: Option<ModelsPicker>,
+    pub session_picker: Option<SessionPicker>,
     pub provider_profiles: BTreeMap<String, ProviderProfile>,
     pub input_line: InputBufferState,
     pub selection: SelectionState,
@@ -429,8 +477,10 @@ pub struct AppState {
     idle_rate_is_approximate: bool,
     /// running 时提交的 prompt 排队(FIFO);推进时 pop 队首进 transcript。
     pub pending_queue: Vec<String>,
+    pending_session_switch: Option<String>,
     /// 最近一次「第 1 次取消键」时刻;Task 4 时间窗两级取消用。
     last_cancel_at: Option<Instant>,
+    last_exit_intent_at: Option<Instant>,
     copy_hint: Option<CopyHint>,
     pub paste_tail: Option<PasteTailState>,
     paste_receiving_hint: bool,
@@ -462,6 +512,7 @@ impl AppState {
             tools_expanded: false,
             command_completion: None,
             models_picker: None,
+            session_picker: None,
             provider_profiles: BTreeMap::new(),
             input_line: InputBufferState::default(),
             selection: SelectionState::default(),
@@ -481,7 +532,9 @@ impl AppState {
             idle_rate_tps: None,
             idle_rate_is_approximate: false,
             pending_queue: Vec::new(),
+            pending_session_switch: None,
             last_cancel_at: None,
+            last_exit_intent_at: None,
             copy_hint: None,
             paste_tail: None,
             paste_receiving_hint: false,
@@ -515,12 +568,32 @@ impl AppState {
         !self.pending_queue.is_empty()
     }
 
+    pub fn open_session_picker(&mut self, summaries: Vec<SessionSummary>) {
+        self.session_picker = Some(SessionPicker::new(summaries));
+    }
+
+    pub fn close_session_picker(&mut self) {
+        self.session_picker = None;
+    }
+
+    pub fn take_pending_session_switch(&mut self) -> Option<String> {
+        self.pending_session_switch.take()
+    }
+
     pub(crate) fn last_cancel_at(&self) -> Option<Instant> {
         self.last_cancel_at
     }
 
     pub(crate) fn set_last_cancel_at(&mut self, at: Instant) {
         self.last_cancel_at = Some(at);
+    }
+
+    pub(crate) fn last_exit_intent_at(&self) -> Option<Instant> {
+        self.last_exit_intent_at
+    }
+
+    pub(crate) fn set_last_exit_intent_at(&mut self, at: Instant) {
+        self.last_exit_intent_at = Some(at);
     }
 
     /// 记录复制成功轻提示(现在开始计时;新复制覆盖旧 hint 并重新计时)。
@@ -918,6 +991,43 @@ impl AppState {
         }
     }
 
+    pub fn handle_session_picker_key(&mut self, key: KeyEvent) -> bool {
+        if self.session_picker.is_none() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                if let Some(picker) = self.session_picker.as_mut() {
+                    picker.move_highlight(-1);
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(picker) = self.session_picker.as_mut() {
+                    picker.move_highlight(1);
+                }
+                true
+            }
+            KeyCode::Enter => {
+                let selected = self
+                    .session_picker
+                    .as_ref()
+                    .and_then(|picker| picker.selected().map(str::to_string));
+                if let Some(id) = selected {
+                    self.pending_session_switch = Some(id);
+                    self.close_session_picker();
+                }
+                true
+            }
+            KeyCode::Esc => {
+                self.close_session_picker();
+                true
+            }
+            _ => true,
+        }
+    }
+
     fn handle_command_completion_key(&mut self, key: KeyEvent) -> bool {
         if self.command_completion.is_none() {
             return false;
@@ -1106,7 +1216,9 @@ impl AppState {
             return;
         }
 
-        if key.code == KeyCode::Esc && self.phase.is_running() {
+        let interrupt_key = key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        if interrupt_key && self.phase.is_running() {
             if let Some(tx) = interrupt_tx {
                 let _ = tx.send(UserInput::Interrupt);
             }
@@ -1363,21 +1475,23 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_rows, compute_diff, estimate_streaming_rate_tps, estimate_tokens_from_chars,
-        AppState, DiffKind, DiffLine, ModelsPicker, ModelsPickerRowKind, Phase, SessionSnapshot,
-        StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock, PASTE_TAIL_QUIET_FALLBACK,
+        AppState, DiffKind, DiffLine, ModelsPicker, ModelsPickerRowKind, PASTE_TAIL_QUIET_FALLBACK,
+        Phase, SessionPicker, SessionRow, SessionSnapshot, StatusSnapshot, ToolCard,
+        ToolCardStatus, TranscriptBlock, build_rows, compute_diff, estimate_streaming_rate_tps,
+        estimate_tokens_from_chars,
     };
     use crate::agent::AgentStatus;
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::{PermissionDecision, PermissionMode};
     use crate::provider::Usage;
+    use crate::session::SessionSummary;
     use crate::tool::ToolOutcome;
     use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
     use crate::tui::command::Command;
     use crate::tui::input_batch::{PasteTailMatcher, TailAction};
     use crate::tui::selection::{Point, SelectionAction};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fmt::Debug;
@@ -1616,6 +1730,161 @@ mod tests {
         assert!(!state.has_queue());
     }
 
+    #[test]
+    fn last_exit_intent_at_round_trips_through_app_state() {
+        let mut state = AppState::new();
+        let at = Instant::now();
+
+        assert_eq!(state.last_exit_intent_at(), None);
+        state.set_last_exit_intent_at(at);
+
+        assert_eq!(state.last_exit_intent_at(), Some(at));
+    }
+
+    fn session_summary(id: &str, created_at: &str, first_user: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            created_at: created_at.to_string(),
+            first_user: first_user.map(str::to_string),
+        }
+    }
+
+    fn session_row(id: &str) -> SessionRow {
+        SessionRow {
+            id: id.to_string(),
+            label: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn session_picker_new_builds_labels_from_summary_fields() {
+        let picker = SessionPicker::new(vec![session_summary(
+            "1234567890abcdef",
+            "2026-07-04T14:30:22Z",
+            Some("first prompt"),
+        )]);
+
+        assert_eq!(picker.highlighted, 0);
+        assert_eq!(picker.rows.len(), 1);
+        let row = &picker.rows[0];
+        assert_eq!(row.id, "1234567890abcdef");
+        assert!(row.label.contains("12345678"));
+        assert!(!row.label.contains("1234567890abcdef"));
+        assert!(row.label.contains("2026-07-04T14:30:22Z"));
+        assert!(row.label.contains("first prompt"));
+    }
+
+    #[test]
+    fn session_picker_new_handles_missing_first_user() {
+        let picker = SessionPicker::new(vec![session_summary(
+            "abcdef1234567890",
+            "2026-07-04T15:01:02Z",
+            None,
+        )]);
+
+        assert_eq!(picker.rows.len(), 1);
+        let row = &picker.rows[0];
+        assert_eq!(row.id, "abcdef1234567890");
+        assert!(row.label.contains("abcdef12"));
+        assert!(row.label.contains("2026-07-04T15:01:02Z"));
+    }
+
+    #[test]
+    fn session_picker_move_highlight_clamps_to_bounds() {
+        let mut picker = SessionPicker {
+            rows: vec![session_row("a"), session_row("b")],
+            highlighted: 0,
+        };
+
+        picker.move_highlight(-1);
+        assert_eq!(picker.highlighted, 0);
+
+        picker.move_highlight(10);
+        assert_eq!(picker.highlighted, 1);
+
+        picker.move_highlight(-10);
+        assert_eq!(picker.highlighted, 0);
+    }
+
+    #[test]
+    fn session_picker_key_navigation_moves_highlight_with_clamping() {
+        let mut state = AppState::new();
+        state.open_session_picker(vec![
+            session_summary("session-a", "created-a", Some("first a")),
+            session_summary("session-b", "created-b", Some("first b")),
+            session_summary("session-c", "created-c", Some("first c")),
+        ]);
+
+        assert!(state.handle_session_picker_key(key(KeyCode::Down)));
+        assert_eq!(state.session_picker.as_ref().unwrap().highlighted, 1);
+
+        assert!(state.handle_session_picker_key(key(KeyCode::Down)));
+        assert_eq!(state.session_picker.as_ref().unwrap().highlighted, 2);
+
+        assert!(state.handle_session_picker_key(key(KeyCode::Down)));
+        assert_eq!(state.session_picker.as_ref().unwrap().highlighted, 2);
+
+        assert!(state.handle_session_picker_key(key(KeyCode::Up)));
+        assert_eq!(state.session_picker.as_ref().unwrap().highlighted, 1);
+
+        assert!(state.handle_session_picker_key(key(KeyCode::Up)));
+        assert_eq!(state.session_picker.as_ref().unwrap().highlighted, 0);
+
+        assert!(state.handle_session_picker_key(key(KeyCode::Up)));
+        assert_eq!(state.session_picker.as_ref().unwrap().highlighted, 0);
+    }
+
+    #[test]
+    fn session_picker_enter_sets_pending_switch_and_closes_picker() {
+        let mut state = AppState::new();
+        state.open_session_picker(vec![
+            session_summary("session-a", "created-a", Some("first a")),
+            session_summary("session-b", "created-b", Some("first b")),
+        ]);
+        state.session_picker.as_mut().unwrap().highlighted = 1;
+
+        assert!(state.handle_session_picker_key(key(KeyCode::Enter)));
+
+        assert!(state.session_picker.is_none());
+        assert_eq!(
+            state.take_pending_session_switch(),
+            Some("session-b".to_string())
+        );
+        assert_eq!(state.take_pending_session_switch(), None);
+    }
+
+    #[test]
+    fn session_picker_escape_closes_without_pending_switch() {
+        let mut state = AppState::new();
+        state.open_session_picker(vec![session_summary(
+            "session-a",
+            "created-a",
+            Some("first a"),
+        )]);
+
+        assert!(state.handle_session_picker_key(key(KeyCode::Esc)));
+
+        assert!(state.session_picker.is_none());
+        assert_eq!(state.take_pending_session_switch(), None);
+    }
+
+    #[test]
+    fn session_picker_catch_all_consumes_character_without_input_or_switch() {
+        let mut state = AppState::new();
+        state.open_session_picker(vec![session_summary(
+            "session-a",
+            "created-a",
+            Some("first a"),
+        )]);
+        state.set_input_text("keep");
+
+        assert!(state.handle_session_picker_key(key(KeyCode::Char('x'))));
+
+        assert!(state.session_picker.is_some());
+        assert_eq!(state.input(), "keep");
+        assert_eq!(state.take_pending_session_switch(), None);
+    }
+
     // --- 消息排队 Task 2(提交分流) ---
 
     #[test]
@@ -1755,9 +2024,11 @@ mod tests {
             .filter(|row| row.provider_id == "wps" && row.kind == ModelsPickerRowKind::Model)
             .collect();
         assert_eq!(wps_models.len(), 8, "wps catalog has 8 models");
-        assert!(wps_models
-            .iter()
-            .any(|row| row.model.as_deref() == Some("zhipu/glm-5.2") && row.is_current));
+        assert!(
+            wps_models
+                .iter()
+                .any(|row| row.model.as_deref() == Some("zhipu/glm-5.2") && row.is_current)
+        );
         assert_eq!(wps_models.iter().filter(|row| row.is_current).count(), 1);
 
         let openai_header = rows
@@ -1863,14 +2134,16 @@ mod tests {
                     || row.provider_id == "wps"),
             "only wps group should remain when filtering glm"
         );
-        assert!(visible
-            .iter()
-            .filter(|row| row.kind == ModelsPickerRowKind::Model)
-            .all(|row| {
-                let haystack =
-                    format!("{}/{}", row.provider_id, row.model.as_deref().unwrap_or(""));
-                haystack.to_lowercase().contains("glm")
-            }));
+        assert!(
+            visible
+                .iter()
+                .filter(|row| row.kind == ModelsPickerRowKind::Model)
+                .all(|row| {
+                    let haystack =
+                        format!("{}/{}", row.provider_id, row.model.as_deref().unwrap_or(""));
+                    haystack.to_lowercase().contains("glm")
+                })
+        );
 
         let highlighted = picker.highlighted_row().expect("highlight after filter");
         assert_eq!(highlighted.kind, ModelsPickerRowKind::Model);
@@ -2739,6 +3012,29 @@ mod tests {
         assert!(state.tools_expanded);
     }
 
+    #[test]
+    fn running_ctrl_c_sends_interrupt_without_exiting() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.phase = Phase::CallingModel;
+
+        state.on_key_with_interrupt(
+            key_with_modifiers_and_kind(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        assert_eq!(interrupt_rx.try_recv().unwrap(), UserInput::Interrupt);
+        assert!(input_rx.try_recv().is_err());
+        assert!(!state.should_exit);
+        assert_eq!(state.phase, Phase::CallingModel);
+    }
+
     fn completion_names(state: &AppState) -> Vec<&'static str> {
         state
             .command_completion
@@ -2766,7 +3062,9 @@ mod tests {
         state.on_key(key(KeyCode::Char('/')), &tx);
         assert_eq!(
             completion_names(&state),
-            vec!["/help", "/clear", "/model", "/models", "/status", "/exit", "/compact"]
+            vec![
+                "/help", "/clear", "/model", "/models", "/status", "/exit", "/compact"
+            ]
         );
         assert_eq!(selected_completion_name(&state), "/help");
 
@@ -3304,7 +3602,7 @@ mod tests {
         interrupt_tx: &mpsc::UnboundedSender<UserInput>,
     ) {
         use crate::tui::app::{
-            apply_batch_input_key, flush_merged_input_chars, ApplyBatchKeyResult,
+            ApplyBatchKeyResult, apply_batch_input_key, flush_merged_input_chars,
         };
         use crate::tui::input_batch::classify_key_batch;
 

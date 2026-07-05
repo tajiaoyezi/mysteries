@@ -1,17 +1,17 @@
+use crate::agent::DEFAULT_SYSTEM_PROMPT;
 use crate::agent::message::Message;
 use crate::agent::run_compact_command;
-use crate::agent::DEFAULT_SYSTEM_PROMPT;
 use crate::agent::{Agent, AgentStatus, Compacting};
 use crate::app::select_provider;
-use crate::cli::{load_config_or_onboard, CliError, CliPaths, StdinAuthPrompter};
+use crate::cli::{CliError, CliPaths, StdinAuthPrompter, load_config_or_onboard};
 use crate::config::{Config, ProviderConfig, ProviderKind, ProviderProfile};
 use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSource};
 use crate::error::AgentError;
 use crate::permission::PermissionMode;
 use crate::provider::Usage;
-use crate::session::{replace_system_head, SessionMeta, SessionStore};
+use crate::session::{SessionMeta, SessionStore, replace_system_head};
 use crate::tool::ToolContext;
-use crate::tui::clipboard::{copy_selection, ArboardClipboard, Clipboard};
+use crate::tui::clipboard::{ArboardClipboard, Clipboard, copy_selection};
 use crate::tui::selection::{Point, SelectionAction};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, MissedTickBehavior};
 
 pub mod app;
@@ -44,6 +44,23 @@ pub mod terminal;
 pub mod theme;
 pub(crate) mod width;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupMode {
+    Fresh,
+    Resume,
+    Continue,
+}
+
+pub fn startup_mode(resume: bool, continue_: bool) -> StartupMode {
+    if resume {
+        StartupMode::Resume
+    } else if continue_ {
+        StartupMode::Continue
+    } else {
+        StartupMode::Fresh
+    }
+}
+
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const EVENT_BATCH_CAP: usize = 1 << 20;
 const PASTE_CONTINUATION_GRACE: StdDuration = StdDuration::from_millis(10);
@@ -55,6 +72,7 @@ const PASTE_COALESCE_MIN_EVENTS: usize = 4;
 const PASTE_COALESCE_GRACE: StdDuration = StdDuration::from_millis(30);
 const PASTE_FAST_TOPUP_ROUNDS: usize = 5;
 const CANCEL_DOUBLE_TAP: StdDuration = StdDuration::from_millis(600);
+pub const EXIT_DOUBLE_TAP: StdDuration = StdDuration::from_secs(1);
 
 pub struct RunAgentTaskConfig {
     pub profiles: BTreeMap<String, ProviderProfile>,
@@ -70,15 +88,15 @@ struct SessionStartup {
     resume_provider: Option<(String, String)>,
 }
 
-pub async fn run_tui(paths: CliPaths, resume: bool) -> Result<(), CliError> {
+pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError> {
     let mut prompter = StdinAuthPrompter;
     let config = load_config_or_onboard(&paths, &mut prompter)?;
     let profiles =
         crate::app::provider_profiles_from_paths(&paths.user_config, &paths.project_config)
             .map_err(CliError::from)?;
     let store = SessionStore::new(paths.config_dir.join("sessions"));
-    let session_startup = prepare_session_startup(&store, &paths, &config, resume)?;
-    let session_meta = session_startup.meta.clone();
+    let session_startup = prepare_session_startup(&store, &paths, &config, mode)?;
+    let mut session_meta = session_startup.meta.clone();
     let resume_provider = session_startup.resume_provider.clone();
     let credentials = CredentialChain::new(vec![
         Box::new(EnvCredentialSource::new()),
@@ -134,6 +152,12 @@ pub async fn run_tui(paths: CliPaths, resume: bool) -> Result<(), CliError> {
     state.provider_profiles = profiles;
     state.permission_mode = permission_mode;
     state.transcript = session_startup.transcript;
+    if mode == StartupMode::Resume {
+        let summaries = store.list_sessions().map_err(cli_io_error)?;
+        if !summaries.is_empty() {
+            state.open_session_picker(summaries);
+        }
+    }
     if let Some((id, model)) = resume_provider {
         let _ = input_tx.send(channel::UserInput::SetProvider { id, model });
     }
@@ -289,6 +313,30 @@ pub async fn run_tui(paths: CliPaths, resume: bool) -> Result<(), CliError> {
             }
         }
 
+        if let Some(id) = state.take_pending_session_switch() {
+            match store.load(&id) {
+                Ok((meta, mut history, transcript)) => {
+                    replace_system_head(&mut history, DEFAULT_SYSTEM_PROMPT);
+                    let mut h = state.agent_history.lock().await;
+                    *h = history;
+                    drop(h);
+                    state.transcript = transcript;
+                    let provider = meta.provider.clone();
+                    let model = meta.model.clone();
+                    let _ = input_tx.send(channel::UserInput::SetProvider {
+                        id: provider.clone(),
+                        model: model.clone(),
+                    });
+                    state.session.provider = provider;
+                    state.session.model = model;
+                    session_meta = meta;
+                }
+                Err(_) => state
+                    .transcript
+                    .push(app::TranscriptBlock::Notice("会话切换失败".to_string())),
+            }
+        }
+
         if !skip_frame {
             draw_frame(&mut terminal, &state, &theme, &mut last_frame)?;
         }
@@ -305,9 +353,9 @@ fn prepare_session_startup(
     store: &SessionStore,
     paths: &CliPaths,
     config: &Config,
-    resume: bool,
+    mode: StartupMode,
 ) -> Result<SessionStartup, CliError> {
-    if resume {
+    if mode == StartupMode::Continue {
         if let Some(id) = store.latest().map_err(cli_io_error)? {
             let (meta, mut history, transcript) = store.load(&id).map_err(cli_io_error)?;
             replace_system_head(&mut history, DEFAULT_SYSTEM_PROMPT);
@@ -567,6 +615,12 @@ pub enum CancelAction {
     ClearAll,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitIntent {
+    Consumed,
+    Exit,
+}
+
 /// gap = 两次取消键到达间隔;gap >= threshold → 第 1 次/隔久;gap < threshold → 快速连按清空。
 pub fn cancel_action(gap: StdDuration, threshold: StdDuration) -> CancelAction {
     if gap >= threshold {
@@ -576,9 +630,21 @@ pub fn cancel_action(gap: StdDuration, threshold: StdDuration) -> CancelAction {
     }
 }
 
+pub fn exit_intent_action(gap: StdDuration, threshold: StdDuration) -> ExitIntent {
+    if gap < threshold {
+        ExitIntent::Exit
+    } else {
+        ExitIntent::Consumed
+    }
+}
+
 fn is_queue_cancel_key(key: KeyEvent) -> bool {
     key.code == KeyCode::Esc
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn is_ctrl_c_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 fn handle_queue_cancel_key(
@@ -590,6 +656,7 @@ fn handle_queue_cancel_key(
     if !is_key_press(key)
         || state.pending_permission.is_some()
         || state.models_picker.is_some()
+        || state.session_picker.is_some()
         || state.command_completion.is_some()
         || !state.has_queue()
     {
@@ -615,6 +682,35 @@ fn handle_queue_cancel_key(
         }
     }
     true
+}
+
+fn handle_idle_exit_intent_key(
+    state: &mut app::AppState,
+    key: KeyEvent,
+    now: Instant,
+) -> Option<ExitIntent> {
+    if !is_key_press(key)
+        || !is_ctrl_c_key(key)
+        || state.pending_permission.is_some()
+        || state.models_picker.is_some()
+        || state.session_picker.is_some()
+        || state.command_completion.is_some()
+        || state.has_selection()
+        || state.has_queue()
+        || state.phase.is_running()
+    {
+        return None;
+    }
+
+    let gap = state
+        .last_exit_intent_at()
+        .map(|last| now.duration_since(last))
+        .unwrap_or(EXIT_DOUBLE_TAP);
+    let action = exit_intent_action(gap, EXIT_DOUBLE_TAP);
+    if action == ExitIntent::Consumed {
+        state.set_last_exit_intent_at(now);
+    }
+    Some(action)
 }
 
 fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
@@ -652,7 +748,7 @@ fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
         return !state.phase.is_running();
     }
 
-    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+    false
 }
 
 fn arrows_route_to_models_picker(state: &app::AppState, key: KeyEvent) -> bool {
@@ -964,9 +1060,7 @@ fn read_event_batch_round(
         if !is_key {
             return Ok(BatchReadOutcome::NonKey);
         }
-        while crossterm::event::poll(StdDuration::ZERO)
-            .map_err(|e| CliError::Io(e.to_string()))?
-        {
+        while crossterm::event::poll(StdDuration::ZERO).map_err(|e| CliError::Io(e.to_string()))? {
             batch.push(crossterm::event::read().map_err(|e| CliError::Io(e.to_string()))?);
             if batch.len() >= EVENT_BATCH_CAP {
                 return Ok(BatchReadOutcome::Cap);
@@ -998,7 +1092,7 @@ fn bridge_event_batch(mut batch: Vec<Event>) -> Result<Vec<Event>, CliError> {
         match read_event_batch_round(&mut batch, grace)? {
             BatchReadOutcome::Key => {}
             BatchReadOutcome::NonKey => break, // 非键事件(鼠标 Moved/Focus/Resize)即收批,防高频事件令合批不退出
-            BatchReadOutcome::Quiet => break, // 静默超过 grace:粘贴/续读结束
+            BatchReadOutcome::Quiet => break,  // 静默超过 grace:粘贴/续读结束
             BatchReadOutcome::Cap => return Ok(batch),
         }
     }
@@ -1031,6 +1125,7 @@ fn can_try_fast_paste(state: &app::AppState, batch: &[Event]) -> bool {
     batch.len() >= PASTE_COALESCE_MIN_EVENTS
         && state.pending_permission.is_none()
         && state.models_picker.is_none()
+        && state.session_picker.is_none()
 }
 
 fn process_paste_tail_batch(
@@ -1119,7 +1214,10 @@ fn process_event_batch(batch: Vec<Event>, ctx: EventBatchContext<'_>) -> Result<
     let intents = input_batch::classify_key_batch(&press_keys);
 
     // 批级折叠:整批为大段纯粘贴(全文本内容键、行/字符任一阈值达标)时折叠为占位符并消费整批
-    if state.pending_permission.is_none() && state.models_picker.is_none() {
+    if state.pending_permission.is_none()
+        && state.models_picker.is_none()
+        && state.session_picker.is_none()
+    {
         if let Some(text) = input_batch::fold_candidate(
             &batch,
             input_batch::PASTE_FOLD_MIN_LINES,
@@ -1142,6 +1240,19 @@ fn process_event_batch(batch: Vec<Event>, ctx: EventBatchContext<'_>) -> Result<
                 let intent = intents[press_index];
                 press_index += 1;
 
+                if state.session_picker.is_some() {
+                    app::flush_merged_input_chars(state, &mut pending_str);
+                    state.handle_session_picker_key(key);
+                    continue;
+                }
+                if let Some(action) = handle_idle_exit_intent_key(state, key, Instant::now()) {
+                    app::flush_merged_input_chars(state, &mut pending_str);
+                    if action == ExitIntent::Exit {
+                        break_loop = true;
+                        break;
+                    }
+                    continue;
+                }
                 if should_exit(state, key) {
                     app::flush_merged_input_chars(state, &mut pending_str);
                     break_loop = true;
@@ -1351,20 +1462,20 @@ fn error_message(err: AgentError) -> String {
 mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
     use super::{
-        apply_mouse_wheel_scroll_to_state, arrows_route_to_completion, cancel_action,
-        handle_mouse_selection_event, handle_queue_cancel_key, handle_resize, handle_selection_key,
-        prepare_session_startup, push_session_save_notice_if_error, run_agent_task,
-        scroll_action_for_key, selection_key_action, should_exit, terminal_session_event,
-        write_session_snapshot, CancelAction, MouseWheelScrollAction, RunAgentTaskConfig,
-        SelectionKeyAction, DEFAULT_SYSTEM_PROMPT,
+        CancelAction, DEFAULT_SYSTEM_PROMPT, EXIT_DOUBLE_TAP, ExitIntent, MouseWheelScrollAction,
+        RunAgentTaskConfig, SelectionKeyAction, StartupMode, apply_mouse_wheel_scroll_to_state,
+        arrows_route_to_completion, cancel_action, handle_mouse_selection_event,
+        handle_queue_cancel_key, handle_resize, handle_selection_key, prepare_session_startup,
+        push_session_save_notice_if_error, run_agent_task, scroll_action_for_key,
+        selection_key_action, should_exit, terminal_session_event, write_session_snapshot,
     };
-    use crate::agent::message::Message;
     use crate::agent::AgentStatus;
+    use crate::agent::message::Message;
     use crate::app::assemble_agent;
     use crate::cli::CliPaths;
     use crate::config::{
-        AuthType, Config, ProviderConfig, ProviderKind, ProviderProfile,
-        DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS,
+        AuthType, Config, DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS, ProviderConfig,
+        ProviderKind, ProviderProfile,
     };
     use crate::error::ProviderError;
     use crate::permission::{PermissionDecision, PermissionMode};
@@ -1390,11 +1501,11 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant as StdInstant;
-    use tokio::sync::{mpsc, oneshot, Mutex};
-    use tokio::time::{timeout, Duration};
+    use tokio::sync::{Mutex, mpsc, oneshot};
+    use tokio::time::{Duration, timeout};
 
     fn normal_channel_decider(tx: mpsc::UnboundedSender<AgentEvent>) -> ChannelDecider {
         ChannelDecider::new(tx, Arc::new(std::sync::Mutex::new(PermissionMode::Normal)))
@@ -1481,7 +1592,15 @@ mod tests {
     }
 
     #[test]
-    fn prepare_session_startup_resumes_latest_replaces_system_and_returns_provider_restore() {
+    fn startup_mode_prefers_resume_over_continue() {
+        assert_eq!(super::startup_mode(true, true), StartupMode::Resume);
+        assert_eq!(super::startup_mode(true, false), StartupMode::Resume);
+        assert_eq!(super::startup_mode(false, true), StartupMode::Continue);
+        assert_eq!(super::startup_mode(false, false), StartupMode::Fresh);
+    }
+
+    #[test]
+    fn prepare_session_startup_continue_replaces_system_and_returns_provider_restore() {
         let temp = tempfile::tempdir().unwrap();
         let paths = cli_paths(&temp);
         let store = SessionStore::new(paths.config_dir.join("sessions"));
@@ -1493,7 +1612,8 @@ mod tests {
         let transcript = vec![TranscriptBlock::Notice("restored".to_string())];
         store.write(&meta, &history, &transcript).unwrap();
 
-        let startup = prepare_session_startup(&store, &paths, &config(), true).unwrap();
+        let startup =
+            prepare_session_startup(&store, &paths, &config(), StartupMode::Continue).unwrap();
 
         assert_eq!(startup.meta, meta);
         assert_eq!(
@@ -1508,6 +1628,31 @@ mod tests {
             startup.resume_provider,
             Some(("alt".to_string(), "alt-model".to_string()))
         );
+    }
+
+    #[test]
+    fn prepare_session_startup_resume_starts_fresh_for_picker() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = cli_paths(&temp);
+        let store = SessionStore::new(paths.config_dir.join("sessions"));
+        store
+            .write(
+                &session_meta("stored-session"),
+                &[Message::System("old system".to_string())],
+                &[TranscriptBlock::Notice("stored".to_string())],
+            )
+            .unwrap();
+
+        let startup =
+            prepare_session_startup(&store, &paths, &config(), StartupMode::Resume).unwrap();
+
+        assert_ne!(startup.meta.id, "stored-session");
+        assert_eq!(
+            startup.history,
+            vec![Message::System(DEFAULT_SYSTEM_PROMPT.to_string())]
+        );
+        assert!(startup.transcript.is_empty());
+        assert_eq!(startup.resume_provider, None);
     }
 
     #[test]
@@ -1687,6 +1832,73 @@ mod tests {
             ),
             CancelAction::InterruptAndAdvance,
         );
+    }
+
+    #[test]
+    fn exit_intent_action_narrow_gap_exits() {
+        assert_eq!(
+            super::exit_intent_action(std::time::Duration::from_millis(500), EXIT_DOUBLE_TAP,),
+            ExitIntent::Exit
+        );
+    }
+
+    #[test]
+    fn exit_intent_action_wide_gap_is_consumed() {
+        assert_eq!(
+            super::exit_intent_action(std::time::Duration::from_millis(1500), EXIT_DOUBLE_TAP,),
+            ExitIntent::Consumed
+        );
+    }
+
+    #[test]
+    fn exit_intent_action_boundary_gap_equals_threshold_is_consumed() {
+        assert_eq!(
+            super::exit_intent_action(EXIT_DOUBLE_TAP, EXIT_DOUBLE_TAP),
+            ExitIntent::Consumed
+        );
+    }
+
+    #[test]
+    fn idle_exit_intent_first_ctrl_c_consumes_and_records_time() {
+        let mut state = super::app::AppState::new();
+        let now = StdInstant::now();
+
+        assert_eq!(
+            super::handle_idle_exit_intent_key(&mut state, ctrl_c(), now),
+            Some(ExitIntent::Consumed)
+        );
+        assert_eq!(state.last_exit_intent_at(), Some(now));
+    }
+
+    #[test]
+    fn idle_exit_intent_second_ctrl_c_within_threshold_exits() {
+        let mut state = super::app::AppState::new();
+        let first = StdInstant::now();
+        state.set_last_exit_intent_at(first);
+
+        assert_eq!(
+            super::handle_idle_exit_intent_key(
+                &mut state,
+                ctrl_c(),
+                first + std::time::Duration::from_millis(100),
+            ),
+            Some(ExitIntent::Exit)
+        );
+        assert_eq!(state.last_exit_intent_at(), Some(first));
+    }
+
+    #[test]
+    fn idle_exit_intent_ctrl_c_after_timeout_rearms() {
+        let mut state = super::app::AppState::new();
+        let first = StdInstant::now();
+        let second = first + EXIT_DOUBLE_TAP + std::time::Duration::from_millis(1);
+        state.set_last_exit_intent_at(first);
+
+        assert_eq!(
+            super::handle_idle_exit_intent_key(&mut state, ctrl_c(), second),
+            Some(ExitIntent::Consumed)
+        );
+        assert_eq!(state.last_exit_intent_at(), Some(second));
     }
 
     #[test]
@@ -2079,7 +2291,7 @@ mod tests {
 
         let ready = super::app::AppState::new();
         assert_eq!(selection_key_action(&ready, ctrl_c()), None);
-        assert!(should_exit(&ready, ctrl_c()));
+        assert!(!should_exit(&ready, ctrl_c()));
         assert!(should_exit(&ready, key(KeyCode::Esc)));
     }
 
@@ -2111,7 +2323,7 @@ mod tests {
     }
     #[test]
     fn mouse_wheel_scroll_action_maps_scroll_kinds_and_ignores_others() {
-        use super::{mouse_wheel_scroll_action, MouseWheelScrollAction, MOUSE_WHEEL_SCROLL_LINES};
+        use super::{MOUSE_WHEEL_SCROLL_LINES, MouseWheelScrollAction, mouse_wheel_scroll_action};
         use crossterm::event::MouseButton;
 
         assert_eq!(
@@ -2659,18 +2871,22 @@ mod tests {
         );
 
         let stored = history.lock().await;
-        assert!(stored
-            .iter()
-            .any(|msg| { matches!(msg, Message::User(text) if text == "round one") }));
+        assert!(
+            stored
+                .iter()
+                .any(|msg| { matches!(msg, Message::User(text) if text == "round one") })
+        );
         assert!(stored.iter().any(|msg| {
             matches!(
                 msg,
                 Message::Assistant { text, .. } if text == "first reply"
             )
         }));
-        assert!(stored
-            .iter()
-            .any(|msg| { matches!(msg, Message::User(text) if text == "round two") }));
+        assert!(
+            stored
+                .iter()
+                .any(|msg| { matches!(msg, Message::User(text) if text == "round two") })
+        );
     }
 
     #[tokio::test]
@@ -2867,9 +3083,11 @@ mod tests {
 
         assert!(old_provider.recorded_requests().is_empty());
         let locked = history.lock().await;
-        assert!(locked
-            .iter()
-            .any(|msg| matches!(msg, Message::User(text) if text == "hello")));
+        assert!(
+            locked
+                .iter()
+                .any(|msg| matches!(msg, Message::User(text) if text == "hello"))
+        );
     }
 
     #[tokio::test]

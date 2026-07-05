@@ -1,0 +1,6 @@
+---
+source: src/tui/render.rs
+assertion_line: 4215
+expression: text
+---
+‹text.muted›↓ 120 tok · 60 t/s‹/›‹text.primary›                                          ‹/›‹text.muted›再按一次 Ctrl+C 退出‹/›

@@ -1,9 +1,13 @@
 use crate::agent::message::Message;
 use crate::tui::app::TranscriptBlock;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::time::SystemTime;
+
+const FIRST_USER_SUMMARY_CHARS: usize = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -13,6 +17,13 @@ pub struct SessionMeta {
     pub created_at: String,
     pub cwd: PathBuf,
     pub app_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at: String,
+    pub first_user: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -25,6 +36,11 @@ pub enum SessionLine {
 #[derive(Clone, Debug)]
 pub struct SessionStore {
     root: PathBuf,
+}
+
+struct SessionSummaryWithMtime {
+    summary: SessionSummary,
+    modified: SystemTime,
 }
 
 impl SessionStore {
@@ -117,6 +133,63 @@ impl SessionStore {
 
         Ok(latest.map(|(id, _)| id))
     }
+
+    pub fn list_sessions(&self) -> io::Result<Vec<SessionSummary>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let mut summaries = Vec::new();
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if !metadata.is_file() {
+                continue;
+            }
+            let modified = metadata.modified()?;
+            match read_session_summary(&path) {
+                Ok(summary) => summaries.push(SessionSummaryWithMtime { summary, modified }),
+                Err(err) if err.kind() == io::ErrorKind::InvalidData => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        summaries.sort_by_key(|entry| Reverse(entry.modified));
+        Ok(summaries.into_iter().map(|entry| entry.summary).collect())
+    }
+}
+
+fn read_session_summary(path: &std::path::Path) -> io::Result<SessionSummary> {
+    let body = fs::read_to_string(path)?;
+    let mut meta = None;
+    let mut first_user = None;
+
+    for line in body.lines() {
+        match parse_line(line)? {
+            SessionLine::Meta(next_meta) => {
+                if meta.replace(next_meta).is_some() {
+                    return Err(invalid_data("session contains more than one Meta line"));
+                }
+            }
+            SessionLine::Msg(Message::User(text)) if first_user.is_none() => {
+                first_user = Some(text.chars().take(FIRST_USER_SUMMARY_CHARS).collect());
+            }
+            SessionLine::Msg(_) | SessionLine::Block(_) => {}
+        }
+    }
+
+    let meta: SessionMeta = meta.ok_or_else(|| invalid_data("session is missing Meta line"))?;
+    Ok(SessionSummary {
+        id: meta.id,
+        created_at: meta.created_at,
+        first_user,
+    })
 }
 
 fn serialize_line(line: &SessionLine) -> io::Result<String> {
@@ -140,11 +213,11 @@ pub fn replace_system_head(history: &mut Vec<Message>, prompt: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{replace_system_head, SessionLine, SessionMeta, SessionStore};
+    use super::{SessionLine, SessionMeta, SessionStore, SessionSummary, replace_system_head};
     use crate::agent::message::Message;
     use crate::provider::ToolCall;
     use crate::tui::app::{StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::thread;
@@ -232,6 +305,12 @@ mod tests {
             .join("\n");
         fs::write(store.session_path(id), format!("{body}\n"))
             .expect("session file should be written");
+    }
+
+    fn write_session(root: &Path, meta: SessionMeta, history: &[Message]) {
+        store_at(root)
+            .write(&meta, history, &[])
+            .expect("session should be written");
     }
 
     fn single_tag(value: Value) -> String {
@@ -338,6 +417,126 @@ mod tests {
         let store = store_at(&root);
 
         assert_eq!(store.latest().unwrap(), Some("newer".to_string()));
+    }
+
+    #[test]
+    fn list_sessions_returns_summaries_in_mtime_descending_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        write_session(
+            &root,
+            SessionMeta {
+                id: "older-session".to_string(),
+                created_at: "older-created".to_string(),
+                ..meta("older-session")
+            },
+            &[Message::User("older first".to_string())],
+        );
+        thread::sleep(Duration::from_millis(50));
+        write_session(
+            &root,
+            SessionMeta {
+                id: "newer-session".to_string(),
+                created_at: "newer-created".to_string(),
+                ..meta("newer-session")
+            },
+            &[Message::User("newer first".to_string())],
+        );
+
+        let summaries = store_at(&root).list_sessions().unwrap();
+
+        assert_eq!(
+            summaries,
+            vec![
+                SessionSummary {
+                    id: "newer-session".to_string(),
+                    created_at: "newer-created".to_string(),
+                    first_user: Some("newer first".to_string()),
+                },
+                SessionSummary {
+                    id: "older-session".to_string(),
+                    created_at: "older-created".to_string(),
+                    first_user: Some("older first".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn list_sessions_truncates_first_user_to_sixty_chars() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        write_session(
+            &root,
+            meta("long-user-session"),
+            &[Message::User("x".repeat(80))],
+        );
+
+        let summaries = store_at(&root).list_sessions().unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].first_user, Some("x".repeat(60)));
+        assert!(summaries[0].first_user.as_ref().unwrap().chars().count() <= 60);
+    }
+
+    #[test]
+    fn list_sessions_uses_none_when_session_has_no_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        write_session(
+            &root,
+            meta("system-only-session"),
+            &[Message::System("system only".to_string())],
+        );
+
+        let summaries = store_at(&root).list_sessions().unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].first_user, None);
+    }
+
+    #[test]
+    fn list_sessions_skips_damaged_files_without_failing_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("broken.jsonl"), "not json\n").unwrap();
+        write_session(
+            &root,
+            meta("valid-session"),
+            &[Message::User("valid first".to_string())],
+        );
+
+        let summaries = store_at(&root).list_sessions().unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "valid-session");
+        assert_eq!(summaries[0].first_user, Some("valid first".to_string()));
+    }
+
+    #[test]
+    fn list_sessions_returns_empty_vec_for_empty_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_at(&temp.path().join("sessions"));
+
+        assert_eq!(store.list_sessions().unwrap(), Vec::<SessionSummary>::new());
+    }
+
+    #[test]
+    fn list_sessions_ignores_non_jsonl_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        write_session(
+            &root,
+            meta("jsonl-session"),
+            &[Message::User("jsonl first".to_string())],
+        );
+        fs::write(root.join("ignored.txt"), "not a session").unwrap();
+
+        let summaries = store_at(&root).list_sessions().unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "jsonl-session");
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use mysteries::cli::{
-    run_auth_list, run_auth_login_interactive, run_auth_logout_interactive, run_cli, AuthPaths,
-    CliError, CliPaths,
+    AuthPaths, CliError, CliPaths, run_auth_list, run_auth_login_interactive,
+    run_auth_logout_interactive, run_cli,
 };
-use mysteries::tui::run_tui;
+use mysteries::tui::{run_tui, startup_mode};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -21,11 +21,15 @@ async fn main() -> ExitCode {
 
 async fn real_main() -> Result<(), CliError> {
     let mut resume = false;
+    let mut continue_ = false;
     let args = env::args()
         .skip(1)
         .filter_map(|arg| {
             if arg == "--resume" {
                 resume = true;
+                None
+            } else if arg == "--continue" {
+                continue_ = true;
                 None
             } else {
                 Some(arg)
@@ -55,7 +59,7 @@ async fn real_main() -> Result<(), CliError> {
         let prompt = read_prompt(&args)?;
         run_cli(paths, &prompt).await
     } else {
-        run_tui(paths, resume).await
+        run_tui(paths, startup_mode(resume, continue_)).await
     }
 }
 

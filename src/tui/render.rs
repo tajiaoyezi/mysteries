@@ -1,23 +1,24 @@
-use crate::permission::{permission_mode_label, PermissionMode};
+use crate::permission::{PermissionMode, permission_mode_label};
+use crate::tui::EXIT_DOUBLE_TAP;
 use crate::tui::app::{
-    compute_diff, AppState, DiffKind, DiffLine, ModelsPickerRowKind, Phase, StatusSnapshot,
-    ToolCard, ToolCardStatus, TranscriptBlock,
+    AppState, DiffKind, DiffLine, ModelsPickerRowKind, Phase, StatusSnapshot, ToolCard,
+    ToolCardStatus, TranscriptBlock, compute_diff,
 };
 use crate::tui::input_buffer::{InputBufferState, PastedChunk};
 use crate::tui::input_layout::{
-    input_content_height_cap, input_scroll_offset, visual_input_layout, InputVisualLayout,
+    InputVisualLayout, input_content_height_cap, input_scroll_offset, visual_input_layout,
 };
 use crate::tui::jump_to_bottom::jump_to_bottom_pill_text;
 use crate::tui::markdown::render_markdown;
-use crate::tui::selection::{col_range_for_row, Selection};
+use crate::tui::selection::{Selection, col_range_for_row};
 use crate::tui::theme::Theme;
 use crate::tui::width::{char_width, display_width};
+use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -55,6 +56,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     render_command_completion(frame, rows[input_row], state, theme);
     render_status(frame, rows[status_row], state, theme);
     render_models_picker(frame, rows[status_row], state, theme);
+    render_session_picker(frame, rows[status_row], state, theme);
     render_mode_line(frame, rows[mode_row], state, theme);
     highlight_selection(frame, state, theme);
 }
@@ -1169,10 +1171,12 @@ fn activity_line_spans(
     now: Instant,
 ) -> Vec<Span<'static>> {
     let mut spans = activity_spans(state, theme);
-    let hint = state.active_copy_hint(now).or_else(|| {
-        (state.paste_tail_active() || state.paste_receiving_hint_active())
-            .then_some(PASTE_RECEIVING_HINT)
-    });
+    let hint = active_exit_intent_hint(state, now)
+        .or_else(|| state.active_copy_hint(now))
+        .or_else(|| {
+            (state.paste_tail_active() || state.paste_receiving_hint_active())
+                .then_some(PASTE_RECEIVING_HINT)
+        });
     let Some(hint) = hint else {
         return spans;
     };
@@ -1186,6 +1190,13 @@ fn activity_line_spans(
     spans.push(Span::styled(" ".repeat(total - left - hint_width), base));
     spans.push(Span::styled(hint.to_string(), base.fg(theme.text_muted)));
     spans
+}
+
+fn active_exit_intent_hint(state: &AppState, now: Instant) -> Option<&'static str> {
+    state
+        .last_exit_intent_at()
+        .filter(|at| now.duration_since(*at) < EXIT_DOUBLE_TAP)
+        .map(|_| "再按一次 Ctrl+C 退出")
 }
 
 fn queue_message_display(message: &str) -> String {
@@ -1676,6 +1687,78 @@ fn render_models_picker(frame: &mut Frame<'_>, status_area: Rect, state: &AppSta
     frame.render_widget(paragraph, area);
 }
 
+fn render_session_picker(
+    frame: &mut Frame<'_>,
+    status_area: Rect,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let Some(picker) = &state.session_picker else {
+        return;
+    };
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        "会话",
+        Style::default()
+            .fg(theme.accent_primary)
+            .bg(theme.bg_surface)
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    if picker.rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "无历史会话",
+            Style::default()
+                .fg(theme.text_secondary)
+                .bg(theme.bg_surface),
+        )));
+    } else {
+        for (index, row) in picker.rows.iter().enumerate() {
+            let mut style = Style::default().bg(theme.bg_surface);
+            if index == picker.highlighted {
+                style = style
+                    .fg(theme.accent_primary)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            } else {
+                style = style.fg(theme.text_body);
+            }
+            lines.push(Line::from(Span::styled(row.label.clone(), style)));
+        }
+    }
+
+    lines.push(Line::from(Span::styled(
+        "↑↓ 选 · Enter 恢复 · Esc 取消",
+        Style::default()
+            .fg(theme.text_secondary)
+            .bg(theme.bg_surface),
+    )));
+
+    let list_height = lines.len() as u16 + 2;
+    let width = status_area.width.min(68);
+    let area = Rect {
+        x: status_area.x,
+        y: status_area.y.saturating_sub(list_height + 1),
+        width,
+        height: list_height,
+    };
+
+    frame.render_widget(Clear, area);
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(
+                    Style::default()
+                        .fg(theme.border_strong)
+                        .bg(theme.bg_surface),
+                )
+                .style(Style::default().fg(theme.text_primary).bg(theme.bg_surface)),
+        )
+        .style(Style::default().fg(theme.text_primary).bg(theme.bg_surface));
+    frame.render_widget(paragraph, area);
+}
+
 fn highlight_selection(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     let Some(selection) = state.selection.selection else {
         return;
@@ -1788,13 +1871,14 @@ pub fn bubble_sort<T: PartialOrd>(slice: &mut [T]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        collapsed_tool_summary, diff_body_lines, display_cursor, expand_for_display, fold_label,
-        input_content_spans, render, selection_text, tool_card_lines, transcript_line_count,
-        DIFF_COLLAPSED_MAX_ROWS, DIFF_MAX_ROWS,
+        DIFF_COLLAPSED_MAX_ROWS, DIFF_MAX_ROWS, collapsed_tool_summary, diff_body_lines,
+        display_cursor, expand_for_display, fold_label, input_content_spans, render,
+        selection_text, tool_card_lines, transcript_line_count,
     };
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::PermissionMode;
     use crate::provider::Usage;
+    use crate::session::SessionSummary;
     use crate::tui::app::{
         AppState, DiffKind, DiffLine, ModelsPicker, Phase, SessionSnapshot, ToolCard,
         ToolCardStatus, TranscriptBlock,
@@ -1806,11 +1890,11 @@ mod tests {
     use crate::tui::theme::Theme;
     use crate::tui::width::display_width;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Position, Rect};
     use ratatui::style::{Color, Modifier, Style};
-    use ratatui::Terminal;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -2730,9 +2814,11 @@ mod tests {
             .collect::<Vec<_>>();
         let exact_lines = diff_body_lines(&exact, &theme, 32, DIFF_MAX_ROWS);
         assert_eq!(exact_lines.len(), DIFF_MAX_ROWS);
-        assert!(!exact_lines
-            .iter()
-            .any(|line| line_plain(line).contains("⋯ 其余")));
+        assert!(
+            !exact_lines
+                .iter()
+                .any(|line| line_plain(line).contains("⋯ 其余"))
+        );
 
         let over = (1..=DIFF_MAX_ROWS + 1)
             .map(|n| diff_fixture(DiffKind::Add, format!("line {n}")))
@@ -2750,9 +2836,11 @@ mod tests {
 
         assert_eq!(lines.len(), DIFF_MAX_ROWS + 1);
         assert_eq!(line_plain(lines.last().unwrap()), "│ ⋯ 其余 1 行");
-        assert!(lines[..DIFF_MAX_ROWS]
-            .iter()
-            .all(|line| display_width(&line_plain(line)) <= 8));
+        assert!(
+            lines[..DIFF_MAX_ROWS]
+                .iter()
+                .all(|line| display_width(&line_plain(line)) <= 8)
+        );
     }
 
     #[test]
@@ -2883,9 +2971,11 @@ mod tests {
         assert!(plain[DIFF_COLLAPSED_MAX_ROWS].starts_with("│ + line 8"));
         assert_eq!(plain[DIFF_COLLAPSED_MAX_ROWS + 1], "│ ⋯ 其余 4 行");
         assert!(!plain.iter().any(|line| line.contains("hidden output")));
-        assert!(!plain
-            .iter()
-            .any(|line| line.contains("┌─") || line.contains("└─")));
+        assert!(
+            !plain
+                .iter()
+                .any(|line| line.contains("┌─") || line.contains("└─"))
+        );
     }
 
     #[test]
@@ -2915,19 +3005,27 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(running_plain[0].contains(" · 运行中…"));
-        assert!(running_plain
-            .iter()
-            .any(|line| line.starts_with("│ − old one")));
-        assert!(running_plain
-            .iter()
-            .any(|line| line.starts_with("│ + new one")));
+        assert!(
+            running_plain
+                .iter()
+                .any(|line| line.starts_with("│ − old one"))
+        );
+        assert!(
+            running_plain
+                .iter()
+                .any(|line| line.starts_with("│ + new one"))
+        );
         assert!(error_plain[0].contains(" · 2 行 ⌄"));
-        assert!(error_plain
-            .iter()
-            .any(|line| line.starts_with("│ − old one")));
-        assert!(error_plain
-            .iter()
-            .any(|line| line.starts_with("│ + new one")));
+        assert!(
+            error_plain
+                .iter()
+                .any(|line| line.starts_with("│ − old one"))
+        );
+        assert!(
+            error_plain
+                .iter()
+                .any(|line| line.starts_with("│ + new one"))
+        );
     }
 
     #[test]
@@ -3014,6 +3112,24 @@ mod tests {
                 picker.push_filter_char(ch);
             }
         }
+        state
+    }
+
+    fn session_picker_state() -> AppState {
+        let mut state = AppState::new();
+        state.open_session_picker(vec![
+            SessionSummary {
+                id: "11111111-aaaa-bbbb-cccc-000000000000".to_string(),
+                created_at: "2026-07-04 10:00:00".to_string(),
+                first_user: Some("第一段需求".to_string()),
+            },
+            SessionSummary {
+                id: "22222222-aaaa-bbbb-cccc-000000000000".to_string(),
+                created_at: "2026-07-04 11:00:00".to_string(),
+                first_user: None,
+            },
+        ]);
+        state.session_picker.as_mut().unwrap().highlighted = 1;
         state
     }
 
@@ -3122,7 +3238,9 @@ mod tests {
         let state = markdown_rich_assistant_state();
         let text = render_to_styled_with_size(&state, &Theme::midnight(), 96, 36);
 
-        println!("\n--- markdown rich midnight frame ---\n{text}\n--- end markdown rich midnight frame ---");
+        println!(
+            "\n--- markdown rich midnight frame ---\n{text}\n--- end markdown rich midnight frame ---"
+        );
         insta::assert_snapshot!("tui_markdown_rich_assistant_midnight", text);
     }
 
@@ -3131,7 +3249,9 @@ mod tests {
         let state = markdown_rich_assistant_state();
         let text = render_to_styled_with_size(&state, &Theme::daylight(), 96, 36);
 
-        println!("\n--- markdown rich daylight frame ---\n{text}\n--- end markdown rich daylight frame ---");
+        println!(
+            "\n--- markdown rich daylight frame ---\n{text}\n--- end markdown rich daylight frame ---"
+        );
         insta::assert_snapshot!("tui_markdown_rich_assistant_daylight", text);
     }
 
@@ -3173,6 +3293,20 @@ mod tests {
         let text = render_to_styled(&state, &Theme::midnight());
         println!("\n--- models picker filtered ---\n{text}\n--- end models picker filtered ---");
         insta::assert_snapshot!("tui_models_picker_filtered", text);
+    }
+
+    #[test]
+    fn session_picker_open_snapshot() {
+        let state = session_picker_state();
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        assert!(text.contains("会话"));
+        assert!(text.contains("11111111"));
+        assert!(text.contains("22222222"));
+        assert!(text.contains("第一段需求"));
+        assert!(text.contains("Enter 恢复"));
+        println!("\n--- session picker open ---\n{text}\n--- end session picker open ---");
+        insta::assert_snapshot!("tui_session_picker_open", text);
     }
 
     #[test]
@@ -3600,7 +3734,9 @@ mod tests {
         ));
         let text = render_to_styled(&state, &Theme::midnight());
 
-        println!("\n--- timeline final answer frame ---\n{text}\n--- end timeline final answer frame ---");
+        println!(
+            "\n--- timeline final answer frame ---\n{text}\n--- end timeline final answer frame ---"
+        );
         insta::assert_snapshot!("tui_timeline_tool_then_final_answer", text);
     }
 
@@ -4077,6 +4213,31 @@ mod tests {
 
         println!("\n--- activity copy hint ---\n{text}\n--- end activity copy hint ---");
         insta::assert_snapshot!("tui_activity_copy_hint", text);
+    }
+
+    #[test]
+    fn activity_exit_intent_takes_priority_over_copy_hint_snapshot() {
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.record_usage(
+            Usage {
+                input_tokens: 10,
+                output_tokens: 120,
+            },
+            Duration::from_secs(2),
+        );
+        state.apply(AgentEvent::TurnComplete);
+        state.set_copy_hint("已复制 35 字".to_string());
+        state.set_last_exit_intent_at(Instant::now());
+
+        let text = activity_line(&render_to_styled(&state, &theme));
+
+        assert!(text.contains("再按一次 Ctrl+C 退出"));
+        assert!(!text.contains("已复制 35 字"));
+        println!(
+            "\n--- activity exit intent priority ---\n{text}\n--- end activity exit intent priority ---"
+        );
+        insta::assert_snapshot!("tui_activity_exit_intent_priority", text);
     }
 
     #[test]
