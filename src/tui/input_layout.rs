@@ -19,12 +19,14 @@ pub(crate) fn input_content_height_cap(
     permission_height: u16,
     max_content_rows: u16,
     queue_height: u16,
+    plan_progress_height: u16,
 ) -> u16 {
     let available = i32::from(screen_height)
         - 16
         - i32::from(status_top_gap_height)
         - i32::from(permission_height)
-        - i32::from(queue_height);
+        - i32::from(queue_height)
+        - i32::from(plan_progress_height);
     available.clamp(1, i32::from(max_content_rows)) as u16
 }
 
@@ -169,21 +171,21 @@ mod tests {
 
     #[test]
     fn input_height_cap_reserves_fixed_rows_transcript_floor_and_limits() {
-        assert_eq!(input_content_height_cap(26, 2, 0, 10, 0), 8);
-        assert_eq!(input_content_height_cap(40, 2, 0, 10, 0), 10);
-        assert_eq!(input_content_height_cap(6, 0, 12, 10, 0), 1);
+        assert_eq!(input_content_height_cap(26, 2, 0, 10, 0, 0), 8);
+        assert_eq!(input_content_height_cap(40, 2, 0, 10, 0, 0), 10);
+        assert_eq!(input_content_height_cap(6, 0, 12, 10, 0, 0), 1);
     }
 
     #[test]
     fn input_height_cap_subtracts_queue_height() {
-        assert_eq!(input_content_height_cap(26, 2, 0, 10, 0), 8);
-        assert_eq!(input_content_height_cap(26, 2, 0, 10, 3), 5);
+        assert_eq!(input_content_height_cap(26, 2, 0, 10, 0, 0), 8);
+        assert_eq!(input_content_height_cap(26, 2, 0, 10, 3, 0), 5);
     }
 
     #[test]
     fn input_height_cap_min_screen_with_max_queue_preserves_transcript_floor() {
         const QUEUE_MAX_ROWS: u16 = 5;
-        let cap = input_content_height_cap(24, 2, 0, 10, QUEUE_MAX_ROWS);
+        let cap = input_content_height_cap(24, 2, 0, 10, QUEUE_MAX_ROWS, 0);
         assert_eq!(cap, 1);
         // header3 + transcript_min8 + gap2 + activity1 + queue5 + input3 + status1 + mode1 = 24
         let fixed_rows = 3 + 8 + 2 + 1 + QUEUE_MAX_ROWS + 3 + 1 + 1;
@@ -192,8 +194,8 @@ mod tests {
 
     #[test]
     fn input_height_cap_shrinks_when_permission_box_is_visible() {
-        let normal = input_content_height_cap(30, 2, 0, 10, 0);
-        let pending_permission = input_content_height_cap(30, 0, 9, 10, 0);
+        let normal = input_content_height_cap(30, 2, 0, 10, 0, 0);
+        let pending_permission = input_content_height_cap(30, 0, 9, 10, 0, 0);
 
         assert_eq!(normal, 10);
         assert_eq!(pending_permission, 5);

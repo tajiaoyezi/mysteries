@@ -548,7 +548,7 @@ pub async fn run_cli(paths: CliPaths, prompt: &str) -> Result<(), CliError> {
         Box::new(FileCredentialSource::new(paths.credentials.clone())),
     ]);
     let provider = select_provider(&config, credentials)?;
-    let assembled = assemble_agent(provider, &config, Box::new(StdinDecider), None, None);
+    let assembled = assemble_agent(provider, &config, Box::new(StdinDecider), None, None, None);
     let ctx = ToolContext {
         cwd: paths.cwd,
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,

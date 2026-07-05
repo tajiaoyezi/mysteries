@@ -94,7 +94,14 @@ async fn assembled_agent_runs_multiturn_tool_flow_offline() {
             ..Default::default()
         },
     ]));
-    let assembled = assemble_agent(provider.clone(), &config(), Box::new(AllowAll), None, None);
+    let assembled = assemble_agent(
+        provider.clone(),
+        &config(),
+        Box::new(AllowAll),
+        None,
+        None,
+        None,
+    );
     let sink = CaptureSink::new();
     let mut history = vec![
         Message::System("system".to_string()),

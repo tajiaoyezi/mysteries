@@ -1,4 +1,5 @@
 use crate::permission::{permission_mode_label, PermissionMode};
+use crate::tool::plan::StepStatus;
 use crate::tui::app::{
     compute_diff, AppState, DiffKind, DiffLine, ModelsPickerRowKind, Phase, StatusSnapshot,
     ToolCard, ToolCardStatus, TranscriptBlock,
@@ -11,7 +12,7 @@ use crate::tui::jump_to_bottom::jump_to_bottom_pill_text;
 use crate::tui::markdown::render_markdown;
 use crate::tui::selection::{col_range_for_row, Selection};
 use crate::tui::theme::Theme;
-use crate::tui::width::{char_width, display_width};
+use crate::tui::width::{char_width, display_width, truncate_text_to_width};
 use crate::tui::EXIT_DOUBLE_TAP;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -30,6 +31,7 @@ const DIFF_MAX_ROWS: usize = 24;
 const DIFF_COLLAPSED_MAX_ROWS: usize = 8;
 const PLAN_APPROVAL_FOOTER_LINES: u16 = 2;
 const MAX_PLAN_DIALOG_HEIGHT: u16 = 16;
+const MAX_PLAN_PROGRESS_HEIGHT: u16 = 8;
 const MAX_QUESTION_DIALOG_HEIGHT: u16 = 20;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
@@ -40,8 +42,18 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     );
 
     let rows = layout_rows(area, state);
-    let queue_row = queue_height(state).gt(&0).then_some(5usize);
-    let input_row = queue_row.map_or(5, |_| 6);
+    let mut next_row = 5usize;
+    let plan_progress_row = plan_progress_height(state).gt(&0).then(|| {
+        let row = next_row;
+        next_row += 1;
+        row
+    });
+    let queue_row = queue_height(state).gt(&0).then(|| {
+        let row = next_row;
+        next_row += 1;
+        row
+    });
+    let input_row = next_row;
     let status_row = input_row + 1;
     let mode_row = input_row + 2;
 
@@ -56,6 +68,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
         render_user_question(frame, rows[2], state, theme);
     }
     render_activity(frame, rows[4], state, theme);
+    if let Some(row) = plan_progress_row {
+        render_active_plan(frame, rows[row], state, theme);
+    }
     if let Some(row) = queue_row {
         render_queue(frame, rows[row], state, theme);
     }
@@ -83,6 +98,31 @@ fn queue_height(state: &AppState) -> u16 {
     state.pending_queue.len().min(QUEUE_MAX_ROWS) as u16
 }
 
+fn plan_progress_height(state: &AppState) -> u16 {
+    state
+        .current_plan
+        .as_ref()
+        .map(|plan| {
+            if active_plan_is_folded(state) {
+                return 1;
+            }
+            let desired = 1 + plan.steps.len() as u16;
+            desired.min(MAX_PLAN_PROGRESS_HEIGHT)
+        })
+        .unwrap_or(0)
+}
+
+fn active_plan_is_folded(state: &AppState) -> bool {
+    state.phase == Phase::Ready
+        && state.current_plan.as_ref().is_some_and(|plan| {
+            !plan.steps.is_empty()
+                && plan
+                    .steps
+                    .iter()
+                    .all(|step| step.status == StepStatus::Done)
+        })
+}
+
 fn transcript_min_height(state: &AppState) -> u16 {
     if state.pending_plan_approval.is_some() || state.pending_question.is_some() {
         0
@@ -93,6 +133,7 @@ fn transcript_min_height(state: &AppState) -> u16 {
 
 fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
     let qh = queue_height(state);
+    let pph = plan_progress_height(state);
     let mut constraints = vec![
         Constraint::Length(3),
         Constraint::Min(transcript_min_height(state)),
@@ -100,6 +141,9 @@ fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
         Constraint::Length(status_top_gap_height(state)),
         Constraint::Length(1),
     ];
+    if pph > 0 {
+        constraints.push(Constraint::Length(pph));
+    }
     if qh > 0 {
         constraints.push(Constraint::Length(qh));
     }
@@ -184,6 +228,7 @@ fn input_box_height(area: Rect, state: &AppState) -> u16 {
         permission_height(state),
         INPUT_MAX_CONTENT_ROWS,
         queue_height(state),
+        plan_progress_height(state),
     );
     (layout.lines.len() as u16).clamp(1, cap).saturating_add(2)
 }
@@ -1033,6 +1078,24 @@ fn tool_args_preview(tool_name: &str, args: &serde_json::Value) -> String {
                 (None, None) => args.to_string(),
             }
         }
+        "submit_plan" => args
+            .get("steps")
+            .and_then(serde_json::Value::as_array)
+            .map(|steps| format!("{} 步", steps.len()))
+            .unwrap_or_else(|| args.to_string()),
+        "update_plan" => {
+            let step = args.get("step").and_then(serde_json::Value::as_u64);
+            let status = args.get("status").and_then(serde_json::Value::as_str);
+            match (step, status) {
+                (Some(step), Some(status)) => format!("step {step} · {status}"),
+                _ => args.to_string(),
+            }
+        }
+        "ask_user" => args
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .map(|question| truncate_text_to_width(question, 48))
+            .unwrap_or_else(|| args.to_string()),
         _ => args.to_string(),
     }
 }
@@ -1233,10 +1296,7 @@ fn render_plan_approval(frame: &mut Frame<'_>, area: Rect, state: &AppState, the
             ),
         ]));
         content_lines.push(Line::from(vec![
-            Span::styled(
-                "验收: ",
-                Style::default().fg(theme.text_secondary).bg(bg),
-            ),
+            Span::styled("验收: ", Style::default().fg(theme.text_secondary).bg(bg)),
             Span::styled(
                 step.validation.clone(),
                 Style::default().fg(theme.text_muted).bg(bg),
@@ -1264,15 +1324,9 @@ fn render_plan_approval(frame: &mut Frame<'_>, area: Rect, state: &AppState, the
 
     let footer = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled(
-                "[y · 批准]",
-                Style::default().fg(theme.success_fg).bg(bg),
-            ),
+            Span::styled("[y · 批准]", Style::default().fg(theme.success_fg).bg(bg)),
             Span::styled("   ", Style::default().bg(bg)),
-            Span::styled(
-                "[n · 驳回]",
-                Style::default().fg(theme.error_fg).bg(bg),
-            ),
+            Span::styled("[n · 驳回]", Style::default().fg(theme.error_fg).bg(bg)),
         ]),
         Line::from(Span::styled(
             "提示:Enter = 批准 · Esc = 驳回",
@@ -1281,6 +1335,181 @@ fn render_plan_approval(frame: &mut Frame<'_>, area: Rect, state: &AppState, the
     ])
     .style(Style::default().fg(theme.text_primary).bg(bg));
     frame.render_widget(footer, chunks[1]);
+}
+
+const ACTIVE_PLAN_VALIDATION_SEP: &str = "  ";
+
+fn active_plan_step_line(
+    index: usize,
+    step: &crate::tui::app::ActiveStep,
+    line_width: usize,
+    theme: &Theme,
+    bg: ratatui::style::Color,
+    accent: ratatui::style::Color,
+) -> Line<'static> {
+    let (glyph, glyph_style) = match step.status {
+        StepStatus::Done => ("✓", Style::default().fg(theme.success_fg).bg(bg)),
+        StepStatus::InProgress => ("▸", Style::default().fg(accent).bg(bg)),
+        StepStatus::Pending => ("○", Style::default().fg(theme.text_muted).bg(bg)),
+    };
+    let number = format!(" {}. ", index + 1);
+    let prefix_width = display_width("  ") + display_width(glyph) + display_width(&number);
+    let desc_budget = line_width.saturating_sub(prefix_width).max(1);
+    let description = truncate_text_to_width(&step.description, desc_budget);
+
+    let mut spans = vec![
+        Span::styled("  ", Style::default().bg(bg)),
+        Span::styled(glyph, glyph_style),
+        Span::styled(number, Style::default().fg(theme.text_secondary).bg(bg)),
+        Span::styled(description, Style::default().fg(theme.text_body).bg(bg)),
+    ];
+
+    if matches!(step.status, StepStatus::Done) {
+        if let Some(validation) = &step.validation_result {
+            let used_width = prefix_width + display_width(spans[3].content.as_ref());
+            let remaining = line_width.saturating_sub(used_width);
+            let sep_width = display_width(ACTIVE_PLAN_VALIDATION_SEP);
+            if remaining > sep_width {
+                let val_budget = remaining.saturating_sub(sep_width);
+                let truncated = truncate_text_to_width(validation, val_budget);
+                if display_width(&truncated) <= val_budget && !truncated.is_empty() {
+                    spans.push(Span::styled(
+                        ACTIVE_PLAN_VALIDATION_SEP.to_string(),
+                        Style::default().bg(bg),
+                    ));
+                    spans.push(Span::styled(
+                        truncated,
+                        Style::default().fg(theme.text_muted).bg(bg),
+                    ));
+                }
+            }
+        }
+    }
+
+    Line::from(spans)
+}
+
+fn active_plan_folded_line(
+    plan: &crate::tui::app::ActivePlan,
+    theme: &Theme,
+    bg: ratatui::style::Color,
+) -> Line<'static> {
+    let total = plan.steps.len();
+    Line::from(vec![
+        Span::styled("  ", Style::default().bg(bg)),
+        Span::styled(
+            "✓",
+            Style::default()
+                .fg(theme.success_fg)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " 计划完成 · ",
+            Style::default()
+                .fg(theme.text_body)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            plan.title.clone(),
+            Style::default().fg(theme.text_body).bg(bg),
+        ),
+        Span::styled(
+            format!(" ({total}/{total})"),
+            Style::default().fg(theme.text_muted).bg(bg),
+        ),
+    ])
+}
+
+fn render_active_plan(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(plan) = &state.current_plan else {
+        return;
+    };
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let bg = theme.bg_surface;
+    let accent = theme.warning_fg;
+
+    if active_plan_is_folded(state) {
+        frame.render_widget(
+            Paragraph::new(vec![active_plan_folded_line(plan, theme, bg)])
+                .style(Style::default().fg(theme.text_primary).bg(bg)),
+            area,
+        );
+        return;
+    }
+
+    let max_step_lines = area.height.saturating_sub(1) as usize;
+    let reserve_overflow = plan.steps.len() > max_step_lines && max_step_lines > 0;
+    let step_budget = if reserve_overflow {
+        max_step_lines.saturating_sub(1).max(1)
+    } else {
+        max_step_lines
+    };
+    let in_progress_idx = plan
+        .steps
+        .iter()
+        .position(|step| step.status == StepStatus::InProgress);
+
+    let mut indices = (0..plan.steps.len())
+        .take(step_budget.max(1))
+        .collect::<Vec<_>>();
+    if let Some(ip) = in_progress_idx {
+        if !indices.contains(&ip) {
+            if let Some(last) = indices.last_mut() {
+                *last = ip;
+            } else {
+                indices.push(ip);
+            }
+            indices.sort_unstable();
+        }
+    }
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "◑ 执行中的计划 · ",
+            Style::default()
+                .fg(accent)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            plan.title.clone(),
+            Style::default().fg(theme.text_body).bg(bg),
+        ),
+    ])];
+
+    let mut shown = 0usize;
+    let line_width = area.width as usize;
+    for index in indices {
+        if lines.len() as u16 >= area.height {
+            break;
+        }
+        lines.push(active_plan_step_line(
+            index,
+            &plan.steps[index],
+            line_width,
+            theme,
+            bg,
+            accent,
+        ));
+        shown += 1;
+    }
+
+    if shown < plan.steps.len() {
+        lines.push(Line::from(Span::styled(
+            format!("  ⋯ 其余 {} 步", plan.steps.len() - shown),
+            Style::default().fg(theme.text_muted).bg(bg),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(theme.text_primary).bg(bg)),
+        area,
+    );
 }
 
 fn user_question_other_content_line(option_count: usize) -> usize {
@@ -1326,17 +1555,15 @@ fn user_question_other_cursor_position(
         .saturating_add(display_width(&label) as u16)
         .saturating_add(display_width(supplement) as u16)
         .min(max_x);
-    let y = content_area
-        .y
-        .saturating_add(other_line as u16)
-        .min(max_y);
+    let y = content_area.y.saturating_add(other_line as u16).min(max_y);
     Position::new(x, y)
 }
 
 fn question_other_input_active(state: &AppState) -> bool {
-    state.pending_question.as_ref().is_some_and(|pending| {
-        pending.cursor == pending.request.question.options.len()
-    })
+    state
+        .pending_question
+        .as_ref()
+        .is_some_and(|pending| pending.cursor == pending.request.question.options.len())
 }
 
 fn render_user_question(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
@@ -1684,10 +1911,7 @@ fn mode_glyph_and_style(mode: PermissionMode, theme: &Theme) -> (&'static str, S
             Style::default().fg(theme.accent_primary).bg(theme.bg_base),
         ),
         PermissionMode::Yolo => ("▲", Style::default().fg(theme.warning_fg).bg(theme.bg_base)),
-        PermissionMode::Plan => (
-            "◔",
-            Style::default().fg(theme.info_fg).bg(theme.bg_base),
-        ),
+        PermissionMode::Plan => ("◔", Style::default().fg(theme.info_fg).bg(theme.bg_base)),
     }
 }
 
@@ -2212,13 +2436,15 @@ mod tests {
     use crate::permission::PermissionMode;
     use crate::provider::Usage;
     use crate::session::SessionSummary;
+    use crate::tool::ask::{Question, QuestionOption};
+    use crate::tool::plan::{Plan, PlanStep, StepStatus};
     use crate::tui::app::{
         AppState, DiffKind, DiffLine, ModelsPicker, Phase, SessionSnapshot, ToolCard,
         ToolCardStatus, TranscriptBlock,
     };
-    use crate::tui::channel::{AgentEvent, PermissionRequest, PlanApprovalRequest, QuestionRequest};
-    use crate::tool::plan::{Plan, PlanStep};
-    use crate::tool::ask::{Question, QuestionOption};
+    use crate::tui::channel::{
+        AgentEvent, PermissionRequest, PlanApprovalRequest, QuestionRequest,
+    };
     use crate::tui::input_batch::PasteTailMatcher;
     use crate::tui::input_buffer::PastedChunk;
     use crate::tui::selection::{Point, Selection, SelectionState};
@@ -3524,13 +3750,14 @@ mod tests {
             with_queue.enqueue_prompt(format!("queued {i}"));
         }
 
-        let cap_without = input_content_height_cap(24, 2, 0, super::INPUT_MAX_CONTENT_ROWS, 0);
+        let cap_without = input_content_height_cap(24, 2, 0, super::INPUT_MAX_CONTENT_ROWS, 0, 0);
         let cap_with = input_content_height_cap(
             24,
             2,
             0,
             super::INPUT_MAX_CONTENT_ROWS,
             QUEUE_MAX_ROWS as u16,
+            0,
         );
         assert!(cap_with < cap_without);
         assert_eq!(cap_with, cap_without.saturating_sub(QUEUE_MAX_ROWS as u16));
@@ -3715,6 +3942,60 @@ mod tests {
     }
 
     #[test]
+    fn active_plan_in_progress_snapshot() {
+        let state = active_plan_in_progress_state();
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 24);
+        insta::assert_snapshot!("tui_active_plan_in_progress", text);
+    }
+
+    #[test]
+    fn active_plan_overflow_snapshot() {
+        let state = active_plan_overflow_state();
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 24);
+        insta::assert_snapshot!("tui_active_plan_overflow", text);
+    }
+
+    #[test]
+    fn active_plan_long_text_truncates_single_line_snapshot() {
+        let state = active_plan_long_text_state();
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 24);
+        insta::assert_snapshot!("tui_active_plan_long_text_truncated", text);
+    }
+
+    #[test]
+    fn active_plan_folded_when_all_done_and_ready_snapshot() {
+        let state = active_plan_all_done_ready_state();
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 24);
+        insta::assert_snapshot!("tui_active_plan_folded", text);
+    }
+
+    #[test]
+    fn active_plan_all_done_busy_renders_full_panel_snapshot() {
+        let mut state = active_plan_all_done_ready_state();
+        state.phase = Phase::Busy;
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 24);
+        insta::assert_snapshot!("tui_active_plan_all_done_busy_expanded", text);
+    }
+
+    #[test]
+    fn plan_progress_height_folds_only_when_all_done_and_ready() {
+        use super::{active_plan_is_folded, plan_progress_height};
+
+        let ready = active_plan_all_done_ready_state();
+        assert!(active_plan_is_folded(&ready));
+        assert_eq!(plan_progress_height(&ready), 1);
+
+        let mut busy = active_plan_all_done_ready_state();
+        busy.phase = Phase::Busy;
+        assert!(!active_plan_is_folded(&busy));
+        assert_eq!(plan_progress_height(&busy), 4);
+
+        let in_progress = active_plan_in_progress_state();
+        assert!(!active_plan_is_folded(&in_progress));
+        assert_eq!(plan_progress_height(&in_progress), 4);
+    }
+
+    #[test]
     fn user_question_state_snapshot() {
         let state = user_question_state();
         let text = render_to_styled(&state, &Theme::midnight());
@@ -3823,6 +4104,86 @@ mod tests {
             "\n--- interrupted notice daylight frame ---\n{text}\n--- end interrupted notice daylight frame ---"
         );
         insta::assert_snapshot!("tui_interrupted_notice_daylight", text);
+    }
+
+    #[test]
+    fn tool_args_preview_submit_plan_shows_step_count() {
+        use super::tool_args_preview;
+
+        let args = json!({
+            "steps": [
+                {"description": "wire gate", "validation": "cargo test gate"},
+                {"description": "add tool", "validation": "cargo test tool"},
+                {"description": "wire panel", "validation": "insta ok"}
+            ]
+        });
+        assert_eq!(tool_args_preview("submit_plan", &args), "3 步");
+    }
+
+    #[test]
+    fn tool_args_preview_update_plan_done_omits_validation_result() {
+        use super::tool_args_preview;
+
+        let args = json!({
+            "status": "done",
+            "step": 1,
+            "validation_result": "很长很长很长很长很长很长很长很长"
+        });
+        let preview = tool_args_preview("update_plan", &args);
+        assert_eq!(preview, "step 1 · done");
+        assert!(!preview.contains("validation"));
+        assert!(!preview.contains("很长"));
+    }
+
+    #[test]
+    fn tool_args_preview_update_plan_in_progress() {
+        use super::tool_args_preview;
+
+        let args = json!({
+            "status": "in_progress",
+            "step": 2
+        });
+        assert_eq!(
+            tool_args_preview("update_plan", &args),
+            "step 2 · in_progress"
+        );
+    }
+
+    #[test]
+    fn tool_args_preview_ask_user_truncates_question_without_options() {
+        use super::tool_args_preview;
+        use crate::tui::width::display_width;
+
+        let long_question = "这是一段非常非常非常非常非常非常非常非常非常非常非常非常长的提问文本";
+        let args = json!({
+            "question": long_question,
+            "options": [
+                {"id": "a", "label": "选项标签不应出现"},
+                {"id": "b", "label": "另一个选项标签也不应出现"}
+            ]
+        });
+        let preview = tool_args_preview("ask_user", &args);
+        assert!(!preview.contains("选项标签"));
+        assert!(!preview.contains("options"));
+        assert!(display_width(&preview) <= 48);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn tool_args_preview_interactive_tools_fallback_on_missing_fields() {
+        use super::tool_args_preview;
+
+        let submit_no_steps = json!({"title": "plan without steps"});
+        let submit_preview = tool_args_preview("submit_plan", &submit_no_steps);
+        assert_eq!(submit_preview, submit_no_steps.to_string());
+
+        let update_no_step = json!({"status": "done"});
+        let update_preview = tool_args_preview("update_plan", &update_no_step);
+        assert_eq!(update_preview, update_no_step.to_string());
+
+        let ask_no_question = json!({"options": []});
+        let ask_preview = tool_args_preview("ask_user", &ask_no_question);
+        assert_eq!(ask_preview, ask_no_question.to_string());
     }
 
     #[test]
@@ -4190,6 +4551,121 @@ mod tests {
             },
             responder: tx,
         }));
+        state
+    }
+
+    fn active_plan_in_progress_state() -> AppState {
+        let mut state = AppState::new();
+        state.current_plan = Some(crate::tui::app::ActivePlan {
+            title: "Add plan mode".to_string(),
+            steps: vec![
+                crate::tui::app::ActiveStep {
+                    description: "Wire permission gate".to_string(),
+                    validation: "cargo test permission passes".to_string(),
+                    status: StepStatus::Done,
+                    validation_result: Some("cargo test permission → 12 passed".to_string()),
+                },
+                crate::tui::app::ActiveStep {
+                    description: "Add update_plan tool".to_string(),
+                    validation: "update_plan tests pass".to_string(),
+                    status: StepStatus::InProgress,
+                    validation_result: None,
+                },
+                crate::tui::app::ActiveStep {
+                    description: "Wire progress panel".to_string(),
+                    validation: "insta snapshot matches".to_string(),
+                    status: StepStatus::Pending,
+                    validation_result: None,
+                },
+            ],
+        });
+        state.set_input_text("implement panel rendering");
+        state
+    }
+
+    fn active_plan_overflow_state() -> AppState {
+        let mut state = AppState::new();
+        state.current_plan = Some(crate::tui::app::ActivePlan {
+            title: "Long execution plan".to_string(),
+            steps: (1..=20)
+                .map(|index| crate::tui::app::ActiveStep {
+                    description: format!("Execute step {index} with a descriptive title"),
+                    validation: format!("validation {index}"),
+                    status: if index == 12 {
+                        StepStatus::InProgress
+                    } else if index < 12 {
+                        StepStatus::Done
+                    } else {
+                        StepStatus::Pending
+                    },
+                    validation_result: (index < 12)
+                        .then(|| format!("cargo test step {index} → ok")),
+                })
+                .collect(),
+        });
+        state.set_input_text("continue execution");
+        state
+    }
+
+    fn active_plan_long_text_state() -> AppState {
+        let long_description =
+            "验证计划进度面板单行截断不会换行把输入框挤下去的回归用例描述文本".repeat(4);
+        let long_validation = "cargo test permission gate update_plan render active plan panel single line truncation validation overflow check 中文验收结果也要截断".repeat(2);
+        let mut state = AppState::new();
+        state.current_plan = Some(crate::tui::app::ActivePlan {
+            title: "Long text truncation".to_string(),
+            steps: vec![
+                crate::tui::app::ActiveStep {
+                    description: long_description,
+                    validation: "long validation criteria".to_string(),
+                    status: StepStatus::Done,
+                    validation_result: Some(long_validation),
+                },
+                crate::tui::app::ActiveStep {
+                    description: "Add update_plan tool".to_string(),
+                    validation: "tests pass".to_string(),
+                    status: StepStatus::InProgress,
+                    validation_result: None,
+                },
+                crate::tui::app::ActiveStep {
+                    description: "Wire progress panel".to_string(),
+                    validation: "insta snapshot".to_string(),
+                    status: StepStatus::Pending,
+                    validation_result: None,
+                },
+            ],
+        });
+        state.set_input_text("verify single-line truncation");
+        state
+    }
+
+    fn active_plan_all_done_ready_state() -> AppState {
+        let mut state = AppState::new();
+        state.phase = Phase::Ready;
+        state.current_plan = Some(crate::tui::app::ActivePlan {
+            title: "Add plan mode".to_string(),
+            steps: vec![
+                crate::tui::app::ActiveStep {
+                    description: "Wire permission gate".to_string(),
+                    validation: "cargo test permission passes".to_string(),
+                    status: StepStatus::Done,
+                    validation_result: Some("cargo test permission → 12 passed".to_string()),
+                },
+                crate::tui::app::ActiveStep {
+                    description: "Add update_plan tool".to_string(),
+                    validation: "update_plan tests pass".to_string(),
+                    status: StepStatus::Done,
+                    validation_result: Some("cargo test update_plan → 8 passed".to_string()),
+                },
+                crate::tui::app::ActiveStep {
+                    description: "Wire progress panel".to_string(),
+                    validation: "insta snapshot matches".to_string(),
+                    status: StepStatus::Done,
+                    validation_result: Some("cargo test render → 3 passed".to_string()),
+                },
+            ],
+        });
+        state.set_input_text("plan finished");
         state
     }
 

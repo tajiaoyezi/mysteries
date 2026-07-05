@@ -24,6 +24,29 @@ pub(crate) fn char_width(ch: char) -> usize {
     }
 }
 
+pub(crate) fn truncate_text_to_width(text: &str, max_width: usize) -> String {
+    let max_width = max_width.max(1);
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+
+    let ellipsis = '…';
+    let ellipsis_width = char_width(ellipsis).max(1);
+    let content_width = max_width.saturating_sub(ellipsis_width);
+    let mut output = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let ch_width = char_width(ch);
+        if ch_width > 0 && width + ch_width > content_width {
+            break;
+        }
+        output.push(ch);
+        width += ch_width;
+    }
+    output.push(ellipsis);
+    output
+}
+
 fn is_zero_width(ch: char) -> bool {
     matches!(
         ch as u32,

@@ -121,10 +121,11 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
             permission_mode.clone(),
         ))),
         Some(Box::new(channel::ChannelPrompter::new(ui_tx.clone()))),
+        Some(Box::new(channel::ChannelProgressReporter::new(
+            ui_tx.clone(),
+        ))),
     );
-    assembled
-        .agent
-        .set_permission_mode(permission_mode.clone());
+    assembled.agent.set_permission_mode(permission_mode.clone());
     let compacting = assembled.compacting;
     let agent = assembled.agent;
     let agent_history = Arc::new(Mutex::new(session_startup.history));
@@ -155,7 +156,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
             model: session_startup.meta.model.clone(),
             max_iterations: config.max_iterations,
             cwd,
-            tools: crate::app::default_registry().schemas().len() + 2,
+            tools: crate::app::default_registry().schemas().len() + 3,
         },
         agent_history,
     );
@@ -2602,6 +2603,7 @@ mod tests {
             Box::new(normal_channel_decider(ui_tx.clone())),
             None,
             None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -2721,6 +2723,7 @@ mod tests {
             Box::new(normal_channel_decider(ui_tx.clone())),
             None,
             None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -2793,6 +2796,7 @@ mod tests {
             Box::new(normal_channel_decider(ui_tx.clone())),
             None,
             None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -2849,6 +2853,7 @@ mod tests {
             provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
             None,
             None,
         );
@@ -2929,6 +2934,7 @@ mod tests {
             Box::new(normal_channel_decider(ui_tx.clone())),
             None,
             None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -2993,6 +2999,7 @@ mod tests {
             }),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
             None,
             None,
         );
@@ -3080,6 +3087,7 @@ mod tests {
             Box::new(normal_channel_decider(ui_tx.clone())),
             None,
             None,
+            None,
         );
         let task_config = task_hotswap(&temp, profiles);
         let history = agent_history();
@@ -3135,6 +3143,7 @@ mod tests {
             provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
             None,
             None,
         );
@@ -3205,6 +3214,7 @@ mod tests {
             provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
             None,
             None,
         );
@@ -3290,6 +3300,7 @@ model = "zhipu/glm-5.2"
             old_provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
             None,
             None,
         );

@@ -6,7 +6,9 @@ use crate::permission::{
 };
 use crate::provider::{DeltaSink, ToolCall};
 use crate::tool::ask::{Answer, Question, UserPrompter};
-use crate::tool::plan::{Plan, PlanApprover, PlanDecision};
+use crate::tool::plan::{
+    Plan, PlanApprover, PlanDecision, PlanProgressReporter, PlanProgressUpdate,
+};
 use crate::tool::{Tool, ToolOutcome};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -41,6 +43,7 @@ pub enum AgentEvent {
         output_tokens: u32,
     },
     Error(String),
+    PlanProgress(PlanProgressUpdate),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -240,10 +243,8 @@ impl PlanApprover for ChannelPlanApprover {
             .unwrap_or(PlanDecision::Reject("UI disconnected".to_string()));
 
         if matches!(decision, PlanDecision::Approve) {
-            *self
-                .mode
-                .lock()
-                .expect("permission mode mutex poisoned") = PermissionMode::AcceptEdits;
+            *self.mode.lock().expect("permission mode mutex poisoned") =
+                PermissionMode::AcceptEdits;
         }
 
         decision
@@ -287,11 +288,27 @@ impl UserPrompter for ChannelPrompter {
     }
 }
 
+pub struct ChannelProgressReporter {
+    tx: mpsc::UnboundedSender<AgentEvent>,
+}
+
+impl ChannelProgressReporter {
+    pub fn new(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        Self { tx }
+    }
+}
+
+impl PlanProgressReporter for ChannelProgressReporter {
+    fn report(&self, update: PlanProgressUpdate) {
+        let _ = self.tx.send(AgentEvent::PlanProgress(update));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentEvent, ChannelDecider, ChannelObserver, ChannelPlanApprover, ChannelPrompter,
-        ChannelSink,
+        AgentEvent, ChannelDecider, ChannelObserver, ChannelPlanApprover, ChannelProgressReporter,
+        ChannelPrompter, ChannelSink,
     };
     use crate::agent::{AgentObserver, AgentStatus};
     use crate::config::read_raw_config;
@@ -300,7 +317,9 @@ mod tests {
     };
     use crate::provider::{DeltaSink, ToolCall};
     use crate::tool::ask::{Question, UserPrompter};
-    use crate::tool::plan::{Plan, PlanApprover, PlanDecision};
+    use crate::tool::plan::{
+        Plan, PlanApprover, PlanDecision, PlanProgressReporter, PlanProgressUpdate, StepStatus,
+    };
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -898,5 +917,35 @@ mod tests {
         let answer = answer.await;
         assert!(answer.selected.is_empty());
         assert!(answer.supplement.is_none());
+    }
+
+    #[test]
+    fn channel_progress_reporter_sends_plan_progress_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelProgressReporter::new(tx);
+        let update = PlanProgressUpdate {
+            step: 2,
+            status: StepStatus::Done,
+            validation_result: Some("cargo test → 12 passed".to_string()),
+        };
+
+        reporter.report(update.clone());
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::PlanProgress(received) => assert_eq!(received, update),
+            other => panic!("expected PlanProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_progress_reporter_does_not_panic_when_sender_dropped() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let reporter = ChannelProgressReporter::new(tx);
+        reporter.report(PlanProgressUpdate {
+            step: 1,
+            status: StepStatus::InProgress,
+            validation_result: None,
+        });
     }
 }

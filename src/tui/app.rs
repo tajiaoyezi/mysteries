@@ -5,11 +5,11 @@ use crate::permission::{cycle_permission_mode, PermissionMode, PermissionReply};
 use crate::provider::registry::models_for;
 use crate::provider::Usage;
 use crate::session::SessionSummary;
+use crate::tool::ask::Answer;
+use crate::tool::plan::{Plan, PlanDecision, PlanProgressUpdate, StepStatus};
 use crate::tui::channel::{
     AgentEvent, PermissionRequest, PlanApprovalRequest, QuestionRequest, UserInput,
 };
-use crate::tool::ask::Answer;
-use crate::tool::plan::PlanDecision;
 use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
 use crate::tui::input_batch::{PasteTailMatcher, TailAction};
 use crate::tui::input_buffer::{reduce_input_buffer, InputBufferAction, InputBufferState};
@@ -469,6 +469,7 @@ pub struct AppState {
     pub pending_permission: Option<PermissionRequest>,
     pub pending_plan_approval: Option<PlanApprovalRequest>,
     pub pending_question: Option<PendingQuestion>,
+    pub current_plan: Option<ActivePlan>,
     pub scroll_offset: usize,
     pub spinner_frame: usize,
     pub should_exit: bool,
@@ -497,6 +498,38 @@ pub struct PendingQuestion {
     pub cursor: usize,
     pub selected: Vec<String>,
     pub supplement: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivePlan {
+    pub title: String,
+    pub steps: Vec<ActiveStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveStep {
+    pub description: String,
+    pub validation: String,
+    pub status: StepStatus,
+    pub validation_result: Option<String>,
+}
+
+impl ActivePlan {
+    pub fn from_plan(plan: &Plan) -> Self {
+        Self {
+            title: plan.title.clone(),
+            steps: plan
+                .steps
+                .iter()
+                .map(|step| ActiveStep {
+                    description: step.description.clone(),
+                    validation: step.validation.clone(),
+                    status: StepStatus::Pending,
+                    validation_result: None,
+                })
+                .collect(),
+        }
+    }
 }
 
 impl AppState {
@@ -534,6 +567,7 @@ impl AppState {
             pending_permission: None,
             pending_plan_approval: None,
             pending_question: None,
+            current_plan: None,
             scroll_offset: 0,
             spinner_frame: 0,
             should_exit: false,
@@ -561,12 +595,32 @@ impl AppState {
         self.pending_queue.push(s);
     }
 
+    /// 新一轮 user turn 开始时清空执行中计划面板(直发与 dequeue 共用)。
+    fn begin_user_turn(&mut self) {
+        self.current_plan = None;
+    }
+
+    fn apply_plan_progress(&mut self, update: PlanProgressUpdate) {
+        let Some(plan) = self.current_plan.as_mut() else {
+            return;
+        };
+        if update.step == 0 || update.step > plan.steps.len() {
+            return;
+        }
+        let step = &mut plan.steps[update.step - 1];
+        step.status = update.status;
+        if update.validation_result.is_some() {
+            step.validation_result = update.validation_result;
+        }
+    }
+
     /// pop 队首(FIFO);有值时 push transcript User、置 Busy、reset turn token。
     pub fn dequeue_next(&mut self) -> Option<String> {
         if self.pending_queue.is_empty() {
             return None;
         }
         let s = self.pending_queue.remove(0);
+        self.begin_user_turn();
         self.transcript.push(TranscriptBlock::User(s.clone()));
         self.phase = Phase::Busy;
         self.reset_turn_token_usage();
@@ -1199,6 +1253,9 @@ impl AppState {
                 input_tokens: _,
                 output_tokens: _,
             } => {}
+            AgentEvent::PlanProgress(update) => {
+                self.apply_plan_progress(update);
+            }
         }
     }
 
@@ -1262,9 +1319,7 @@ impl AppState {
                     self.answer_pending_plan_approval(PlanDecision::Approve);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.answer_pending_plan_approval(PlanDecision::Reject(
-                        "用户驳回".to_string(),
-                    ));
+                    self.answer_pending_plan_approval(PlanDecision::Reject("用户驳回".to_string()));
                 }
                 _ => {}
             }
@@ -1299,8 +1354,9 @@ impl AppState {
                 }
                 KeyCode::Char(' ') => {
                     if pending.request.question.allow_multi && pending.cursor < options_len {
-                        let label =
-                            pending.request.question.options[pending.cursor].label.clone();
+                        let label = pending.request.question.options[pending.cursor]
+                            .label
+                            .clone();
                         if let Some(index) = pending
                             .selected
                             .iter()
@@ -1318,8 +1374,7 @@ impl AppState {
                     if picked <= other_index {
                         pending.cursor = picked;
                         if picked < options_len && pending.request.question.allow_multi {
-                            let label =
-                                pending.request.question.options[picked].label.clone();
+                            let label = pending.request.question.options[picked].label.clone();
                             if let Some(selected_index) = pending
                                 .selected
                                 .iter()
@@ -1436,6 +1491,7 @@ impl AppState {
                     self.reset_turn_token_usage();
                     self.iteration = 0;
                     self.phase = Phase::Busy;
+                    self.begin_user_turn();
                     self.transcript.push(TranscriptBlock::User(prompt.clone()));
                     let _ = input_tx.send(UserInput::Prompt(prompt));
                 } else {
@@ -1499,6 +1555,9 @@ impl AppState {
 
     fn answer_pending_plan_approval(&mut self, decision: PlanDecision) {
         if let Some(request) = self.pending_plan_approval.take() {
+            if matches!(decision, PlanDecision::Approve) {
+                self.current_plan = Some(ActivePlan::from_plan(&request.plan));
+            }
             let _ = request.responder.send(decision);
             self.phase = Phase::Busy;
         }
@@ -1518,10 +1577,7 @@ impl AppState {
             } else if question.options.is_empty() {
                 (Vec::new(), None)
             } else {
-                (
-                    vec![question.options[pending.cursor].label.clone()],
-                    None,
-                )
+                (vec![question.options[pending.cursor].label.clone()], None)
             };
             let _ = pending.request.responder.send(Answer {
                 selected,
@@ -1675,11 +1731,15 @@ mod tests {
     use crate::permission::{PermissionMode, PermissionReply};
     use crate::provider::Usage;
     use crate::session::SessionSummary;
-    use crate::tool::ToolOutcome;
-    use crate::tui::channel::{AgentEvent, PermissionRequest, QuestionRequest, UserInput};
     use crate::tool::ask::{Answer, Question, QuestionOption};
+    use crate::tool::plan::{Plan, PlanDecision, PlanProgressUpdate, PlanStep, StepStatus};
+    use crate::tool::ToolOutcome;
+    use crate::tui::channel::{
+        AgentEvent, PermissionRequest, PlanApprovalRequest, QuestionRequest, UserInput,
+    };
     use crate::tui::command::Command;
     use crate::tui::input_batch::{PasteTailMatcher, TailAction};
+    use crate::tui::input_buffer::InputBufferAction;
     use crate::tui::selection::{Point, SelectionAction};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use serde::{de::DeserializeOwned, Serialize};
@@ -4225,5 +4285,198 @@ mod tests {
         assert!(state.paste_tail_active());
         assert!(state.expire_paste_tail(now + Duration::from_secs(1) + PASTE_TAIL_QUIET_FALLBACK));
         assert!(!state.paste_tail_active());
+    }
+
+    fn sample_plan() -> Plan {
+        Plan {
+            title: "Add plan mode".to_string(),
+            steps: vec![
+                PlanStep {
+                    description: "Wire permission gate".to_string(),
+                    validation: "cargo test permission passes".to_string(),
+                },
+                PlanStep {
+                    description: "Add update_plan tool".to_string(),
+                    validation: "update_plan tests pass".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn activate_plan(state: &mut AppState) {
+        let (responder, _rx) = oneshot::channel();
+        state.apply(AgentEvent::PlanApprovalRequired(PlanApprovalRequest {
+            plan: sample_plan(),
+            responder,
+        }));
+        state.answer_pending_plan_approval(PlanDecision::Approve);
+    }
+
+    #[test]
+    fn approve_activates_current_plan_with_all_pending_steps() {
+        let (responder, _rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state.apply(AgentEvent::PlanApprovalRequired(PlanApprovalRequest {
+            plan: sample_plan(),
+            responder,
+        }));
+        state.answer_pending_plan_approval(PlanDecision::Approve);
+
+        let plan = state.current_plan.expect("plan should be active");
+        assert_eq!(plan.title, "Add plan mode");
+        assert_eq!(plan.steps.len(), 2);
+        assert!(plan
+            .steps
+            .iter()
+            .all(|step| step.status == StepStatus::Pending));
+    }
+
+    #[test]
+    fn reject_does_not_activate_current_plan() {
+        let (responder, _rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state.apply(AgentEvent::PlanApprovalRequired(PlanApprovalRequest {
+            plan: sample_plan(),
+            responder,
+        }));
+        state.answer_pending_plan_approval(PlanDecision::Reject("revise".to_string()));
+
+        assert!(state.current_plan.is_none());
+    }
+
+    #[test]
+    fn plan_progress_done_updates_step_and_validation_result() {
+        let mut state = AppState::new();
+        activate_plan(&mut state);
+
+        state.apply(AgentEvent::PlanProgress(PlanProgressUpdate {
+            step: 1,
+            status: StepStatus::Done,
+            validation_result: Some("cargo test → 12 passed".to_string()),
+        }));
+
+        let plan = state.current_plan.as_ref().unwrap();
+        assert_eq!(plan.steps[0].status, StepStatus::Done);
+        assert_eq!(
+            plan.steps[0].validation_result.as_deref(),
+            Some("cargo test → 12 passed")
+        );
+        assert_eq!(plan.steps[1].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn plan_progress_step_zero_is_ignored_without_panic() {
+        let mut state = AppState::new();
+        activate_plan(&mut state);
+        let before = state.current_plan.clone();
+
+        state.apply(AgentEvent::PlanProgress(PlanProgressUpdate {
+            step: 0,
+            status: StepStatus::Done,
+            validation_result: None,
+        }));
+
+        assert_eq!(state.current_plan, before);
+    }
+
+    #[test]
+    fn plan_progress_out_of_bounds_step_is_ignored() {
+        let mut state = AppState::new();
+        activate_plan(&mut state);
+        let before = state.current_plan.clone();
+
+        state.apply(AgentEvent::PlanProgress(PlanProgressUpdate {
+            step: 99,
+            status: StepStatus::Done,
+            validation_result: None,
+        }));
+
+        assert_eq!(state.current_plan, before);
+    }
+
+    #[test]
+    fn plan_progress_without_active_plan_is_ignored() {
+        let mut state = AppState::new();
+        state.apply(AgentEvent::PlanProgress(PlanProgressUpdate {
+            step: 1,
+            status: StepStatus::InProgress,
+            validation_result: None,
+        }));
+        assert!(state.current_plan.is_none());
+    }
+
+    #[test]
+    fn ready_direct_prompt_clears_current_plan() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        activate_plan(&mut state);
+        state.apply(AgentEvent::PlanProgress(PlanProgressUpdate {
+            step: 1,
+            status: StepStatus::Done,
+            validation_result: Some("done".to_string()),
+        }));
+        state.phase = Phase::Ready;
+        state.apply_input_action(InputBufferAction::InsertStr("next task".to_string()));
+        state.on_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &input_tx,
+        );
+
+        assert!(state.current_plan.is_none());
+    }
+
+    #[test]
+    fn dequeue_next_clears_current_plan() {
+        let mut state = AppState::new();
+        activate_plan(&mut state);
+        state.enqueue_prompt("queued".to_string());
+
+        let _ = state.dequeue_next();
+
+        assert!(state.current_plan.is_none());
+    }
+
+    #[test]
+    fn enqueue_does_not_clear_current_plan() {
+        let mut state = AppState::new();
+        activate_plan(&mut state);
+        state.phase = Phase::Busy;
+
+        state.enqueue_prompt("queued".to_string());
+
+        assert!(state.current_plan.is_some());
+    }
+
+    #[test]
+    fn turn_complete_does_not_clear_current_plan() {
+        let mut state = AppState::new();
+        activate_plan(&mut state);
+        state.phase = Phase::Busy;
+
+        state.apply(AgentEvent::TurnComplete);
+
+        assert!(state.current_plan.is_some());
+    }
+
+    #[test]
+    fn interrupted_does_not_clear_current_plan() {
+        let mut state = AppState::new();
+        activate_plan(&mut state);
+        state.phase = Phase::Busy;
+
+        state.apply(AgentEvent::Interrupted);
+
+        assert!(state.current_plan.is_some());
+    }
+
+    #[test]
+    fn error_does_not_clear_current_plan() {
+        let mut state = AppState::new();
+        activate_plan(&mut state);
+        state.phase = Phase::Busy;
+
+        state.apply(AgentEvent::Error("boom".to_string()));
+
+        assert!(state.current_plan.is_some());
     }
 }

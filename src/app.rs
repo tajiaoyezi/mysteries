@@ -10,7 +10,7 @@ use crate::provider::{FinishReason, ModelResponse, Provider};
 use crate::tool::ask::AskUserTool;
 use crate::tool::edit::{EditFileTool, WriteFileTool};
 use crate::tool::fs::{GlobTool, GrepTool, ListDirTool, ReadFileTool};
-use crate::tool::plan::SubmitPlanTool;
+use crate::tool::plan::{SubmitPlanTool, UpdatePlanTool};
 use crate::tool::shell::RunShellTool;
 use crate::tool::web::{ReqwestFetcher, WebFetchTool, WebSearchTool};
 use crate::tool::ToolRegistry;
@@ -131,7 +131,9 @@ pub fn default_registry() -> ToolRegistry {
         .register(Box::new(WebFetchTool::new(Box::new(ReqwestFetcher::new()))))
         .unwrap();
     registry
-        .register(Box::new(WebSearchTool::new(Box::new(ReqwestFetcher::new()))))
+        .register(Box::new(WebSearchTool::new(
+            Box::new(ReqwestFetcher::new()),
+        )))
         .unwrap();
     registry
 }
@@ -161,6 +163,7 @@ pub fn assemble_agent(
     decider: Box<dyn PermissionDecider>,
     plan_approver: Option<Box<dyn crate::tool::plan::PlanApprover>>,
     user_prompter: Option<Box<dyn crate::tool::ask::UserPrompter>>,
+    progress_reporter: Option<Box<dyn crate::tool::plan::PlanProgressReporter>>,
 ) -> AssembledAgent {
     let compacting = build_compacting(provider.clone(), config);
     let strategy: Box<dyn ContextStrategy> = Box::new(build_compacting(provider.clone(), config));
@@ -174,6 +177,11 @@ pub fn assemble_agent(
         registry
             .register(Box::new(AskUserTool::new(prompter)))
             .expect("ask_user should register once");
+    }
+    if let Some(reporter) = progress_reporter {
+        registry
+            .register(Box::new(UpdatePlanTool::new(reporter)))
+            .expect("update_plan should register once");
     }
     let mut agent = Agent::new(
         provider,
@@ -527,7 +535,14 @@ kind = "mock"
                 usage: None,
             },
         ]));
-        let assembled = assemble_agent(provider.clone(), &config, Box::new(AllowAll), None, None);
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config,
+            Box::new(AllowAll),
+            None,
+            None,
+            None,
+        );
         let sink = NoopSink;
         let mut history = vec![Message::User("write note".to_string())];
 
@@ -594,7 +609,14 @@ kind = "mock"
             finish_reason: FinishReason::Stop,
             usage: None,
         }]));
-        let assembled = assemble_agent(provider, &config_with_window(None), Box::new(AllowAll), None, None);
+        let assembled = assemble_agent(
+            provider,
+            &config_with_window(None),
+            Box::new(AllowAll),
+            None,
+            None,
+            None,
+        );
         let compacted = assembled
             .compacting
             .prepare(&history, Some(&usage))
@@ -613,6 +635,7 @@ kind = "mock"
             Box::new(AllowAll),
             None,
             None,
+            None,
         );
         let unchanged = assembled
             .compacting
@@ -623,5 +646,97 @@ kind = "mock"
             unchanged, history,
             "explicit 128k window must not trigger at 60k input tokens"
         );
+    }
+
+    #[test]
+    fn assemble_agent_some_registers_update_plan_with_twelve_schemas() {
+        use crate::tool::ask::{Answer, AskUserTool, MockPrompter};
+        use crate::tool::plan::{
+            MockPlanApprover, MockPlanProgressReporter, PlanDecision, SubmitPlanTool,
+            UpdatePlanTool,
+        };
+
+        let mut registry = default_registry();
+        registry
+            .register(Box::new(SubmitPlanTool::new(Box::new(
+                MockPlanApprover::new(PlanDecision::Approve),
+            ))))
+            .unwrap();
+        registry
+            .register(Box::new(AskUserTool::new(Box::new(MockPrompter::new(
+                Answer {
+                    selected: Vec::new(),
+                    supplement: None,
+                },
+            )))))
+            .unwrap();
+        registry
+            .register(Box::new(UpdatePlanTool::new(Box::new(
+                MockPlanProgressReporter::new(),
+            ))))
+            .unwrap();
+
+        let schemas = registry.schemas();
+        assert_eq!(schemas.len(), 12);
+        assert!(schemas.iter().any(|schema| schema.name == "update_plan"));
+    }
+
+    #[tokio::test]
+    async fn assemble_agent_some_drives_eleven_tools_in_normal_mode() {
+        use crate::tool::ask::{Answer, MockPrompter};
+        use crate::tool::plan::{MockPlanApprover, MockPlanProgressReporter, PlanDecision};
+
+        let config = Config {
+            provider: ProviderConfig {
+                id: String::new(),
+                kind: ProviderKind::Mock,
+                base_url: None,
+                auth_type: AuthType::ApiKey,
+            },
+            model: "configured-model".to_string(),
+            allowed_commands: Vec::new(),
+            max_iterations: 2,
+            timeout_secs: 30,
+            model_context_window: None,
+            compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
+            keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
+        };
+        let provider = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "ok".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        }]));
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config,
+            Box::new(AllowAll),
+            Some(Box::new(MockPlanApprover::new(PlanDecision::Approve))),
+            Some(Box::new(MockPrompter::new(Answer {
+                selected: Vec::new(),
+                supplement: None,
+            }))),
+            Some(Box::new(MockPlanProgressReporter::new())),
+        );
+        let sink = NoopSink;
+        let mut history = vec![Message::User("hello".to_string())];
+        let _ = assembled
+            .agent
+            .run(
+                &mut history,
+                &ToolContext {
+                    cwd: PathBuf::from("."),
+                    max_output_bytes: 4096,
+                },
+                &sink,
+            )
+            .await;
+
+        let recorded = provider.recorded_requests();
+        assert_eq!(recorded[0].tools.len(), 11);
+        assert!(recorded[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "update_plan"));
     }
 }

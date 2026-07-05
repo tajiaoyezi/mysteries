@@ -1,0 +1,28 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹text.primary›                                  ‹/›‹text.title +bold›✦ MYSTERIES‹/›
+‹text.primary›                          ‹/›‹accent.primary›AGENT · v1.0 · 终端编码助手‹/›
+‹text.primary›        ‹/›‹text.body›读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等‹/›
+‹text.primary›                               ‹/›‹text.body›你按下 y 才动手。‹/›
+
+‹text.primary›                                     ‹/›‹text.muted›试试 ↓‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔任务〕‹/›‹text.primary› 给 Config 加 timeout_secs 字段‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/status〕‹/›‹text.primary› 当前会话快照‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
+
+‹accent.primary›⠋ 处理…‹/›‹text.muted› · esc 中断‹/›
+‹warning.fg bg=bg.surface +bold›◑ 执行中的计划 · ‹/›‹text.body bg=bg.surface›Add plan mode‹/›
+‹text.primary bg=bg.surface›  ‹/›‹success.fg bg=bg.surface›✓‹/›‹text.secondary bg=bg.surface› 1. ‹/›‹text.body bg=bg.surface›Wire permission gate‹/›‹text.primary bg=bg.surface›  ‹/›‹text.muted bg=bg.surface›cargo test permission → 12 passed‹/›
+‹text.primary bg=bg.surface›  ‹/›‹success.fg bg=bg.surface›✓‹/›‹text.secondary bg=bg.surface› 2. ‹/›‹text.body bg=bg.surface›Add update_plan tool‹/›‹text.primary bg=bg.surface›  ‹/›‹text.muted bg=bg.surface›cargo test update_plan → 8 passed‹/›
+‹text.primary bg=bg.surface›  ‹/›‹success.fg bg=bg.surface›✓‹/›‹text.secondary bg=bg.surface› 3. ‹/›‹text.body bg=bg.surface›Wire progress panel‹/›‹text.primary bg=bg.surface›  ‹/›‹text.muted bg=bg.surface›cargo test render → 3 passed‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›plan finished                                                               ‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

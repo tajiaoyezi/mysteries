@@ -1,0 +1,29 @@
+---
+source: src/tui/render.rs
+assertion_line: 3907
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹text.primary›                                  ‹/›‹text.title +bold›✦ MYSTERIES‹/›
+‹text.primary›                          ‹/›‹accent.primary›AGENT · v1.0 · 终端编码助手‹/›
+‹text.primary›        ‹/›‹text.body›读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等‹/›
+‹text.primary›                               ‹/›‹text.body›你按下 y 才动手。‹/›
+
+‹text.primary›                                     ‹/›‹text.muted›试试 ↓‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔任务〕‹/›‹text.primary› 给 Config 加 timeout_secs 字段‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/status〕‹/›‹text.primary› 当前会话快照‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
+
+‹text.muted›◇ 就绪‹/›
+‹warning.fg bg=bg.surface +bold›◑ 执行中的计划 · ‹/›‹text.body bg=bg.surface›Long text truncation‹/›
+‹text.primary bg=bg.surface›  ‹/›‹success.fg bg=bg.surface›✓‹/›‹text.secondary bg=bg.surface› 1. ‹/›‹text.body bg=bg.surface›验证计划进度面板单行截断不会换行把输入框挤下去的回归用例描述文本验证计划…‹/›
+‹text.primary bg=bg.surface›  ‹/›‹warning.fg bg=bg.surface›▸‹/›‹text.secondary bg=bg.surface› 2. ‹/›‹text.body bg=bg.surface›Add update_plan tool‹/›
+‹text.primary bg=bg.surface›  ‹/›‹text.muted bg=bg.surface›○‹/›‹text.secondary bg=bg.surface› 3. ‹/›‹text.body bg=bg.surface›Wire progress panel‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›verify single-line truncation                                               ‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

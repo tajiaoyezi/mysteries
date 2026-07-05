@@ -193,7 +193,8 @@ impl Agent {
                 let readonly = tool.permission_level() == PermissionLevel::ReadOnly;
                 observer.on_tool_call_started(&call.id, &call.name, &call.arguments, readonly);
 
-                if mode == PermissionMode::Plan && tool.permission_level() != PermissionLevel::ReadOnly
+                if mode == PermissionMode::Plan
+                    && tool.permission_level() != PermissionLevel::ReadOnly
                 {
                     let outcome = ToolOutcome {
                         content: "plan mode forbids non-readonly tools".to_string(),
@@ -1354,10 +1355,8 @@ mod tests {
     #[async_trait]
     impl PlanApprover for FlippingPlanApprover {
         async fn approve(&self, _plan: &Plan) -> PlanDecision {
-            *self
-                .mode
-                .lock()
-                .expect("permission_mode mutex poisoned") = PermissionMode::AcceptEdits;
+            *self.mode.lock().expect("permission_mode mutex poisoned") =
+                PermissionMode::AcceptEdits;
             PlanDecision::Approve
         }
     }
@@ -1498,9 +1497,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut agent = Agent::new(
             provider,
-            registry_with_plan_tools(Box::new(FlippingPlanApprover {
-                mode: mode.clone(),
-            })),
+            registry_with_plan_tools(Box::new(FlippingPlanApprover { mode: mode.clone() })),
             Box::new(AllowAll),
             "mock-model".to_string(),
             4,
@@ -1522,7 +1519,7 @@ mod tests {
             history[2],
             Message::ToolResult {
                 call_id: "call-plan".to_string(),
-                content: "计划已批准,按上述 plan 逐步执行、每步完成后自检其 validation".to_string(),
+                content: "计划已批准,按上述 plan 逐步执行;每开始一步先 update_plan 标记 in_progress、每完成一步 update_plan 标记 done 并附 validation 自检结果".to_string(),
                 is_error: false,
             }
         );
