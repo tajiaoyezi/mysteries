@@ -324,7 +324,7 @@ fn error_outcome(content: impl Into<String>) -> ToolOutcome {
     }
 }
 
-fn truncate_utf8(content: String, max_output_bytes: usize) -> (String, bool) {
+pub(crate) fn truncate_utf8(content: String, max_output_bytes: usize) -> (String, bool) {
     if content.len() <= max_output_bytes {
         return (content, false);
     }

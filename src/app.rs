@@ -10,6 +10,7 @@ use crate::provider::{FinishReason, ModelResponse, Provider};
 use crate::tool::edit::{EditFileTool, WriteFileTool};
 use crate::tool::fs::{GlobTool, GrepTool, ListDirTool, ReadFileTool};
 use crate::tool::shell::RunShellTool;
+use crate::tool::web::{ReqwestFetcher, WebFetchTool, WebSearchTool};
 use crate::tool::ToolRegistry;
 use std::fs;
 use std::io::ErrorKind;
@@ -124,6 +125,12 @@ pub fn default_registry() -> ToolRegistry {
     registry.register(Box::new(WriteFileTool)).unwrap();
     registry.register(Box::new(EditFileTool)).unwrap();
     registry.register(Box::new(RunShellTool)).unwrap();
+    registry
+        .register(Box::new(WebFetchTool::new(Box::new(ReqwestFetcher::new()))))
+        .unwrap();
+    registry
+        .register(Box::new(WebSearchTool::new(Box::new(ReqwestFetcher::new()))))
+        .unwrap();
     registry
 }
 
@@ -462,6 +469,8 @@ kind = "mock"
                 "list_dir",
                 "read_file",
                 "run_shell",
+                "web_fetch",
+                "web_search",
                 "write_file",
             ]
         );
@@ -520,7 +529,7 @@ kind = "mock"
         );
         let recorded = provider.recorded_requests();
         assert_eq!(recorded[0].model, "configured-model");
-        assert_eq!(recorded[0].tools.len(), 7);
+        assert_eq!(recorded[0].tools.len(), 9);
     }
 
     #[tokio::test]

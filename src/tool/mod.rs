@@ -7,6 +7,7 @@ use thiserror::Error;
 pub mod edit;
 pub mod fs;
 pub mod shell;
+pub mod web;
 
 #[async_trait]
 pub trait Tool: Send + Sync {

@@ -1,0 +1,636 @@
+use crate::tool::fs::truncate_utf8;
+use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use regex::Regex;
+use reqwest::header::{HeaderValue, USER_AGENT};
+use serde_json::{json, Value};
+use std::time::Duration;
+use thiserror::Error;
+
+pub const MAX_SEARCH_RESULTS: usize = 8;
+const WEB_TIMEOUT: Duration = Duration::from_secs(15);
+const WEB_MAX_BYTES: usize = 2 * 1024 * 1024;
+const BROWSER_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+pub fn ddg_search_url(query: &str) -> String {
+    reqwest::Url::parse_with_params("https://html.duckduckgo.com/html/", &[("q", query)])
+        .expect("valid ddg search base url")
+        .to_string()
+}
+
+pub fn decode_uddg(href: &str) -> Option<String> {
+    // HTML 属性里 & 常写作 &amp;，须在 URL 解析前还原（非 percent 解码）
+    let normalized = href.replace("&amp;", "&");
+    let url_str = if normalized.starts_with("//") {
+        format!("https:{normalized}")
+    } else {
+        normalized
+    };
+    let url = reqwest::Url::parse(&url_str).ok()?;
+    for (key, value) in url.query_pairs() {
+        if key == "uddg" {
+            return Some(value.into_owned());
+        }
+    }
+    None
+}
+
+pub fn html_to_text(html: &str) -> String {
+    let script_re =
+        Regex::new(r"(?si)<script[^>]*>.*?</script>").expect("script strip regex");
+    let style_re = Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("style strip regex");
+    let tag_re = Regex::new(r"<[^>]*>").expect("tag strip regex");
+    let hex_entity_re =
+        Regex::new(r"&#x([0-9a-fA-F]+);").expect("hex entity regex");
+    let dec_entity_re = Regex::new(r"&#([0-9]+);").expect("dec entity regex");
+    let whitespace_re = Regex::new(r"\s+").expect("whitespace regex");
+
+    let mut text = script_re.replace_all(html, "").into_owned();
+    text = style_re.replace_all(&text, "").into_owned();
+    text = tag_re.replace_all(&text, "").into_owned();
+
+    text = hex_entity_re
+        .replace_all(&text, |caps: &regex::Captures| {
+            u32::from_str_radix(&caps[1], 16)
+                .ok()
+                .and_then(char::from_u32)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .into_owned();
+    text = dec_entity_re
+        .replace_all(&text, |caps: &regex::Captures| {
+            caps[1]
+                .parse::<u32>()
+                .ok()
+                .and_then(char::from_u32)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .into_owned();
+
+    text = text.replace("&lt;", "<");
+    text = text.replace("&gt;", ">");
+    text = text.replace("&quot;", "\"");
+    text = text.replace("&nbsp;", " ");
+    text = text.replace("&amp;", "&");
+
+    whitespace_re.replace_all(text.trim(), " ").into_owned()
+}
+
+pub fn parse_ddg_results(html: &str) -> Vec<SearchResult> {
+    let title_re = Regex::new(r#"(?s)class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
+        .expect("result__a regex");
+    let snippet_re =
+        Regex::new(r#"(?s)class="result__snippet"[^>]*>(.*?)</a>"#).expect("result__snippet regex");
+
+    let titles: Vec<(String, String)> = title_re
+        .captures_iter(html)
+        .map(|caps| {
+            let href = caps[1].to_string();
+            let title = html_to_text(&caps[2]);
+            (href, title)
+        })
+        .collect();
+
+    let snippets: Vec<String> = snippet_re
+        .captures_iter(html)
+        .map(|caps| html_to_text(&caps[1]))
+        .collect();
+
+    titles
+        .into_iter()
+        .zip(snippets)
+        .map(|((href, title), snippet)| SearchResult {
+            url: decode_uddg(&href).unwrap_or(href),
+            title,
+            snippet,
+        })
+        .take(MAX_SEARCH_RESULTS)
+        .collect()
+}
+
+fn format_search_results(results: &[SearchResult]) -> String {
+    results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            format!(
+                "{}. {} — {}\n   {}",
+                index + 1,
+                result.title,
+                result.url,
+                result.snippet
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn is_readable_content_type(content_type: Option<&str>) -> bool {
+    let Some(raw) = content_type else {
+        return true;
+    };
+    let mime = raw.split(';').next().unwrap_or(raw).trim().to_ascii_lowercase();
+    if mime.starts_with("text/") {
+        return true;
+    }
+    !(mime.starts_with("image/")
+        || mime == "application/octet-stream"
+        || mime == "application/pdf")
+}
+
+async fn read_body_capped(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, WebError> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| WebError::new(format!("read body failed: {err}")))?;
+        let remaining = max_bytes.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        if chunk.len() <= remaining {
+            body.extend_from_slice(&chunk);
+        } else {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+    }
+    Ok(body)
+}
+
+fn bytes_to_text(body: Vec<u8>) -> String {
+    match String::from_utf8(body) {
+        Ok(text) => text,
+        Err(err) => {
+            let mut bytes = err.into_bytes();
+            while !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
+                bytes.pop();
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+}
+
+fn string_arg<'a>(args: &'a Value, field: &str) -> Option<&'a str> {
+    args.get(field).and_then(Value::as_str)
+}
+
+fn error_outcome(content: impl Into<String>) -> ToolOutcome {
+    ToolOutcome {
+        content: content.into(),
+        is_error: true,
+        truncated: false,
+        exit: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub struct WebError {
+    message: String,
+}
+
+impl WebError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[async_trait]
+pub trait WebFetcher: Send + Sync {
+    async fn fetch(&self, url: &str) -> Result<String, WebError>;
+}
+
+pub struct MockFetcher {
+    response: Result<String, WebError>,
+}
+
+impl MockFetcher {
+    pub fn ok(html: impl Into<String>) -> Self {
+        Self {
+            response: Ok(html.into()),
+        }
+    }
+
+    pub fn err(message: impl Into<String>) -> Self {
+        Self {
+            response: Err(WebError::new(message)),
+        }
+    }
+}
+
+#[async_trait]
+impl WebFetcher for MockFetcher {
+    async fn fetch(&self, _url: &str) -> Result<String, WebError> {
+        match &self.response {
+            Ok(html) => Ok(html.clone()),
+            Err(err) => Err(WebError::new(&err.message)),
+        }
+    }
+}
+
+pub struct ReqwestFetcher {
+    client: reqwest::Client,
+}
+
+impl ReqwestFetcher {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(WEB_TIMEOUT)
+                .build()
+                .expect("reqwest client"),
+        }
+    }
+}
+
+impl Default for ReqwestFetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl WebFetcher for ReqwestFetcher {
+    async fn fetch(&self, url: &str) -> Result<String, WebError> {
+        let response = self
+            .client
+            .get(url)
+            .header(
+                USER_AGENT,
+                HeaderValue::from_static(BROWSER_USER_AGENT),
+            )
+            .send()
+            .await
+            .map_err(|err| WebError::new(format!("request failed: {err}")))?;
+
+        if !response.status().is_success() {
+            return Err(WebError::new(format!("HTTP {}", response.status())));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if !is_readable_content_type(content_type) {
+            return Err(WebError::new(format!(
+                "unsupported content-type: {}",
+                content_type.unwrap_or("unknown")
+            )));
+        }
+
+        let body = read_body_capped(response, WEB_MAX_BYTES).await?;
+        Ok(bytes_to_text(body))
+    }
+}
+
+pub struct WebFetchTool {
+    fetcher: Box<dyn WebFetcher>,
+}
+
+pub struct WebSearchTool {
+    fetcher: Box<dyn WebFetcher>,
+}
+
+impl WebFetchTool {
+    pub fn new(fetcher: Box<dyn WebFetcher>) -> Self {
+        Self { fetcher }
+    }
+}
+
+impl WebSearchTool {
+    pub fn new(fetcher: Box<dyn WebFetcher>) -> Self {
+        Self { fetcher }
+    }
+}
+
+#[async_trait]
+impl Tool for WebFetchTool {
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+
+    fn description(&self) -> &str {
+        "抓 URL 返可读文本,读文档/网页"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string" }
+            },
+            "required": ["url"]
+        })
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::ReadOnly
+    }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
+        let Some(url) = string_arg(&args, "url") else {
+            return error_outcome("missing or invalid url");
+        };
+
+        let html = match self.fetcher.fetch(url).await {
+            Ok(html) => html,
+            Err(err) => return error_outcome(err.to_string()),
+        };
+
+        let text = html_to_text(&html);
+        let (content, truncated) = truncate_utf8(text, ctx.max_output_bytes);
+        ToolOutcome {
+            content,
+            is_error: false,
+            truncated,
+            exit: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WebSearchTool {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+
+    fn description(&self) -> &str {
+        "联网搜索,返回标题/摘要/URL;拿 URL 用 web_fetch 深读"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" }
+            },
+            "required": ["query"]
+        })
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::ReadOnly
+    }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
+        let Some(query) = string_arg(&args, "query") else {
+            return error_outcome("missing or invalid query");
+        };
+
+        let search_url = ddg_search_url(query);
+        let html = match self.fetcher.fetch(&search_url).await {
+            Ok(html) => html,
+            Err(err) => return error_outcome(err.to_string()),
+        };
+
+        let results = parse_ddg_results(&html);
+        if results.is_empty() {
+            return error_outcome("无结果/疑似被限流");
+        }
+
+        let text = format_search_results(&results);
+        let (content, truncated) = truncate_utf8(text, ctx.max_output_bytes);
+        ToolOutcome {
+            content,
+            is_error: false,
+            truncated,
+            exit: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ddg_search_url, decode_uddg, html_to_text, parse_ddg_results, MockFetcher,
+        WebFetchTool, WebSearchTool, MAX_SEARCH_RESULTS,
+    };
+    use crate::tool::{Tool, ToolContext};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    // 真抓 DDG 片段(2026-07-05, query=rust ownership);含 &amp;rut= / &#x27; / <b> / result__a·result__snippet
+    const DDG_FIXTURE: &str = r#"
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body">
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust%2Dlang.org%2Fbook%2Fch04%2D01%2Dwhat%2Dis%2Downership.html&amp;rut=b560a441023d55ad730a26ec876c42ee7096abe323f838f08901ce78e8b4c68f">What is Ownership? - The Rust Programming Language</a>
+                      </h2>
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust%2Dlang.org%2Fbook%2Fch04%2D01%2Dwhat%2Dis%2Downership.html&amp;rut=b560a441023d55ad730a26ec876c42ee7096abe323f838f08901ce78e8b4c68f">Learn how <b>Rust</b> manages memory through a system of <b>ownership</b> with a set of rules that the compiler checks. See how <b>ownership</b> affects the stack, the heap, and strings in <b>Rust</b>.</a>
+                  </div>
+                </div>
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body">
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust%2Dlang.org%2Fbook%2Fch04%2D00%2Dunderstanding%2Downership.html&amp;rut=4a446c0cf310642290f10978495ceaaa71147590961f5d86ae9fa0b7450508f4">Understanding Ownership - The Rust Programming Language</a>
+                      </h2>
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust%2Dlang.org%2Fbook%2Fch04%2D00%2Dunderstanding%2Downership.html&amp;rut=4a446c0cf310642290f10978495ceaaa71147590961f5d86ae9fa0b7450508f4">Understanding <b>Ownership</b> <b>Ownership</b> is <b>Rust&#x27;s</b> most unique feature and has deep implications for the rest of the language. It enables <b>Rust</b> to make memory safety guarantees without needing a garbage collector, so it&#x27;s important to understand how <b>ownership</b> works. In this chapter, we&#x27;ll talk about <b>ownership</b> as well as several related features: borrowing, slices, and how <b>Rust</b> lays data out in ...</a>
+                  </div>
+                </div>"#;
+
+    fn ctx(max_output_bytes: usize) -> ToolContext {
+        ToolContext {
+            cwd: PathBuf::from("."),
+            max_output_bytes,
+        }
+    }
+
+    // --- 1.1 ddg_search_url / decode_uddg ---
+
+    #[test]
+    fn ddg_search_url_encodes_spaces_as_plus() {
+        let url = ddg_search_url("rust ownership");
+        assert!(url.starts_with("https://html.duckduckgo.com/html/?"));
+        assert!(url.contains("q=rust+ownership"));
+    }
+
+    #[test]
+    fn ddg_search_url_encodes_chinese_and_ampersand() {
+        let url = ddg_search_url("Rust 所有权 & 借用");
+        assert!(url.contains("q="));
+        assert!(!url.contains(' '));
+        assert!(url.contains("%26"));
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let q: String = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "q")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        assert_eq!(q, "Rust 所有权 & 借用");
+    }
+
+    #[test]
+    fn decode_uddg_extracts_real_url_and_does_not_swallow_rut_tail() {
+        let href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fx.html&rut=b560a441023d55ad730a26ec876c42ee7096abe323f838f08901ce78e8b4c68f";
+        assert_eq!(
+            decode_uddg(href),
+            Some("https://doc.rust-lang.org/x.html".to_string())
+        );
+    }
+
+    #[test]
+    fn decode_uddg_returns_none_for_ad_or_missing_uddg() {
+        assert_eq!(
+            decode_uddg("//duckduckgo.com/y.js?d=123"),
+            None
+        );
+        assert_eq!(decode_uddg("//example.com/page"), None);
+    }
+
+    // --- 1.2 html_to_text ---
+
+    #[test]
+    fn html_to_text_strips_script_style_tags_and_decodes_entities() {
+        let html = r#"<script>alert("x")</script><style>.x{color:red}</style><p>Hello <b>World</b></p><span>Rust&#x27;s&nbsp;guide</span>  extra   spaces"#;
+        let text = html_to_text(html);
+        assert!(!text.contains("alert"));
+        assert!(!text.contains("color:red"));
+        assert!(!text.contains('<'));
+        assert!(!text.contains('>'));
+        assert!(text.contains("Hello World"));
+        assert!(text.contains("Rust's guide"));
+        assert!(!text.contains('\u{00a0}'));
+        assert_eq!(text.split_whitespace().count(), 5);
+    }
+
+    #[test]
+    fn html_to_text_handles_malformed_and_empty_without_panic() {
+        assert_eq!(html_to_text(""), "");
+        assert_eq!(html_to_text("<p>unclosed"), "unclosed");
+        assert_eq!(html_to_text("plain text"), "plain text");
+    }
+
+    #[test]
+    fn html_to_text_decodes_hex_apostrophe_from_ddg() {
+        assert_eq!(html_to_text("Rust&#x27;s ownership"), "Rust's ownership");
+    }
+
+    // --- 1.3 parse_ddg_results ---
+
+    #[test]
+    fn parse_ddg_results_extracts_title_url_snippet_from_real_fixture() {
+        let results = parse_ddg_results(DDG_FIXTURE);
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].title,
+            "What is Ownership? - The Rust Programming Language"
+        );
+        assert_eq!(
+            results[0].url,
+            "https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html"
+        );
+        assert!(results[0].snippet.contains("Rust"));
+        assert!(results[0].snippet.contains("ownership"));
+        assert!(!results[0].url.contains("duckduckgo.com/l/"));
+        assert!(!results[0].url.contains("rut="));
+
+        assert_eq!(
+            results[1].title,
+            "Understanding Ownership - The Rust Programming Language"
+        );
+        assert_eq!(
+            results[1].url,
+            "https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html"
+        );
+        assert!(results[1].snippet.contains("Rust's"));
+        assert!(!results[1].snippet.contains("&#x27;"));
+    }
+
+    #[test]
+    fn parse_ddg_results_returns_empty_for_no_results() {
+        assert!(parse_ddg_results("<html><body>no results</body></html>").is_empty());
+    }
+
+    #[test]
+    fn parse_ddg_results_caps_at_max_search_results() {
+        let mut html = String::new();
+        for i in 0..10 {
+            html.push_str(&format!(
+                r#"<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F{i}&amp;rut=abc">Title {i}</a><a class="result__snippet">Snippet {i}</a>"#
+            ));
+        }
+        let results = parse_ddg_results(&html);
+        assert_eq!(results.len(), MAX_SEARCH_RESULTS);
+    }
+
+    // --- 2.1 WebFetcher + tools (red stop point) ---
+
+    #[tokio::test]
+    async fn web_fetch_returns_html_to_text_on_success() {
+        let html = "<p>Hello <b>web</b></p>";
+        let tool = WebFetchTool::new(Box::new(MockFetcher::ok(html)));
+        let outcome = tool
+            .execute(json!({ "url": "https://example.com" }), &ctx(4096))
+            .await;
+        assert!(!outcome.is_error);
+        assert_eq!(outcome.content, html_to_text(html));
+        assert!(!outcome.truncated);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_returns_error_when_fetcher_fails() {
+        let tool = WebFetchTool::new(Box::new(MockFetcher::err("network down")));
+        let outcome = tool
+            .execute(json!({ "url": "https://example.com" }), &ctx(4096))
+            .await;
+        assert!(outcome.is_error);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_truncates_when_exceeding_max_output_bytes() {
+        let html = "é".repeat(20);
+        let tool = WebFetchTool::new(Box::new(MockFetcher::ok(&html)));
+        let outcome = tool
+            .execute(json!({ "url": "https://example.com" }), &ctx(5))
+            .await;
+        assert!(!outcome.is_error);
+        assert!(outcome.truncated);
+        assert!(outcome.content.len() <= 5);
+    }
+
+    #[tokio::test]
+    async fn web_search_returns_parsed_results_on_success() {
+        let tool = WebSearchTool::new(Box::new(MockFetcher::ok(DDG_FIXTURE)));
+        let outcome = tool
+            .execute(json!({ "query": "rust ownership" }), &ctx(8192))
+            .await;
+        assert!(!outcome.is_error);
+        assert!(outcome.content.contains("What is Ownership?"));
+        assert!(outcome.content.contains("doc.rust-lang.org/book/ch04-01-what-is-ownership.html"));
+        assert!(outcome.content.contains("Understanding Ownership"));
+    }
+
+    #[tokio::test]
+    async fn web_search_returns_error_when_fetcher_fails() {
+        let tool = WebSearchTool::new(Box::new(MockFetcher::err("ddg blocked")));
+        let outcome = tool
+            .execute(json!({ "query": "rust" }), &ctx(4096))
+            .await;
+        assert!(outcome.is_error);
+    }
+
+    #[tokio::test]
+    async fn web_search_returns_error_when_no_results_parsed() {
+        let tool = WebSearchTool::new(Box::new(MockFetcher::ok("<html></html>")));
+        let outcome = tool
+            .execute(json!({ "query": "rust" }), &ctx(4096))
+            .await;
+        assert!(outcome.is_error);
+    }
+}
