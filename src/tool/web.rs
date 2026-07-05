@@ -3,14 +3,16 @@ use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use regex::Regex;
-use reqwest::header::{HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderValue, LOCATION, USER_AGENT};
 use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::time::Duration;
 use thiserror::Error;
 
 pub const MAX_SEARCH_RESULTS: usize = 8;
 const WEB_TIMEOUT: Duration = Duration::from_secs(15);
 const WEB_MAX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REDIRECTS: u32 = 3;
 const BROWSER_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
@@ -117,6 +119,112 @@ pub fn parse_ddg_results(html: &str) -> Vec<SearchResult> {
         })
         .take(MAX_SEARCH_RESULTS)
         .collect()
+}
+
+/// loopback / 私网 / link-local / CGNAT / NAT64 / multicast / 0/8 / 240/4 等内网或保留范围。
+pub fn is_blocked_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_ipv4(&mapped);
+            }
+            is_blocked_ipv6(v6)
+        }
+    }
+}
+
+fn is_blocked_ipv4(v4: &Ipv4Addr) -> bool {
+    let oct = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || oct[0] == 0
+        || oct[0] >= 240
+        || (oct[0] == 100 && (64..=127).contains(&oct[1]))
+}
+
+fn is_blocked_ipv6(v6: &Ipv6Addr) -> bool {
+    if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+        return true;
+    }
+    let octets = v6.octets();
+    let segs = v6.segments();
+    // fc00::/7 — 首字节 & 0xFE == 0xFC
+    if (octets[0] & 0xFE) == 0xFC {
+        return true;
+    }
+    // fe80::/10
+    if (segs[0] & 0xFFC0) == 0xFE80 {
+        return true;
+    }
+    // NAT64 64:ff9b::/96 — 前 96 位 == 64:ff9b:0:0:0:0
+    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2..=5].iter().all(|&s| s == 0) {
+        return true;
+    }
+    false
+}
+
+/// host 只从已 parse 的 `reqwest::Url::host_str()` 取(v6 先剥 `[]`),禁止从原始 URL 字符串切 host。
+pub fn precheck_url(url: &reqwest::Url) -> Result<(), WebError> {
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(WebError::new(format!("blocked scheme: {scheme}")));
+        }
+    }
+    let Some(host) = url.host_str() else {
+        return Err(WebError::new("missing host"));
+    };
+    if host.is_empty() {
+        return Err(WebError::new("missing host"));
+    }
+    let host = strip_ipv6_brackets(host);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip(&ip) {
+            return Err(WebError::new(format!("blocked IP: {ip}")));
+        }
+    }
+    Ok(())
+}
+
+fn strip_ipv6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// 已解析地址集裁决:任一内网 IP 拒;空集 fail-closed。
+pub fn check_resolved(addrs: &[IpAddr]) -> Result<(), WebError> {
+    if addrs.is_empty() {
+        return Err(WebError::new("no resolved addresses"));
+    }
+    for addr in addrs {
+        if is_blocked_ip(addr) {
+            return Err(WebError::new(format!("blocked IP: {addr}")));
+        }
+    }
+    Ok(())
+}
+
+async fn assert_target_allowed(url: &reqwest::Url) -> Result<(), WebError> {
+    precheck_url(url)?;
+
+    let Some(host) = url.host_str() else {
+        return Err(WebError::new("missing host"));
+    };
+    let host = strip_ipv6_brackets(host).to_string();
+    let port = url.port_or_known_default().unwrap_or(0);
+
+    let addrs = tokio::task::spawn_blocking(move || (host.as_str(), port).to_socket_addrs())
+        .await
+        .map_err(|err| WebError::new(format!("dns task failed: {err}")))?
+        .map_err(|err| WebError::new(format!("dns resolution failed: {err}")))?;
+
+    let ips: Vec<IpAddr> = addrs.map(|addr| addr.ip()).collect();
+    check_resolved(&ips)
 }
 
 fn format_search_results(results: &[SearchResult]) -> String {
@@ -252,6 +360,7 @@ impl ReqwestFetcher {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(WEB_TIMEOUT)
                 .build()
                 .expect("reqwest client"),
@@ -268,16 +377,43 @@ impl Default for ReqwestFetcher {
 #[async_trait]
 impl WebFetcher for ReqwestFetcher {
     async fn fetch(&self, url: &str) -> Result<String, WebError> {
-        let response = self
-            .client
-            .get(url)
-            .header(
-                USER_AGENT,
-                HeaderValue::from_static(BROWSER_USER_AGENT),
-            )
-            .send()
-            .await
-            .map_err(|err| WebError::new(format!("request failed: {err}")))?;
+        let mut url = reqwest::Url::parse(url)
+            .map_err(|err| WebError::new(format!("invalid url: {err}")))?;
+        let mut redirects = 0u32;
+
+        let response = loop {
+            assert_target_allowed(&url).await?;
+
+            let response = self
+                .client
+                .get(url.clone())
+                .header(
+                    USER_AGENT,
+                    HeaderValue::from_static(BROWSER_USER_AGENT),
+                )
+                .send()
+                .await
+                .map_err(|err| WebError::new(format!("request failed: {err}")))?;
+
+            if response.status().is_redirection() {
+                if redirects >= MAX_REDIRECTS {
+                    return Err(WebError::new("too many redirects"));
+                }
+                let location = response
+                    .headers()
+                    .get(LOCATION)
+                    .ok_or_else(|| WebError::new("redirect missing Location header"))?
+                    .to_str()
+                    .map_err(|err| WebError::new(format!("invalid Location header: {err}")))?;
+                url = url
+                    .join(location)
+                    .map_err(|err| WebError::new(format!("invalid redirect url: {err}")))?;
+                redirects += 1;
+                continue;
+            }
+
+            break response;
+        };
 
         if !response.status().is_success() {
             return Err(WebError::new(format!("HTTP {}", response.status())));
@@ -418,11 +554,13 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ddg_search_url, decode_uddg, html_to_text, parse_ddg_results, MockFetcher,
-        WebFetchTool, WebSearchTool, MAX_SEARCH_RESULTS,
+        check_resolved, ddg_search_url, decode_uddg, html_to_text, is_blocked_ip,
+        parse_ddg_results, precheck_url, MockFetcher, WebFetchTool, WebSearchTool,
+        MAX_SEARCH_RESULTS,
     };
     use crate::tool::{Tool, ToolContext};
     use serde_json::json;
+    use std::net::IpAddr;
     use std::path::PathBuf;
 
     // 真抓 DDG 片段(2026-07-05, query=rust ownership);含 &amp;rut= / &#x27; / <b> / result__a·result__snippet
@@ -569,7 +707,119 @@ mod tests {
         assert_eq!(results.len(), MAX_SEARCH_RESULTS);
     }
 
-    // --- 2.1 WebFetcher + tools (red stop point) ---
+    // --- SSRF 护栏纯函数(§1 + §2) ---
+
+    #[test]
+    fn is_blocked_ip_blocks_private_and_reserved_ranges() {
+        let blocked = [
+            "127.0.0.1",
+            "::1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "240.0.0.1",
+            "255.255.255.255",
+            "fe80::1",
+            "fc00::1",
+            "fd00::1",
+            "64:ff9b::a9fe:a9fe",
+            "::ffff:127.0.0.1",
+        ];
+        for addr in blocked {
+            assert!(
+                is_blocked_ip(&addr.parse::<IpAddr>().unwrap()),
+                "expected blocked: {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_blocked_ip_allows_public_addresses() {
+        let allowed = [
+            "1.1.1.1",
+            "8.8.8.8",
+            "172.15.0.1",
+            "172.32.0.1",
+            "2606:4700::1",
+        ];
+        for addr in allowed {
+            assert!(
+                !is_blocked_ip(&addr.parse::<IpAddr>().unwrap()),
+                "expected allowed: {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn precheck_url_rejects_non_http_schemes_and_blocked_ips() {
+        for url in ["ftp://x", "file:///x"] {
+            assert!(precheck_url(&reqwest::Url::parse(url).unwrap()).is_err());
+        }
+        for url in [
+            "http://127.0.0.1",
+            "https://169.254.169.254",
+            "http://[::1]/",
+            "http://2130706433/",
+            "http://0177.0.0.1/",
+            "http://evil@127.0.0.1/",
+        ] {
+            assert!(
+                precheck_url(&reqwest::Url::parse(url).unwrap()).is_err(),
+                "expected blocked: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn precheck_url_allows_hostnames_and_public_ips() {
+        for url in ["https://example.com", "https://1.1.1.1"] {
+            assert!(
+                precheck_url(&reqwest::Url::parse(url).unwrap()).is_ok(),
+                "expected allowed: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn precheck_url_normalizes_encoded_ipv4_literals() {
+        let decimal = reqwest::Url::parse("http://2130706433/").unwrap();
+        assert_eq!(decimal.host_str(), Some("127.0.0.1"));
+        assert!(precheck_url(&decimal).is_err());
+
+        let octal = reqwest::Url::parse("http://0177.0.0.1/").unwrap();
+        assert_eq!(octal.host_str(), Some("127.0.0.1"));
+        assert!(precheck_url(&octal).is_err());
+    }
+
+    #[test]
+    fn precheck_url_strips_ipv6_brackets_from_host_str() {
+        let url = reqwest::Url::parse("http://[::1]/path").unwrap();
+        assert!(precheck_url(&url).is_err());
+    }
+
+    #[test]
+    fn check_resolved_rejects_blocked_and_empty() {
+        assert!(check_resolved(&[]).is_err());
+        assert!(
+            check_resolved(&["10.0.0.1".parse().unwrap(), "1.1.1.1".parse().unwrap()]).is_err()
+        );
+    }
+
+    #[test]
+    fn check_resolved_allows_all_public() {
+        assert!(
+            check_resolved(&["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()]).is_ok()
+        );
+        assert!(check_resolved(&["2606:4700::1".parse().unwrap()]).is_ok());
+    }
+
+    // --- WebFetcher + tools ---
 
     #[tokio::test]
     async fn web_fetch_returns_html_to_text_on_success() {
