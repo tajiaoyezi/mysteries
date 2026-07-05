@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -14,6 +14,7 @@ pub const DEFAULT_KEEP_RECENT_TURNS: u32 = 1;
 pub struct Config {
     pub provider: ProviderConfig,
     pub model: String,
+    pub allowed_commands: Vec<String>,
     pub max_iterations: u32,
     pub timeout_secs: u64,
     pub model_context_window: Option<u32>,
@@ -31,6 +32,8 @@ pub struct RawConfig {
     pub active: Option<String>,
     #[serde(default)]
     pub providers: Option<BTreeMap<String, RawProviderProfile>>,
+    #[serde(default)]
+    pub allowed_commands: Option<Vec<String>>,
     #[serde(default)]
     pub max_iterations: Option<u32>,
     #[serde(default)]
@@ -149,6 +152,26 @@ pub fn write_config(path: &Path, patch: &ConfigWritePatch) -> Result<(), ConfigE
     Ok(())
 }
 
+pub fn append_allowed_command(path: &Path, cmd: &str) -> Result<(), ConfigError> {
+    let mut raw = read_raw_config(path)?;
+    let mut allowed = allowed_command_set(raw.allowed_commands.take());
+    let cmd = crate::permission::normalize(cmd);
+    if !cmd.is_empty() {
+        allowed.insert(cmd);
+    }
+    raw.allowed_commands = (!allowed.is_empty()).then(|| allowed.into_iter().collect());
+
+    let serialized =
+        toml::to_string_pretty(&raw).map_err(|err| ConfigError::Toml(err.to_string()))?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| ConfigError::Write(err.to_string()))?;
+        }
+    }
+    fs::write(path, serialized.as_bytes()).map_err(|err| ConfigError::Write(err.to_string()))?;
+    Ok(())
+}
+
 fn migrate_legacy_into_providers(raw: &mut RawConfig) {
     let legacy_provider = match raw.provider.take() {
         Some(provider) => provider,
@@ -193,12 +216,31 @@ pub fn merge(user: RawConfig, project: RawConfig) -> RawConfig {
         model: project.model.or(user.model),
         active: project.active.or(user.active),
         providers: merge_providers(user.providers, project.providers),
+        allowed_commands: merge_allowed_commands(user.allowed_commands, project.allowed_commands),
         max_iterations: project.max_iterations.or(user.max_iterations),
         timeout_secs: project.timeout_secs.or(user.timeout_secs),
         model_context_window: project.model_context_window.or(user.model_context_window),
         compact_trigger_ratio: project.compact_trigger_ratio.or(user.compact_trigger_ratio),
         keep_recent_turns: project.keep_recent_turns.or(user.keep_recent_turns),
     }
+}
+
+fn allowed_command_set(commands: Option<Vec<String>>) -> BTreeSet<String> {
+    commands
+        .unwrap_or_default()
+        .into_iter()
+        .map(|command| crate::permission::normalize(&command))
+        .filter(|command| !command.is_empty())
+        .collect()
+}
+
+fn merge_allowed_commands(
+    user: Option<Vec<String>>,
+    project: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let mut allowed = allowed_command_set(user);
+    allowed.extend(allowed_command_set(project));
+    (!allowed.is_empty()).then(|| allowed.into_iter().collect())
 }
 
 fn merge_provider(
@@ -275,6 +317,7 @@ pub fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     Ok(Config {
         provider,
         model,
+        allowed_commands: raw.allowed_commands.unwrap_or_default(),
         max_iterations: raw.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS),
         timeout_secs: raw.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
         model_context_window: raw.model_context_window,
@@ -404,9 +447,9 @@ fn default_provider_id_for_kind(kind: &ProviderKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge, parse, read_raw_config, resolve, write_config, AuthType, ConfigError,
-        ConfigWritePatch, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS,
-        DEFAULT_TIMEOUT_SECS,
+        append_allowed_command, merge, parse, read_raw_config, resolve, write_config, AuthType,
+        ConfigError, ConfigWritePatch, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
+        DEFAULT_KEEP_RECENT_TURNS, DEFAULT_TIMEOUT_SECS,
     };
     use std::fs;
 
@@ -431,6 +474,99 @@ kind = "openai"
         assert_eq!(provider.id, None);
         assert_eq!(provider.base_url, None);
         assert_eq!(provider.auth_type, None);
+    }
+
+    #[test]
+    fn parse_allowed_commands_from_toml() {
+        let raw = parse(
+            r#"
+allowed_commands = ["git status", "cargo build"]
+
+model = "gpt-4o-mini"
+
+[provider]
+kind = "mock"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            raw.allowed_commands,
+            Some(vec!["git status".to_string(), "cargo build".to_string()])
+        );
+    }
+
+    #[test]
+    fn resolve_defaults_allowed_commands_to_empty_vec() {
+        let config = resolve(parse(&minimal_raw()).unwrap()).unwrap();
+
+        assert!(config.allowed_commands.is_empty());
+    }
+
+    #[test]
+    fn merge_allowed_commands_uses_union_dedup_in_sorted_order() {
+        let user = parse(
+            r#"
+allowed_commands = ["git status", "cargo build"]
+"#,
+        )
+        .unwrap();
+        let project = parse(
+            r#"
+allowed_commands = ["cargo build", "cargo test"]
+"#,
+        )
+        .unwrap();
+
+        let merged = merge(user, project);
+
+        assert_eq!(
+            merged.allowed_commands,
+            Some(vec![
+                "cargo build".to_string(),
+                "cargo test".to_string(),
+                "git status".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn append_allowed_command_dedups_and_writes_readable_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+allowed_commands = ["git status"]
+
+model = "gpt-4o-mini"
+
+[provider]
+kind = "mock"
+"#,
+        )
+        .unwrap();
+
+        append_allowed_command(&path, "git status").unwrap();
+        append_allowed_command(&path, "ls").unwrap();
+
+        let raw = read_raw_config(&path).unwrap();
+        assert_eq!(
+            raw.allowed_commands,
+            Some(vec!["git status".to_string(), "ls".to_string()])
+        );
+    }
+
+    #[test]
+    fn append_allowed_command_adds_field_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, minimal_raw()).unwrap();
+
+        append_allowed_command(&path, "cargo build").unwrap();
+
+        let raw = read_raw_config(&path).unwrap();
+        assert_eq!(raw.allowed_commands, Some(vec!["cargo build".to_string()]));
     }
 
     #[test]

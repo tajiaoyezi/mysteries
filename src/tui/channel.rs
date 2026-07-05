@@ -1,9 +1,14 @@
 use crate::agent::{AgentObserver, AgentStatus};
-use crate::permission::{auto_allows, PermissionDecider, PermissionDecision, PermissionMode};
+use crate::config::append_allowed_command;
+use crate::permission::{
+    auto_allows, PermissionDecider, PermissionDecision, PermissionMode, PermissionReply,
+    PolicyEngine,
+};
 use crate::provider::{DeltaSink, ToolCall};
 use crate::tool::{Tool, ToolOutcome};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
@@ -47,7 +52,8 @@ pub enum UserInput {
 pub struct PermissionRequest {
     pub tool_name: String,
     pub args: Value,
-    pub responder: oneshot::Sender<PermissionDecision>,
+    pub allow_always_key: Option<String>,
+    pub responder: oneshot::Sender<PermissionReply>,
 }
 
 pub struct ChannelSink {
@@ -112,17 +118,37 @@ impl AgentObserver for ChannelObserver {
 pub struct ChannelDecider {
     tx: mpsc::UnboundedSender<AgentEvent>,
     mode: Arc<Mutex<PermissionMode>>,
+    policy: Mutex<PolicyEngine>,
+    user_config_path: PathBuf,
 }
 
 impl ChannelDecider {
-    pub fn new(tx: mpsc::UnboundedSender<AgentEvent>, mode: Arc<Mutex<PermissionMode>>) -> Self {
-        Self { tx, mode }
+    pub fn new(
+        tx: mpsc::UnboundedSender<AgentEvent>,
+        mode: Arc<Mutex<PermissionMode>>,
+        policy: PolicyEngine,
+        user_config_path: PathBuf,
+    ) -> Self {
+        Self {
+            tx,
+            mode,
+            policy: Mutex::new(policy),
+            user_config_path,
+        }
     }
 }
 
 #[async_trait]
 impl PermissionDecider for ChannelDecider {
     async fn decide(&self, call: &ToolCall, tool: &dyn Tool) -> PermissionDecision {
+        {
+            let policy = self.policy.lock().expect("policy mutex poisoned");
+            if policy.is_allowed(call, tool) {
+                return PermissionDecision::Allow;
+            }
+        }
+
+        let allow_always_key = PolicyEngine::permission_key(call, tool);
         let mode = *self.mode.lock().expect("permission mode mutex poisoned");
         if auto_allows(mode, tool.permission_level()) {
             return PermissionDecision::Allow;
@@ -132,6 +158,7 @@ impl PermissionDecider for ChannelDecider {
         let request = PermissionRequest {
             tool_name: tool.name().to_string(),
             args: call.arguments.clone(),
+            allow_always_key: allow_always_key.clone(),
             responder: tx,
         };
 
@@ -143,7 +170,24 @@ impl PermissionDecider for ChannelDecider {
             return PermissionDecision::Deny;
         }
 
-        rx.await.unwrap_or(PermissionDecision::Deny)
+        match rx.await.unwrap_or(PermissionReply::Deny) {
+            PermissionReply::AllowOnce => PermissionDecision::Allow,
+            PermissionReply::AllowAlways => {
+                if let Some(key) = allow_always_key {
+                    self.policy
+                        .lock()
+                        .expect("policy mutex poisoned")
+                        .remember(key.clone());
+                    if let Err(err) = append_allowed_command(&self.user_config_path, &key) {
+                        let _ = self
+                            .tx
+                            .send(AgentEvent::Notice(format!("命令白名单持久化失败:{err}")));
+                    }
+                }
+                PermissionDecision::Allow
+            }
+            PermissionReply::Deny => PermissionDecision::Deny,
+        }
     }
 }
 
@@ -151,11 +195,15 @@ impl PermissionDecider for ChannelDecider {
 mod tests {
     use super::{AgentEvent, ChannelDecider, ChannelObserver, ChannelSink};
     use crate::agent::{AgentObserver, AgentStatus};
-    use crate::permission::{PermissionDecider, PermissionDecision, PermissionMode};
+    use crate::config::read_raw_config;
+    use crate::permission::{
+        PermissionDecider, PermissionDecision, PermissionMode, PermissionReply, PolicyEngine,
+    };
     use crate::provider::{DeltaSink, ToolCall};
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
     use async_trait::async_trait;
     use serde_json::{json, Value};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout, Duration};
@@ -317,9 +365,41 @@ mod tests {
         mpsc::UnboundedReceiver<AgentEvent>,
         Arc<Mutex<PermissionMode>>,
     ) {
+        decider_with_mode_and_policy(mode, [])
+    }
+
+    fn decider_with_mode_and_policy<const N: usize>(
+        mode: PermissionMode,
+        allowed: [&str; N],
+    ) -> (
+        ChannelDecider,
+        mpsc::UnboundedReceiver<AgentEvent>,
+        Arc<Mutex<PermissionMode>>,
+    ) {
+        decider_with_mode_policy_and_path(mode, allowed, PathBuf::from("user-config.toml"))
+    }
+
+    fn decider_with_mode_policy_and_path<const N: usize>(
+        mode: PermissionMode,
+        allowed: [&str; N],
+        user_config_path: PathBuf,
+    ) -> (
+        ChannelDecider,
+        mpsc::UnboundedReceiver<AgentEvent>,
+        Arc<Mutex<PermissionMode>>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
         let mode = Arc::new(Mutex::new(mode));
-        (ChannelDecider::new(tx, mode.clone()), rx, mode)
+        (
+            ChannelDecider::new(
+                tx,
+                mode.clone(),
+                PolicyEngine::from_commands(allowed),
+                user_config_path,
+            ),
+            rx,
+            mode,
+        )
     }
 
     // --- §2.1 ChannelDecider + PermissionMode(卡点 B) ---
@@ -371,12 +451,182 @@ mod tests {
         match request {
             AgentEvent::PermissionRequired(request) => {
                 assert_eq!(request.tool_name, "execute_tool");
-                request.responder.send(PermissionDecision::Allow).unwrap();
+                assert_eq!(request.allow_always_key.as_deref(), Some("echo hi"));
+                request.responder.send(PermissionReply::AllowOnce).unwrap();
             }
             other => panic!("expected PermissionRequired, got {other:?}"),
         }
 
         assert_eq!(decision.await, PermissionDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn channel_decider_allowlist_hit_returns_allow_without_channel() {
+        let (decider, mut rx, _mode) =
+            decider_with_mode_and_policy(PermissionMode::Normal, ["echo hi"]);
+        let call = execute_call();
+        let tool = ExecuteTool;
+        let decision = decider.decide(&call, &tool);
+        tokio::pin!(decision);
+
+        let decision = tokio::select! {
+            event = rx.recv() => panic!("must not send PermissionRequired for allowed command: {event:?}"),
+            decision = &mut decision => decision,
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for allowlist decision"),
+        };
+
+        assert_eq!(decision, PermissionDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn channel_decider_normal_miss_sends_permission_request_with_allow_always_key() {
+        let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::Normal);
+        let call = execute_call();
+        let tool = ExecuteTool;
+        let decision = decider.decide(&call, &tool);
+        tokio::pin!(decision);
+
+        let request = tokio::select! {
+            event = rx.recv() => event.expect("permission request should be sent"),
+            decision = &mut decision => panic!("decide returned before permission response: {decision:?}"),
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for permission request"),
+        };
+
+        match request {
+            AgentEvent::PermissionRequired(request) => {
+                assert_eq!(request.tool_name, "execute_tool");
+                assert_eq!(request.allow_always_key.as_deref(), Some("echo hi"));
+                drop(request.responder);
+            }
+            other => panic!("expected PermissionRequired, got {other:?}"),
+        }
+
+        assert_eq!(decision.await, PermissionDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn channel_decider_allow_always_persists_and_remembers_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let (decider, mut rx, _mode) =
+            decider_with_mode_policy_and_path(PermissionMode::Normal, [], config_path.clone());
+        let call = execute_call();
+        let tool = ExecuteTool;
+        let decision = decider.decide(&call, &tool);
+        tokio::pin!(decision);
+
+        let request = tokio::select! {
+            event = rx.recv() => event.expect("permission request should be sent"),
+            decision = &mut decision => panic!("decide returned before permission response: {decision:?}"),
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for permission request"),
+        };
+        match request {
+            AgentEvent::PermissionRequired(request) => {
+                assert_eq!(request.allow_always_key.as_deref(), Some("echo hi"));
+                request
+                    .responder
+                    .send(PermissionReply::AllowAlways)
+                    .unwrap();
+            }
+            other => panic!("expected PermissionRequired, got {other:?}"),
+        }
+
+        assert_eq!(decision.await, PermissionDecision::Allow);
+        assert_eq!(
+            read_raw_config(&config_path).unwrap().allowed_commands,
+            Some(vec!["echo hi".to_string()])
+        );
+
+        let second = decider.decide(&call, &tool);
+        tokio::pin!(second);
+        let second = tokio::select! {
+            event = rx.recv() => panic!("remembered command must not send PermissionRequired: {event:?}"),
+            decision = &mut second => decision,
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for remembered command decision"),
+        };
+        assert_eq!(second, PermissionDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn channel_decider_allow_always_notice_on_persist_failure_but_remembers() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().to_path_buf();
+        let (decider, mut rx, _mode) =
+            decider_with_mode_policy_and_path(PermissionMode::Normal, [], config_path);
+        let call = execute_call();
+        let tool = ExecuteTool;
+        let decision = decider.decide(&call, &tool);
+        tokio::pin!(decision);
+
+        let request = tokio::select! {
+            event = rx.recv() => event.expect("permission request should be sent"),
+            decision = &mut decision => panic!("decide returned before permission response: {decision:?}"),
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for permission request"),
+        };
+        match request {
+            AgentEvent::PermissionRequired(request) => {
+                request
+                    .responder
+                    .send(PermissionReply::AllowAlways)
+                    .unwrap();
+            }
+            other => panic!("expected PermissionRequired, got {other:?}"),
+        }
+
+        assert_eq!(decision.await, PermissionDecision::Allow);
+        let notice = tokio::select! {
+            event = rx.recv() => event.expect("persist failure notice"),
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for persist failure notice"),
+        };
+        match notice {
+            AgentEvent::Notice(message) => {
+                assert!(message.starts_with("命令白名单持久化失败:"));
+            }
+            other => panic!("expected Notice, got {other:?}"),
+        }
+
+        let second = decider.decide(&call, &tool);
+        tokio::pin!(second);
+        let second = tokio::select! {
+            event = rx.recv() => panic!("remembered command must not send PermissionRequired: {event:?}"),
+            decision = &mut second => decision,
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for remembered command decision"),
+        };
+        assert_eq!(second, PermissionDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn channel_decider_allow_always_without_key_does_not_persist() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let (decider, mut rx, _mode) =
+            decider_with_mode_policy_and_path(PermissionMode::Normal, [], config_path.clone());
+        let call = call();
+        let tool = ConfirmTool;
+        let decision = decider.decide(&call, &tool);
+        tokio::pin!(decision);
+
+        let request = tokio::select! {
+            event = rx.recv() => event.expect("permission request should be sent"),
+            decision = &mut decision => panic!("decide returned before permission response: {decision:?}"),
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for permission request"),
+        };
+        match request {
+            AgentEvent::PermissionRequired(request) => {
+                assert_eq!(request.allow_always_key, None);
+                request
+                    .responder
+                    .send(PermissionReply::AllowAlways)
+                    .unwrap();
+            }
+            other => panic!("expected PermissionRequired, got {other:?}"),
+        }
+
+        assert_eq!(decision.await, PermissionDecision::Allow);
+        assert!(
+            !config_path.exists(),
+            "keyless AllowAlways must not create or update config"
+        );
     }
 
     struct ConfirmTool;
@@ -435,7 +685,7 @@ mod tests {
             AgentEvent::PermissionRequired(request) => {
                 assert_eq!(request.tool_name, "confirm_tool");
                 assert_eq!(request.args, json!({ "path": "note.txt" }));
-                request.responder.send(PermissionDecision::Allow).unwrap();
+                request.responder.send(PermissionReply::AllowOnce).unwrap();
             }
             other => panic!("expected PermissionRequired, got {other:?}"),
         }

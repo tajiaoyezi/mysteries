@@ -1,17 +1,17 @@
-use crate::agent::DEFAULT_SYSTEM_PROMPT;
 use crate::agent::message::Message;
 use crate::agent::run_compact_command;
+use crate::agent::DEFAULT_SYSTEM_PROMPT;
 use crate::agent::{Agent, AgentStatus, Compacting};
 use crate::app::select_provider;
-use crate::cli::{CliError, CliPaths, StdinAuthPrompter, load_config_or_onboard};
+use crate::cli::{load_config_or_onboard, CliError, CliPaths, StdinAuthPrompter};
 use crate::config::{Config, ProviderConfig, ProviderKind, ProviderProfile};
 use crate::credential::{CredentialChain, EnvCredentialSource, FileCredentialSource};
 use crate::error::AgentError;
-use crate::permission::PermissionMode;
+use crate::permission::{PermissionMode, PolicyEngine};
 use crate::provider::Usage;
-use crate::session::{SessionMeta, SessionStore, replace_system_head};
+use crate::session::{replace_system_head, SessionMeta, SessionStore};
 use crate::tool::ToolContext;
-use crate::tui::clipboard::{ArboardClipboard, Clipboard, copy_selection};
+use crate::tui::clipboard::{copy_selection, ArboardClipboard, Clipboard};
 use crate::tui::selection::{Point, SelectionAction};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{Duration, MissedTickBehavior};
 
 pub mod app;
@@ -113,6 +113,8 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
         Box::new(channel::ChannelDecider::new(
             ui_tx.clone(),
             permission_mode.clone(),
+            PolicyEngine::from_commands(config.allowed_commands.iter()),
+            paths.user_config.clone(),
         )),
     );
     let compacting = assembled.compacting;
@@ -1428,6 +1430,7 @@ fn apply_set_provider(
             auth_type: profile.auth_type.clone(),
         },
         model: model.to_string(),
+        allowed_commands: startup_config.allowed_commands.clone(),
         max_iterations: startup_config.max_iterations,
         timeout_secs: startup_config.timeout_secs,
         model_context_window: startup_config.model_context_window,
@@ -1462,23 +1465,24 @@ fn error_message(err: AgentError) -> String {
 mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
     use super::{
-        CancelAction, DEFAULT_SYSTEM_PROMPT, EXIT_DOUBLE_TAP, ExitIntent, MouseWheelScrollAction,
-        RunAgentTaskConfig, SelectionKeyAction, StartupMode, apply_mouse_wheel_scroll_to_state,
-        arrows_route_to_completion, cancel_action, handle_mouse_selection_event,
-        handle_queue_cancel_key, handle_resize, handle_selection_key, prepare_session_startup,
-        push_session_save_notice_if_error, run_agent_task, scroll_action_for_key,
-        selection_key_action, should_exit, terminal_session_event, write_session_snapshot,
+        apply_mouse_wheel_scroll_to_state, arrows_route_to_completion, cancel_action,
+        handle_mouse_selection_event, handle_queue_cancel_key, handle_resize, handle_selection_key,
+        prepare_session_startup, push_session_save_notice_if_error, run_agent_task,
+        scroll_action_for_key, selection_key_action, should_exit, terminal_session_event,
+        write_session_snapshot, CancelAction, ExitIntent, MouseWheelScrollAction,
+        RunAgentTaskConfig, SelectionKeyAction, StartupMode, DEFAULT_SYSTEM_PROMPT,
+        EXIT_DOUBLE_TAP,
     };
-    use crate::agent::AgentStatus;
     use crate::agent::message::Message;
+    use crate::agent::AgentStatus;
     use crate::app::assemble_agent;
     use crate::cli::CliPaths;
     use crate::config::{
-        AuthType, Config, DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS, ProviderConfig,
-        ProviderKind, ProviderProfile,
+        AuthType, Config, ProviderConfig, ProviderKind, ProviderProfile,
+        DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS,
     };
     use crate::error::ProviderError;
-    use crate::permission::{PermissionDecision, PermissionMode};
+    use crate::permission::{PermissionMode, PermissionReply, PolicyEngine};
     use crate::provider::mock::MockProvider;
     use crate::provider::{
         DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, ToolCall,
@@ -1501,14 +1505,19 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Instant as StdInstant;
-    use tokio::sync::{Mutex, mpsc, oneshot};
-    use tokio::time::{Duration, timeout};
+    use tokio::sync::{mpsc, oneshot, Mutex};
+    use tokio::time::{timeout, Duration};
 
     fn normal_channel_decider(tx: mpsc::UnboundedSender<AgentEvent>) -> ChannelDecider {
-        ChannelDecider::new(tx, Arc::new(std::sync::Mutex::new(PermissionMode::Normal)))
+        ChannelDecider::new(
+            tx,
+            Arc::new(std::sync::Mutex::new(PermissionMode::Normal)),
+            PolicyEngine::default(),
+            PathBuf::from("user-config.toml"),
+        )
     }
 
     fn agent_history() -> Arc<Mutex<Vec<Message>>> {
@@ -1547,6 +1556,7 @@ mod tests {
                 auth_type: AuthType::ApiKey,
             },
             model: "tui-test-model".to_string(),
+            allowed_commands: Vec::new(),
             max_iterations: 4,
             timeout_secs: 30,
             model_context_window: None,
@@ -1919,6 +1929,7 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: perm_tx,
         }));
 
@@ -2238,6 +2249,7 @@ mod tests {
         pending.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: tx,
         }));
         assert!(!should_exit(
@@ -2260,6 +2272,7 @@ mod tests {
         pending.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: tx,
         }));
         assert_eq!(selection_key_action(&pending, ctrl_c()), None);
@@ -2323,7 +2336,7 @@ mod tests {
     }
     #[test]
     fn mouse_wheel_scroll_action_maps_scroll_kinds_and_ignores_others() {
-        use super::{MOUSE_WHEEL_SCROLL_LINES, MouseWheelScrollAction, mouse_wheel_scroll_action};
+        use super::{mouse_wheel_scroll_action, MouseWheelScrollAction, MOUSE_WHEEL_SCROLL_LINES};
         use crossterm::event::MouseButton;
 
         assert_eq!(
@@ -2622,7 +2635,7 @@ mod tests {
         match ui_rx.recv().await.expect("permission event") {
             AgentEvent::PermissionRequired(request) => {
                 assert_eq!(request.tool_name, "write_file");
-                request.responder.send(PermissionDecision::Allow).unwrap();
+                request.responder.send(PermissionReply::AllowOnce).unwrap();
             }
             other => panic!("expected PermissionRequired, got {other:?}"),
         }
@@ -2720,7 +2733,7 @@ mod tests {
                     request.args,
                     json!({ "path": "note.txt", "content": "from tui" })
                 );
-                request.responder.send(PermissionDecision::Allow).unwrap();
+                request.responder.send(PermissionReply::AllowOnce).unwrap();
                 break;
             }
         }
@@ -2871,22 +2884,18 @@ mod tests {
         );
 
         let stored = history.lock().await;
-        assert!(
-            stored
-                .iter()
-                .any(|msg| { matches!(msg, Message::User(text) if text == "round one") })
-        );
+        assert!(stored
+            .iter()
+            .any(|msg| { matches!(msg, Message::User(text) if text == "round one") }));
         assert!(stored.iter().any(|msg| {
             matches!(
                 msg,
                 Message::Assistant { text, .. } if text == "first reply"
             )
         }));
-        assert!(
-            stored
-                .iter()
-                .any(|msg| { matches!(msg, Message::User(text) if text == "round two") })
-        );
+        assert!(stored
+            .iter()
+            .any(|msg| { matches!(msg, Message::User(text) if text == "round two") }));
     }
 
     #[tokio::test]
@@ -3083,11 +3092,9 @@ mod tests {
 
         assert!(old_provider.recorded_requests().is_empty());
         let locked = history.lock().await;
-        assert!(
-            locked
-                .iter()
-                .any(|msg| matches!(msg, Message::User(text) if text == "hello"))
-        );
+        assert!(locked
+            .iter()
+            .any(|msg| matches!(msg, Message::User(text) if text == "hello")));
     }
 
     #[tokio::test]

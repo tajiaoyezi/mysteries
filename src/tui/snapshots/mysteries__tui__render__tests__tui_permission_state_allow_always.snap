@@ -1,0 +1,28 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹accent.primary›> ‹/›‹text.primary›跑一下 cargo test --lib‹/›
+
+
+
+
+
+
+
+‹warning.fg bg=warning.bg›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹warning.fg bg=warning.bg›│‹/›‹warning.fg bg=warning.bg +bold›▲ 需要授权‹/›‹text.primary bg=warning.bg›                                                                    ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›tool: ‹/›‹accent.primary bg=warning.bg›run_shell‹/›‹text.primary bg=warning.bg›                                                               ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›args: ‹/›‹text.body bg=warning.bg›command=cargo test --lib‹/›‹text.primary bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│[y · 允许]‹/›‹text.body bg=warning.bg›   ‹/›‹warning.fg bg=warning.bg›[a · 总是允许]‹/›‹text.body bg=warning.bg›   ‹/›‹error.fg bg=warning.bg›[n · 拒绝]‹/›‹text.primary bg=warning.bg›                                      ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›提示:Enter = 允许 · Esc = 拒绝‹/›‹text.primary bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹warning.fg›▲ 等待授权…‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 1 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

@@ -1,16 +1,16 @@
-use crate::agent::AgentStatus;
 use crate::agent::message::Message;
+use crate::agent::AgentStatus;
 use crate::config::ProviderProfile;
-use crate::permission::{PermissionDecision, PermissionMode, cycle_permission_mode};
-use crate::provider::Usage;
+use crate::permission::{cycle_permission_mode, PermissionMode, PermissionReply};
 use crate::provider::registry::models_for;
+use crate::provider::Usage;
 use crate::session::SessionSummary;
 use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
-use crate::tui::command::{Command, CommandMetadata, command_metadata, parse_command};
+use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
 use crate::tui::input_batch::{PasteTailMatcher, TailAction};
-use crate::tui::input_buffer::{InputBufferAction, InputBufferState, reduce_input_buffer};
+use crate::tui::input_buffer::{reduce_input_buffer, InputBufferAction, InputBufferState};
 use crate::tui::jump_to_bottom::{bump_new_message_count, new_message_count_on_follow_bottom};
-use crate::tui::selection::{SelectionAction, SelectionState, reduce_selection};
+use crate::tui::selection::{reduce_selection, SelectionAction, SelectionState};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const ASCII_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
@@ -1198,10 +1198,18 @@ impl AppState {
         if self.pending_permission.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.answer_pending_permission(PermissionDecision::Allow);
+                    self.answer_pending_permission(PermissionReply::AllowOnce);
+                }
+                KeyCode::Char('a') | KeyCode::Char('A')
+                    if self
+                        .pending_permission
+                        .as_ref()
+                        .is_some_and(|request| request.allow_always_key.is_some()) =>
+                {
+                    self.answer_pending_permission(PermissionReply::AllowAlways);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.answer_pending_permission(PermissionDecision::Deny);
+                    self.answer_pending_permission(PermissionReply::Deny);
                 }
                 _ => {}
             }
@@ -1348,9 +1356,9 @@ impl AppState {
         }
     }
 
-    fn answer_pending_permission(&mut self, decision: PermissionDecision) {
+    fn answer_pending_permission(&mut self, reply: PermissionReply) {
         if let Some(request) = self.pending_permission.take() {
-            let _ = request.responder.send(decision);
+            let _ = request.responder.send(reply);
             self.phase = Phase::Busy;
         }
     }
@@ -1475,14 +1483,14 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, DiffKind, DiffLine, ModelsPicker, ModelsPickerRowKind, PASTE_TAIL_QUIET_FALLBACK,
-        Phase, SessionPicker, SessionRow, SessionSnapshot, StatusSnapshot, ToolCard,
-        ToolCardStatus, TranscriptBlock, build_rows, compute_diff, estimate_streaming_rate_tps,
-        estimate_tokens_from_chars,
+        build_rows, compute_diff, estimate_streaming_rate_tps, estimate_tokens_from_chars,
+        AppState, DiffKind, DiffLine, ModelsPicker, ModelsPickerRowKind, Phase, SessionPicker,
+        SessionRow, SessionSnapshot, StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
+        PASTE_TAIL_QUIET_FALLBACK,
     };
     use crate::agent::AgentStatus;
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
-    use crate::permission::{PermissionDecision, PermissionMode};
+    use crate::permission::{PermissionMode, PermissionReply};
     use crate::provider::Usage;
     use crate::session::SessionSummary;
     use crate::tool::ToolOutcome;
@@ -1491,7 +1499,7 @@ mod tests {
     use crate::tui::input_batch::{PasteTailMatcher, TailAction};
     use crate::tui::selection::{Point, SelectionAction};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use serde::{Serialize, de::DeserializeOwned};
+    use serde::{de::DeserializeOwned, Serialize};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fmt::Debug;
@@ -2024,11 +2032,9 @@ mod tests {
             .filter(|row| row.provider_id == "wps" && row.kind == ModelsPickerRowKind::Model)
             .collect();
         assert_eq!(wps_models.len(), 8, "wps catalog has 8 models");
-        assert!(
-            wps_models
-                .iter()
-                .any(|row| row.model.as_deref() == Some("zhipu/glm-5.2") && row.is_current)
-        );
+        assert!(wps_models
+            .iter()
+            .any(|row| row.model.as_deref() == Some("zhipu/glm-5.2") && row.is_current));
         assert_eq!(wps_models.iter().filter(|row| row.is_current).count(), 1);
 
         let openai_header = rows
@@ -2134,16 +2140,14 @@ mod tests {
                     || row.provider_id == "wps"),
             "only wps group should remain when filtering glm"
         );
-        assert!(
-            visible
-                .iter()
-                .filter(|row| row.kind == ModelsPickerRowKind::Model)
-                .all(|row| {
-                    let haystack =
-                        format!("{}/{}", row.provider_id, row.model.as_deref().unwrap_or(""));
-                    haystack.to_lowercase().contains("glm")
-                })
-        );
+        assert!(visible
+            .iter()
+            .filter(|row| row.kind == ModelsPickerRowKind::Model)
+            .all(|row| {
+                let haystack =
+                    format!("{}/{}", row.provider_id, row.model.as_deref().unwrap_or(""));
+                haystack.to_lowercase().contains("glm")
+            }));
 
         let highlighted = picker.highlighted_row().expect("highlight after filter");
         assert_eq!(highlighted.kind, ModelsPickerRowKind::Model);
@@ -2624,6 +2628,7 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({ "path": "note.txt" }),
+            allow_always_key: None,
             responder: tx,
         }));
 
@@ -2835,6 +2840,7 @@ mod tests {
             state.apply(AgentEvent::PermissionRequired(PermissionRequest {
                 tool_name: "write_file".to_string(),
                 args: json!({}),
+                allow_always_key: None,
                 responder: permission_tx,
             }));
 
@@ -2958,6 +2964,7 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: allow_tx,
         }));
 
@@ -2977,7 +2984,7 @@ mod tests {
 
         state.on_key(key(KeyCode::Char('y')), &input_tx);
 
-        assert_eq!(allow_rx.try_recv().unwrap(), PermissionDecision::Allow);
+        assert_eq!(allow_rx.try_recv().unwrap(), PermissionReply::AllowOnce);
         assert!(state.pending_permission.is_none());
         assert_eq!(state.phase, Phase::Busy);
         assert!(state.tools_expanded);
@@ -3062,9 +3069,7 @@ mod tests {
         state.on_key(key(KeyCode::Char('/')), &tx);
         assert_eq!(
             completion_names(&state),
-            vec![
-                "/help", "/clear", "/model", "/models", "/status", "/exit", "/compact"
-            ]
+            vec!["/help", "/clear", "/model", "/models", "/status", "/exit", "/compact"]
         );
         assert_eq!(selected_completion_name(&state), "/help");
 
@@ -3203,12 +3208,13 @@ mod tests {
         allow_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: allow_tx,
         }));
 
         allow_state.on_key(key(KeyCode::Char('y')), &input_tx);
 
-        assert_eq!(allow_rx.try_recv().unwrap(), PermissionDecision::Allow);
+        assert_eq!(allow_rx.try_recv().unwrap(), PermissionReply::AllowOnce);
         assert!(allow_state.pending_permission.is_none());
         assert_eq!(allow_state.phase, Phase::Busy);
 
@@ -3217,12 +3223,13 @@ mod tests {
         deny_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: deny_tx,
         }));
 
         deny_state.on_key(key(KeyCode::Char('n')), &input_tx);
 
-        assert_eq!(deny_rx.try_recv().unwrap(), PermissionDecision::Deny);
+        assert_eq!(deny_rx.try_recv().unwrap(), PermissionReply::Deny);
         assert!(deny_state.pending_permission.is_none());
         assert_eq!(deny_state.phase, Phase::Busy);
     }
@@ -3235,24 +3242,60 @@ mod tests {
         allow_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: allow_tx,
         }));
 
         allow_state.on_key(key(KeyCode::Enter), &input_tx);
 
-        assert_eq!(allow_rx.try_recv().unwrap(), PermissionDecision::Allow);
+        assert_eq!(allow_rx.try_recv().unwrap(), PermissionReply::AllowOnce);
 
         let (deny_tx, mut deny_rx) = oneshot::channel();
         let mut deny_state = AppState::new();
         deny_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: deny_tx,
         }));
 
         deny_state.on_key(key(KeyCode::Esc), &input_tx);
 
-        assert_eq!(deny_rx.try_recv().unwrap(), PermissionDecision::Deny);
+        assert_eq!(deny_rx.try_recv().unwrap(), PermissionReply::Deny);
+    }
+
+    #[test]
+    fn on_key_answers_pending_permission_with_allow_always_only_when_key_exists() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (allow_tx, mut allow_rx) = oneshot::channel();
+        let mut allow_state = AppState::new();
+        allow_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "run_shell".to_string(),
+            args: json!({ "command": "cargo test" }),
+            allow_always_key: Some("cargo test".to_string()),
+            responder: allow_tx,
+        }));
+
+        allow_state.on_key(key(KeyCode::Char('a')), &input_tx);
+
+        assert_eq!(allow_rx.try_recv().unwrap(), PermissionReply::AllowAlways);
+        assert!(allow_state.pending_permission.is_none());
+        assert_eq!(allow_state.phase, Phase::Busy);
+
+        let (ignored_tx, mut ignored_rx) = oneshot::channel();
+        let mut ignored_state = AppState::new();
+        ignored_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "edit_file".to_string(),
+            args: json!({ "path": "src/lib.rs" }),
+            allow_always_key: None,
+            responder: ignored_tx,
+        }));
+
+        ignored_state.on_key(key(KeyCode::Char('a')), &input_tx);
+
+        assert!(ignored_rx.try_recv().is_err());
+        assert!(ignored_state.pending_permission.is_some());
+        assert_eq!(ignored_state.phase, Phase::WaitingForPermission);
     }
 
     #[test]
@@ -3484,6 +3527,7 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: allow_tx,
         }));
 
@@ -3572,6 +3616,7 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "run_shell".to_string(),
             args: json!({ "command": "echo" }),
+            allow_always_key: None,
             responder: allow_tx,
         }));
 
@@ -3602,7 +3647,7 @@ mod tests {
         interrupt_tx: &mpsc::UnboundedSender<UserInput>,
     ) {
         use crate::tui::app::{
-            ApplyBatchKeyResult, apply_batch_input_key, flush_merged_input_chars,
+            apply_batch_input_key, flush_merged_input_chars, ApplyBatchKeyResult,
         };
         use crate::tui::input_batch::classify_key_batch;
 
@@ -3680,6 +3725,7 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            allow_always_key: None,
             responder: permission_tx,
         }));
 
@@ -3694,7 +3740,10 @@ mod tests {
             &interrupt_tx,
         );
 
-        assert_eq!(permission_rx.try_recv().unwrap(), PermissionDecision::Allow);
+        assert_eq!(
+            permission_rx.try_recv().unwrap(),
+            PermissionReply::AllowOnce
+        );
         assert!(state.pending_permission.is_none());
         assert_eq!(state.input(), "");
         assert!(!state.input().contains('\n'));

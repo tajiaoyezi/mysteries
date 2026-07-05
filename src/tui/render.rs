@@ -1,24 +1,24 @@
-use crate::permission::{PermissionMode, permission_mode_label};
-use crate::tui::EXIT_DOUBLE_TAP;
+use crate::permission::{permission_mode_label, PermissionMode};
 use crate::tui::app::{
-    AppState, DiffKind, DiffLine, ModelsPickerRowKind, Phase, StatusSnapshot, ToolCard,
-    ToolCardStatus, TranscriptBlock, compute_diff,
+    compute_diff, AppState, DiffKind, DiffLine, ModelsPickerRowKind, Phase, StatusSnapshot,
+    ToolCard, ToolCardStatus, TranscriptBlock,
 };
 use crate::tui::input_buffer::{InputBufferState, PastedChunk};
 use crate::tui::input_layout::{
-    InputVisualLayout, input_content_height_cap, input_scroll_offset, visual_input_layout,
+    input_content_height_cap, input_scroll_offset, visual_input_layout, InputVisualLayout,
 };
 use crate::tui::jump_to_bottom::jump_to_bottom_pill_text;
 use crate::tui::markdown::render_markdown;
-use crate::tui::selection::{Selection, col_range_for_row};
+use crate::tui::selection::{col_range_for_row, Selection};
 use crate::tui::theme::Theme;
 use crate::tui::width::{char_width, display_width};
-use ratatui::Frame;
+use crate::tui::EXIT_DOUBLE_TAP;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::Frame;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -1085,26 +1085,50 @@ fn render_permission(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
             ),
         ]),
     ];
-    lines.extend(
-        compute_diff(&request.tool_name, &request.args)
-            .into_iter()
-            .map(|line| diff_line(line, theme)),
-    );
-    lines.extend([
-        Line::from(vec![
+    let budget = area.height.saturating_sub(7) as usize;
+    let diff: Vec<Line<'static>> = compute_diff(&request.tool_name, &request.args)
+        .into_iter()
+        .map(|line| diff_line(line, theme))
+        .collect();
+    if diff.len() > budget && diff.len() > 2 {
+        let shown = budget.saturating_sub(1);
+        let hidden = diff.len().saturating_sub(shown);
+        lines.extend(diff.into_iter().take(shown));
+        lines.push(Line::from(Span::styled(
+            format!("⋯ 其余 {hidden} 行"),
+            Style::default().fg(theme.text_muted).bg(theme.warning_bg),
+        )));
+    } else {
+        lines.extend(diff);
+    }
+    let mut action_spans = vec![
+        Span::styled(
+            "[y · 允许]",
+            Style::default().fg(theme.warning_fg).bg(theme.warning_bg),
+        ),
+        Span::styled(
+            "   ",
+            Style::default().fg(theme.text_body).bg(theme.warning_bg),
+        ),
+    ];
+    if request.allow_always_key.is_some() {
+        action_spans.extend([
             Span::styled(
-                "[y · 允许]",
+                "[a · 总是允许]",
                 Style::default().fg(theme.warning_fg).bg(theme.warning_bg),
             ),
             Span::styled(
                 "   ",
                 Style::default().fg(theme.text_body).bg(theme.warning_bg),
             ),
-            Span::styled(
-                "[n · 拒绝]",
-                Style::default().fg(theme.error_fg).bg(theme.warning_bg),
-            ),
-        ]),
+        ]);
+    }
+    action_spans.push(Span::styled(
+        "[n · 拒绝]",
+        Style::default().fg(theme.error_fg).bg(theme.warning_bg),
+    ));
+    lines.extend([
+        Line::from(action_spans),
         Line::from(Span::styled(
             "提示:Enter = 允许 · Esc = 拒绝",
             Style::default()
@@ -1871,9 +1895,9 @@ pub fn bubble_sort<T: PartialOrd>(slice: &mut [T]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DIFF_COLLAPSED_MAX_ROWS, DIFF_MAX_ROWS, collapsed_tool_summary, diff_body_lines,
-        display_cursor, expand_for_display, fold_label, input_content_spans, render,
-        selection_text, tool_card_lines, transcript_line_count,
+        collapsed_tool_summary, diff_body_lines, display_cursor, expand_for_display, fold_label,
+        input_content_spans, render, selection_text, tool_card_lines, transcript_line_count,
+        DIFF_COLLAPSED_MAX_ROWS, DIFF_MAX_ROWS,
     };
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::PermissionMode;
@@ -1890,11 +1914,11 @@ mod tests {
     use crate::tui::theme::Theme;
     use crate::tui::width::display_width;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Position, Rect};
     use ratatui::style::{Color, Modifier, Style};
+    use ratatui::Terminal;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -2814,11 +2838,9 @@ mod tests {
             .collect::<Vec<_>>();
         let exact_lines = diff_body_lines(&exact, &theme, 32, DIFF_MAX_ROWS);
         assert_eq!(exact_lines.len(), DIFF_MAX_ROWS);
-        assert!(
-            !exact_lines
-                .iter()
-                .any(|line| line_plain(line).contains("⋯ 其余"))
-        );
+        assert!(!exact_lines
+            .iter()
+            .any(|line| line_plain(line).contains("⋯ 其余")));
 
         let over = (1..=DIFF_MAX_ROWS + 1)
             .map(|n| diff_fixture(DiffKind::Add, format!("line {n}")))
@@ -2836,11 +2858,9 @@ mod tests {
 
         assert_eq!(lines.len(), DIFF_MAX_ROWS + 1);
         assert_eq!(line_plain(lines.last().unwrap()), "│ ⋯ 其余 1 行");
-        assert!(
-            lines[..DIFF_MAX_ROWS]
-                .iter()
-                .all(|line| display_width(&line_plain(line)) <= 8)
-        );
+        assert!(lines[..DIFF_MAX_ROWS]
+            .iter()
+            .all(|line| display_width(&line_plain(line)) <= 8));
     }
 
     #[test]
@@ -2971,11 +2991,9 @@ mod tests {
         assert!(plain[DIFF_COLLAPSED_MAX_ROWS].starts_with("│ + line 8"));
         assert_eq!(plain[DIFF_COLLAPSED_MAX_ROWS + 1], "│ ⋯ 其余 4 行");
         assert!(!plain.iter().any(|line| line.contains("hidden output")));
-        assert!(
-            !plain
-                .iter()
-                .any(|line| line.contains("┌─") || line.contains("└─"))
-        );
+        assert!(!plain
+            .iter()
+            .any(|line| line.contains("┌─") || line.contains("└─")));
     }
 
     #[test]
@@ -3005,27 +3023,19 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(running_plain[0].contains(" · 运行中…"));
-        assert!(
-            running_plain
-                .iter()
-                .any(|line| line.starts_with("│ − old one"))
-        );
-        assert!(
-            running_plain
-                .iter()
-                .any(|line| line.starts_with("│ + new one"))
-        );
+        assert!(running_plain
+            .iter()
+            .any(|line| line.starts_with("│ − old one")));
+        assert!(running_plain
+            .iter()
+            .any(|line| line.starts_with("│ + new one")));
         assert!(error_plain[0].contains(" · 2 行 ⌄"));
-        assert!(
-            error_plain
-                .iter()
-                .any(|line| line.starts_with("│ − old one"))
-        );
-        assert!(
-            error_plain
-                .iter()
-                .any(|line| line.starts_with("│ + new one"))
-        );
+        assert!(error_plain
+            .iter()
+            .any(|line| line.starts_with("│ − old one")));
+        assert!(error_plain
+            .iter()
+            .any(|line| line.starts_with("│ + new one")));
     }
 
     #[test]
@@ -3388,6 +3398,29 @@ mod tests {
             "\n--- permission daylight frame ---\n{text}\n--- end permission daylight frame ---"
         );
         insta::assert_snapshot!("tui_permission_state_daylight", text);
+    }
+
+    #[test]
+    fn permission_state_allow_always_snapshot() {
+        let state = command_permission_state();
+        let text = render_to_styled(&state, &Theme::midnight());
+
+        println!("\n--- permission allow-always frame ---\n{text}\n--- end permission allow-always frame ---");
+        insta::assert_snapshot!("tui_permission_state_allow_always", text);
+    }
+
+    #[test]
+    fn permission_state_long_diff_truncates_before_actions_snapshot() {
+        let state = long_diff_permission_state();
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 24);
+
+        assert!(text.contains("⋯ 其余"));
+        assert!(text.contains("[y · 允许]"));
+        assert!(text.contains("[n · 拒绝]"));
+        println!(
+            "\n--- permission long diff frame ---\n{text}\n--- end permission long diff frame ---"
+        );
+        insta::assert_snapshot!("tui_permission_state_long_diff_truncated", text);
     }
 
     #[test]
@@ -3818,6 +3851,41 @@ mod tests {
                 "old_string": "    pub max_iterations: u32,",
                 "new_string": "    pub timeout_secs: u64,"
             }),
+            allow_always_key: None,
+            responder: tx,
+        }));
+        state
+    }
+
+    fn command_permission_state() -> AppState {
+        let (tx, _rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(TranscriptBlock::User("跑一下 cargo test --lib".to_string()));
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "run_shell".to_string(),
+            args: json!({ "command": "cargo test --lib" }),
+            allow_always_key: Some("cargo test --lib".to_string()),
+            responder: tx,
+        }));
+        state
+    }
+
+    fn long_diff_permission_state() -> AppState {
+        let (tx, _rx) = oneshot::channel();
+        let mut state = AppState::new();
+        let content = (0..50)
+            .map(|index| format!("line {index:02}: generated permission diff content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "write_file".to_string(),
+            args: json!({
+                "path": "src/generated-long-diff.txt",
+                "content": content
+            }),
+            allow_always_key: None,
             responder: tx,
         }));
         state

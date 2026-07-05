@@ -1,0 +1,28 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹text.primary›        ‹/›‹text.body›读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等‹/›
+‹text.primary›                               ‹/›‹text.body›你按下 y 才动手。‹/›
+
+‹text.primary›                                     ‹/›‹text.muted›试试 ↓‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔任务〕‹/›‹text.primary› 给 Config 加 timeout_secs 字段‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/status〕‹/›‹text.primary› 当前会话快照‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
+‹warning.fg bg=warning.bg›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹warning.fg bg=warning.bg›│‹/›‹warning.fg bg=warning.bg +bold›▲ 需要授权‹/›‹text.primary bg=warning.bg›                                                                    ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›tool: ‹/›‹accent.primary bg=warning.bg›write_file‹/›‹text.primary bg=warning.bg›                                                              ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›args: ‹/›‹text.body bg=warning.bg›path=src/generated-long-diff.txt‹/›‹text.primary bg=warning.bg›                                        ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.muted bg=warning.bg›⋯ 其余 50 行‹/›‹text.primary bg=warning.bg›                                                                  ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│[y · 允许]‹/›‹text.body bg=warning.bg›   ‹/›‹error.fg bg=warning.bg›[n · 拒绝]‹/›‹text.primary bg=warning.bg›                                                       ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.secondary bg=warning.bg›提示:Enter = 允许 · Esc = 拒绝‹/›‹text.primary bg=warning.bg›                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹warning.fg›▲ 等待授权…‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

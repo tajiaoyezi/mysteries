@@ -54,6 +54,7 @@ fn config() -> Config {
             auth_type: AuthType::ApiKey,
         },
         model: "e2e-model".to_string(),
+        allowed_commands: Vec::new(),
         max_iterations: 4,
         timeout_secs: 30,
         model_context_window: None,
