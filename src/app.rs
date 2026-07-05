@@ -7,8 +7,10 @@ use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::mock::MockProvider;
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::{FinishReason, ModelResponse, Provider};
+use crate::tool::ask::AskUserTool;
 use crate::tool::edit::{EditFileTool, WriteFileTool};
 use crate::tool::fs::{GlobTool, GrepTool, ListDirTool, ReadFileTool};
+use crate::tool::plan::SubmitPlanTool;
 use crate::tool::shell::RunShellTool;
 use crate::tool::web::{ReqwestFetcher, WebFetchTool, WebSearchTool};
 use crate::tool::ToolRegistry;
@@ -157,12 +159,25 @@ pub fn assemble_agent(
     provider: Arc<dyn Provider>,
     config: &Config,
     decider: Box<dyn PermissionDecider>,
+    plan_approver: Option<Box<dyn crate::tool::plan::PlanApprover>>,
+    user_prompter: Option<Box<dyn crate::tool::ask::UserPrompter>>,
 ) -> AssembledAgent {
     let compacting = build_compacting(provider.clone(), config);
     let strategy: Box<dyn ContextStrategy> = Box::new(build_compacting(provider.clone(), config));
+    let mut registry = default_registry();
+    if let Some(approver) = plan_approver {
+        registry
+            .register(Box::new(SubmitPlanTool::new(approver)))
+            .expect("submit_plan should register once");
+    }
+    if let Some(prompter) = user_prompter {
+        registry
+            .register(Box::new(AskUserTool::new(prompter)))
+            .expect("ask_user should register once");
+    }
     let mut agent = Agent::new(
         provider,
-        default_registry(),
+        registry,
         decider,
         config.model.clone(),
         config.max_iterations,
@@ -512,7 +527,7 @@ kind = "mock"
                 usage: None,
             },
         ]));
-        let assembled = assemble_agent(provider.clone(), &config, Box::new(AllowAll));
+        let assembled = assemble_agent(provider.clone(), &config, Box::new(AllowAll), None, None);
         let sink = NoopSink;
         let mut history = vec![Message::User("write note".to_string())];
 
@@ -579,7 +594,7 @@ kind = "mock"
             finish_reason: FinishReason::Stop,
             usage: None,
         }]));
-        let assembled = assemble_agent(provider, &config_with_window(None), Box::new(AllowAll));
+        let assembled = assemble_agent(provider, &config_with_window(None), Box::new(AllowAll), None, None);
         let compacted = assembled
             .compacting
             .prepare(&history, Some(&usage))
@@ -596,6 +611,8 @@ kind = "mock"
             provider,
             &config_with_window(Some(128_000)),
             Box::new(AllowAll),
+            None,
+            None,
         );
         let unchanged = assembled
             .compacting

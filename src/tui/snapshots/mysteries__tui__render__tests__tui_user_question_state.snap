@@ -1,0 +1,29 @@
+---
+source: src/tui/render.rs
+assertion_line: 3721
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
+‹accent.primary bg=bg.surface_alt›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹accent.primary bg=bg.surface_alt +bold›? 需要你的选择‹/›‹text.primary bg=bg.surface_alt›                                                                ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.primary bg=bg.surface_alt›                                                                              ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.body bg=bg.surface_alt›采用哪种实现路径?‹/›‹text.primary bg=bg.surface_alt›                                                             ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.primary bg=bg.surface_alt›                                                                              ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.secondary bg=bg.surface_alt›   1. [终端 TUI 版] ‹/›‹text.body bg=bg.surface_alt›最小改动,沿用现有 seam‹/›‹text.primary bg=bg.surface_alt›                                    ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.primary bg=bg.surface_alt›                                                                              ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.secondary bg=bg.surface_alt›   2. [Web 版] ‹/›‹text.body bg=bg.surface_alt›独立弹框,后续再统一 channel‹/›‹text.primary bg=bg.surface_alt›                                    ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.primary bg=bg.surface_alt›                                                                              ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│❯  3. ✎ 其它(自己输入): ▏‹/›‹text.primary bg=bg.surface_alt›                                                     ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.primary bg=bg.surface_alt›                                                                              ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.primary bg=bg.surface_alt›                                                                              ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›│‹/›‹text.secondary bg=bg.surface_alt›↑↓/数字 选 · Enter 确认 · Esc 取消‹/›‹text.primary bg=bg.surface_alt›                                            ‹/›‹accent.primary bg=bg.surface_alt›│‹/›
+‹accent.primary bg=bg.surface_alt›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹warning.fg›▲ 等待授权…‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

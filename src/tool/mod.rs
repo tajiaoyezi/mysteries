@@ -1,11 +1,14 @@
+use crate::permission::PermissionMode;
 use crate::provider::ToolSchema;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub mod ask;
 pub mod edit;
 pub mod fs;
+pub mod plan;
 pub mod shell;
 pub mod web;
 
@@ -15,6 +18,10 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
     fn permission_level(&self) -> PermissionLevel;
+
+    fn plan_only(&self) -> bool {
+        false
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome;
 }
@@ -66,6 +73,23 @@ impl ToolRegistry {
             })
             .collect()
     }
+
+    pub fn schemas_for(&self, mode: PermissionMode) -> Vec<ToolSchema> {
+        self.tools
+            .iter()
+            .filter(|tool| match mode {
+                PermissionMode::Plan => {
+                    tool.permission_level() == PermissionLevel::ReadOnly || tool.plan_only()
+                }
+                _ => !tool.plan_only(),
+            })
+            .map(|tool| ToolSchema {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.schema(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -92,6 +116,7 @@ pub enum PermissionLevel {
 #[cfg(test)]
 mod tests {
     use super::{PermissionLevel, Tool, ToolContext, ToolOutcome, ToolRegistry, ToolRegistryError};
+    use crate::permission::PermissionMode;
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use std::path::PathBuf;
@@ -100,6 +125,7 @@ mod tests {
         name: &'static str,
         description: &'static str,
         permission_level: PermissionLevel,
+        plan_only: bool,
     }
 
     #[async_trait]
@@ -126,6 +152,10 @@ mod tests {
             self.permission_level.clone()
         }
 
+        fn plan_only(&self) -> bool {
+            self.plan_only
+        }
+
         async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolOutcome {
             ToolOutcome {
                 content: format!("{}:{}", self.name, args["input"].as_str().unwrap()),
@@ -133,6 +163,28 @@ mod tests {
                 truncated: false,
                 exit: None,
             }
+        }
+    }
+
+    fn mock_tool(
+        name: &'static str,
+        description: &'static str,
+        permission_level: PermissionLevel,
+    ) -> MockTool {
+        MockTool {
+            name,
+            description,
+            permission_level,
+            plan_only: false,
+        }
+    }
+
+    fn plan_only_tool(name: &'static str) -> MockTool {
+        MockTool {
+            name,
+            description: "Plan-only tool",
+            permission_level: PermissionLevel::ReadOnly,
+            plan_only: true,
         }
     }
 
@@ -147,11 +199,11 @@ mod tests {
     async fn registry_registers_finds_and_executes_tools_by_name() {
         let mut registry = ToolRegistry::new();
         registry
-            .register(Box::new(MockTool {
-                name: "read_mock",
-                description: "Read mock data",
-                permission_level: PermissionLevel::ReadOnly,
-            }))
+            .register(Box::new(mock_tool(
+                "read_mock",
+                "Read mock data",
+                PermissionLevel::ReadOnly,
+            )))
             .unwrap();
 
         let tool = registry.get("read_mock").unwrap();
@@ -174,18 +226,18 @@ mod tests {
     fn registry_exposes_tool_schemas_for_model_requests() {
         let mut registry = ToolRegistry::new();
         registry
-            .register(Box::new(MockTool {
-                name: "read_mock",
-                description: "Read mock data",
-                permission_level: PermissionLevel::ReadOnly,
-            }))
+            .register(Box::new(mock_tool(
+                "read_mock",
+                "Read mock data",
+                PermissionLevel::ReadOnly,
+            )))
             .unwrap();
         registry
-            .register(Box::new(MockTool {
-                name: "write_mock",
-                description: "Write mock data",
-                permission_level: PermissionLevel::Edit,
-            }))
+            .register(Box::new(mock_tool(
+                "write_mock",
+                "Write mock data",
+                PermissionLevel::Edit,
+            )))
             .unwrap();
 
         let schemas = registry.schemas();
@@ -211,16 +263,16 @@ mod tests {
     fn registry_rejects_duplicate_tool_name_without_overwriting_original() {
         let mut registry = ToolRegistry::new();
 
-        let first = registry.register(Box::new(MockTool {
-            name: "same",
-            description: "First tool",
-            permission_level: PermissionLevel::ReadOnly,
-        }));
-        let second = registry.register(Box::new(MockTool {
-            name: "same",
-            description: "Second tool",
-            permission_level: PermissionLevel::Edit,
-        }));
+        let first = registry.register(Box::new(mock_tool(
+            "same",
+            "First tool",
+            PermissionLevel::ReadOnly,
+        )));
+        let second = registry.register(Box::new(mock_tool(
+            "same",
+            "Second tool",
+            PermissionLevel::Edit,
+        )));
 
         assert_eq!(first, Ok(()));
         assert_eq!(
@@ -235,13 +287,97 @@ mod tests {
     fn registry_accepts_unique_tool_name() {
         let mut registry = ToolRegistry::new();
 
-        let result = registry.register(Box::new(MockTool {
-            name: "unique",
-            description: "Unique tool",
-            permission_level: PermissionLevel::ReadOnly,
-        }));
+        let result = registry.register(Box::new(mock_tool(
+            "unique",
+            "Unique tool",
+            PermissionLevel::ReadOnly,
+        )));
 
         assert_eq!(result, Ok(()));
         assert!(registry.get("unique").is_some());
+    }
+
+    fn registry_with_mixed_tools() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(mock_tool(
+                "read_tool",
+                "Read tool",
+                PermissionLevel::ReadOnly,
+            )))
+            .unwrap();
+        registry
+            .register(Box::new(mock_tool(
+                "edit_tool",
+                "Edit tool",
+                PermissionLevel::Edit,
+            )))
+            .unwrap();
+        registry
+            .register(Box::new(mock_tool(
+                "exec_tool",
+                "Execute tool",
+                PermissionLevel::Execute,
+            )))
+            .unwrap();
+        registry
+            .register(Box::new(plan_only_tool("submit_plan")))
+            .unwrap();
+        registry
+    }
+
+    #[test]
+    fn plan_only_defaults_false_for_unoverridden_tools() {
+        let tool = mock_tool("plain", "Plain tool", PermissionLevel::ReadOnly);
+        assert!(!tool.plan_only());
+    }
+
+    #[test]
+    fn schemas_for_plan_includes_readonly_and_plan_only_preserving_order() {
+        let registry = registry_with_mixed_tools();
+        let schemas = registry.schemas_for(PermissionMode::Plan);
+
+        assert_eq!(
+            schemas
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_tool", "submit_plan"]
+        );
+    }
+
+    #[test]
+    fn schemas_for_non_plan_excludes_plan_only_preserving_order() {
+        let registry = registry_with_mixed_tools();
+
+        for mode in [
+            PermissionMode::Normal,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Yolo,
+        ] {
+            let schemas = registry.schemas_for(mode);
+            assert_eq!(
+                schemas
+                    .iter()
+                    .map(|schema| schema.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["read_tool", "edit_tool", "exec_tool"],
+                "mode={mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schemas_unchanged_when_not_filtering_by_mode() {
+        let registry = registry_with_mixed_tools();
+        assert_eq!(registry.schemas().len(), 4);
+        assert_eq!(
+            registry
+                .schemas()
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_tool", "edit_tool", "exec_tool", "submit_plan"]
+        );
     }
 }

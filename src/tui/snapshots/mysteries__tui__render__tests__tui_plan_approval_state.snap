@@ -1,0 +1,29 @@
+---
+source: src/tui/render.rs
+assertion_line: 3629
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹text.primary›                                     ‹/›‹text.muted›试试 ↓‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔任务〕‹/›‹text.primary› 给 Config 加 timeout_secs 字段‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/status〕‹/›‹text.primary› 当前会话快照‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
+‹info.fg bg=bg.surface›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹info.fg bg=bg.surface›│‹/›‹info.fg bg=bg.surface +bold›◔ 计划审批‹/›‹text.primary bg=bg.surface›                                                                    ‹/›‹info.fg bg=bg.surface›│‹/›
+‹info.fg bg=bg.surface›│‹/›‹text.secondary bg=bg.surface›标题: ‹/›‹text.body bg=bg.surface›Add plan mode‹/›‹text.primary bg=bg.surface›                                                           ‹/›‹info.fg bg=bg.surface›│‹/›
+‹info.fg bg=bg.surface›│‹/›‹text.secondary bg=bg.surface›步骤 1: ‹/›‹text.body bg=bg.surface›Wire permission gate‹/›‹text.primary bg=bg.surface›                                                  ‹/›‹info.fg bg=bg.surface›│‹/›
+‹info.fg bg=bg.surface›│‹/›‹text.secondary bg=bg.surface›验收: ‹/›‹text.muted bg=bg.surface›cargo test permission passes‹/›‹text.primary bg=bg.surface›                                            ‹/›‹info.fg bg=bg.surface›│‹/›
+‹info.fg bg=bg.surface›│‹/›‹text.secondary bg=bg.surface›步骤 2: ‹/›‹text.body bg=bg.surface›Add submit_plan tool‹/›‹text.primary bg=bg.surface›                                                  ‹/›‹info.fg bg=bg.surface›│‹/›
+‹info.fg bg=bg.surface›│‹/›‹text.secondary bg=bg.surface›验收: ‹/›‹text.muted bg=bg.surface›plan approval snapshot matches‹/›‹text.primary bg=bg.surface›                                          ‹/›‹info.fg bg=bg.surface›│‹/›
+‹info.fg bg=bg.surface›│‹/›‹success.fg bg=bg.surface›[y · 批准]‹/›‹text.primary bg=bg.surface›   ‹/›‹error.fg bg=bg.surface›[n · 驳回]‹/›‹text.primary bg=bg.surface›                                                       ‹/›‹info.fg bg=bg.surface›│‹/›
+‹info.fg bg=bg.surface›│‹/›‹text.secondary bg=bg.surface›提示:Enter = 批准 · Esc = 驳回‹/›‹text.primary bg=bg.surface›                                                ‹/›‹info.fg bg=bg.surface›│‹/›
+‹info.fg bg=bg.surface›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹warning.fg›▲ 等待授权…‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换‹/›

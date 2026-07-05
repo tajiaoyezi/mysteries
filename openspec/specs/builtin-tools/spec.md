@@ -1,7 +1,7 @@
 # builtin-tools Specification
 
 ## Purpose
-定义 9 个内置工具的行为契约:6 个只读工具(`list_dir` / `read_file` / `glob` / `grep` / `web_fetch` / `web_search`,权限级别 `ReadOnly`)与 3 个变更类工具(`write_file` / `edit_file`,`Edit`;`run_shell`,`Execute`),覆盖各自的输入语义、输出截断(`max_output_bytes` / `truncated`)与 exit code 编码。关键立场是失败一律编码为 `ToolOutcome{is_error}` 回给模型而非 panic,变更类工具经权限门 `Deny` 时零副作用,`edit_file` 要求 `old_string` 唯一匹配、否则不写入。工具抽象与注册调度属 tool-system,权限判定机制属 permission-gate;本域仅约定各实体工具自身的行为。
+定义 11 个内置工具的行为契约:6 个只读工具(`list_dir` / `read_file` / `glob` / `grep` / `web_fetch` / `web_search`,权限级别 `ReadOnly`)、3 个变更类工具(`write_file` / `edit_file`,`Edit`;`run_shell`,`Execute`)与 2 个交互工具(`submit_plan` / `ask_user`,`ReadOnly`、经注入 seam 呈递审批 / 提问,plan 模式;`submit_plan` 仅 plan 模式下发),覆盖各自的输入语义、输出截断(`max_output_bytes` / `truncated`)与 exit code 编码。关键立场是失败一律编码为 `ToolOutcome{is_error}` 回给模型而非 panic,变更类工具经权限门 `Deny` 时零副作用,`edit_file` 要求 `old_string` 唯一匹配、否则不写入。工具抽象与注册调度属 tool-system,权限判定机制属 permission-gate;本域仅约定各实体工具自身的行为。
 ## Requirements
 ### Requirement: list_dir 列目录(ReadOnly)
 
@@ -207,4 +207,41 @@ HTTP 抓取经可注入的 `WebFetcher`(`: Send + Sync`)seam(async),测试以 mo
 
 - **WHEN** 对**真实形态** `//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com%2Fx&rut=<hex>` 调 `decode_uddg`(uddg 后带 `&rut=` 尾);对**真抓样例** DDG HTML 调 `parse_ddg_results`
 - **THEN** 前者得 `https://a.com/x`(正确止于 `&`、不吞 `rut` 尾;非重定向 / 广告 href → `None`);后者得 `{title,url,snippet}` 列表(url 为解码后真链、非 DDG 重定向)、至多 `MAX_SEARCH_RESULTS` 条
+
+### Requirement: submit_plan 提交结构化计划(Plan 模式)
+
+`submit_plan` SHALL 接受结构化 plan `{ title, steps: [{ description, validation }] }`(`validation` = 该步可验收判据);`plan_only()==true`(仅 Plan 模式下发,见 tool-system);**`permission_level()==ReadOnly`**——呈递审批本质是只读动作(真正改动在批准后另起工具);**若定为 `Edit`/`Execute`,Plan 期一调用即被 agent-loop 的「非只读纵深拒」挡掉、approver 永不执行、plan 永远批不了(自我否决)**。经**可注入的 `PlanApprover` seam**(`: Send + Sync`,async)呈递审批,得 `PlanDecision {Approve | Reject(reason)}`:
+- **Approve** → `ToolOutcome{content:"计划已批准,按上述 plan 逐步执行、每步完成后自检其 validation", is_error:false}`;权限模式 SHALL 由 approver 实现从 `Plan` 翻至 `AcceptEdits`(翻转在 oneshot 返回**之后**做、勿把 mode mutex 跨 `.await` 持;下一轮全工具可用、按 history 里的 plan 执行)。
+- **Reject(reason)** → `ToolOutcome{content 含 reason, is_error:true}`(留 Plan、模型据理由修订)。
+
+args 解析失败(缺 `title` / `steps`)SHALL → is_error、不 panic。审批经 mock approver 可测,不依赖 TUI。
+
+#### Scenario: 批准返回成功
+
+- **WHEN** 注入返 `Approve` 的 mock approver,execute 一个合法 plan
+- **THEN** `is_error=false`,content 表已批准(mode 翻转由 approver 实现,契约见 tui-shell)
+
+#### Scenario: 驳回带理由回模型
+
+- **WHEN** 注入返 `Reject("先补测试")` 的 mock approver
+- **THEN** `is_error=true`,content 含该理由
+
+#### Scenario: 非法 plan 编码 is_error
+
+- **WHEN** execute 一个缺 `steps` 的 args
+- **THEN** `is_error=true`,不 panic
+
+### Requirement: ask_user 向用户提结构化问题
+
+`ask_user` SHALL 接受 `{ question, options: [{label, description}], allow_multi?, allow_other? }`;`permission_level=ReadOnly`、`plan_only()==false`(**任何模式可用**,Plan 期供研究澄清);经**可注入的 `UserPrompter` seam**(`: Send + Sync`,async)弹 A/B/C + 补充框、阻塞取 `Answer {selected, supplement}`,格式化(所选 label + 补充)回模型。args 解析失败(缺 `question`)SHALL → is_error、不 panic。经 mock prompter 可测,不依赖 TUI。
+
+#### Scenario: 返回所选项 + 补充
+
+- **WHEN** 注入返 `Answer{selected:["A"], supplement:Some("再考虑 X")}` 的 mock prompter,execute 一个带选项的问题
+- **THEN** `is_error=false`,content 含所选 label 与补充文本
+
+#### Scenario: 非法 args 编码 is_error
+
+- **WHEN** execute 一个缺 `question` 的 args
+- **THEN** `is_error=true`,不 panic
 

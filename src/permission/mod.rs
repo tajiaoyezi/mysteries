@@ -67,6 +67,7 @@ pub enum PermissionMode {
     Normal,
     AcceptEdits,
     Yolo,
+    Plan,
 }
 
 pub fn auto_allows(mode: PermissionMode, level: PermissionLevel) -> bool {
@@ -75,6 +76,7 @@ pub fn auto_allows(mode: PermissionMode, level: PermissionLevel) -> bool {
         (PermissionMode::AcceptEdits, PermissionLevel::Edit) => true,
         (PermissionMode::AcceptEdits, PermissionLevel::Execute) => false,
         (PermissionMode::Yolo, PermissionLevel::Edit | PermissionLevel::Execute) => true,
+        (PermissionMode::Plan, PermissionLevel::Edit | PermissionLevel::Execute) => false,
         (_, PermissionLevel::ReadOnly) => false,
     }
 }
@@ -83,7 +85,8 @@ pub fn cycle_permission_mode(mode: PermissionMode) -> PermissionMode {
     match mode {
         PermissionMode::Normal => PermissionMode::AcceptEdits,
         PermissionMode::AcceptEdits => PermissionMode::Yolo,
-        PermissionMode::Yolo => PermissionMode::Normal,
+        PermissionMode::Yolo => PermissionMode::Plan,
+        PermissionMode::Plan => PermissionMode::Normal,
     }
 }
 
@@ -92,6 +95,7 @@ pub fn permission_mode_label(mode: PermissionMode) -> &'static str {
         PermissionMode::Normal => "normal",
         PermissionMode::AcceptEdits => "accept-edits",
         PermissionMode::Yolo => "yolo",
+        PermissionMode::Plan => "plan",
     }
 }
 
@@ -114,8 +118,8 @@ pub async fn gate(
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_allows, cycle_permission_mode, gate, normalize, PermissionDecider, PermissionDecision,
-        PermissionMode, PolicyEngine,
+        auto_allows, cycle_permission_mode, gate, normalize, permission_mode_label,
+        PermissionDecider, PermissionDecision, PermissionMode, PolicyEngine,
     };
     use crate::provider::ToolCall;
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
@@ -344,7 +348,17 @@ mod tests {
     }
 
     #[test]
-    fn cycle_permission_mode_rotates_normal_accept_edits_yolo() {
+    fn auto_allows_plan_mode_never_auto_allows_edit_or_execute() {
+        assert!(!auto_allows(PermissionMode::Plan, PermissionLevel::Edit));
+        assert!(!auto_allows(
+            PermissionMode::Plan,
+            PermissionLevel::Execute
+        ));
+        assert!(!auto_allows(PermissionMode::Plan, PermissionLevel::ReadOnly));
+    }
+
+    #[test]
+    fn cycle_permission_mode_rotates_normal_accept_edits_yolo_plan() {
         assert_eq!(
             cycle_permission_mode(PermissionMode::Normal),
             PermissionMode::AcceptEdits
@@ -355,7 +369,16 @@ mod tests {
         );
         assert_eq!(
             cycle_permission_mode(PermissionMode::Yolo),
+            PermissionMode::Plan
+        );
+        assert_eq!(
+            cycle_permission_mode(PermissionMode::Plan),
             PermissionMode::Normal
         );
+    }
+
+    #[test]
+    fn permission_mode_label_plan() {
+        assert_eq!(permission_mode_label(PermissionMode::Plan), "plan");
     }
 }

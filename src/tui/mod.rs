@@ -107,7 +107,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
     let permission_mode = Arc::new(std::sync::Mutex::new(PermissionMode::Normal));
-    let assembled = crate::app::assemble_agent(
+    let mut assembled = crate::app::assemble_agent(
         provider,
         &config,
         Box::new(channel::ChannelDecider::new(
@@ -116,7 +116,15 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
             PolicyEngine::from_commands(config.allowed_commands.iter()),
             paths.user_config.clone(),
         )),
+        Some(Box::new(channel::ChannelPlanApprover::new(
+            ui_tx.clone(),
+            permission_mode.clone(),
+        ))),
+        Some(Box::new(channel::ChannelPrompter::new(ui_tx.clone()))),
     );
+    assembled
+        .agent
+        .set_permission_mode(permission_mode.clone());
     let compacting = assembled.compacting;
     let agent = assembled.agent;
     let agent_history = Arc::new(Mutex::new(session_startup.history));
@@ -147,7 +155,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
             model: session_startup.meta.model.clone(),
             max_iterations: config.max_iterations,
             cwd,
-            tools: crate::app::default_registry().schemas().len(),
+            tools: crate::app::default_registry().schemas().len() + 2,
         },
         agent_history,
     );
@@ -565,7 +573,7 @@ fn selection_key_action(state: &app::AppState, key: KeyEvent) -> Option<Selectio
         return None;
     }
 
-    if state.pending_permission.is_some() {
+    if state.has_pending_dialog() {
         return None;
     }
 
@@ -656,7 +664,7 @@ fn handle_queue_cancel_key(
     now: Instant,
 ) -> bool {
     if !is_key_press(key)
-        || state.pending_permission.is_some()
+        || state.has_pending_dialog()
         || state.models_picker.is_some()
         || state.session_picker.is_some()
         || state.command_completion.is_some()
@@ -693,7 +701,7 @@ fn handle_idle_exit_intent_key(
 ) -> Option<ExitIntent> {
     if !is_key_press(key)
         || !is_ctrl_c_key(key)
-        || state.pending_permission.is_some()
+        || state.has_pending_dialog()
         || state.models_picker.is_some()
         || state.session_picker.is_some()
         || state.command_completion.is_some()
@@ -720,7 +728,7 @@ fn should_exit(state: &app::AppState, key: KeyEvent) -> bool {
         return false;
     }
 
-    if state.pending_permission.is_some() {
+    if state.has_pending_dialog() {
         return false;
     }
 
@@ -1125,7 +1133,7 @@ fn fast_paste_rebuilt_chars(batch: &[Event]) -> Option<usize> {
 
 fn can_try_fast_paste(state: &app::AppState, batch: &[Event]) -> bool {
     batch.len() >= PASTE_COALESCE_MIN_EVENTS
-        && state.pending_permission.is_none()
+        && !state.has_pending_dialog()
         && state.models_picker.is_none()
         && state.session_picker.is_none()
 }
@@ -1216,7 +1224,7 @@ fn process_event_batch(batch: Vec<Event>, ctx: EventBatchContext<'_>) -> Result<
     let intents = input_batch::classify_key_batch(&press_keys);
 
     // 批级折叠:整批为大段纯粘贴(全文本内容键、行/字符任一阈值达标)时折叠为占位符并消费整批
-    if state.pending_permission.is_none()
+    if !state.has_pending_dialog()
         && state.models_picker.is_none()
         && state.session_picker.is_none()
     {
@@ -2592,6 +2600,8 @@ mod tests {
             provider,
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -2709,6 +2719,8 @@ mod tests {
             provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -2779,6 +2791,8 @@ mod tests {
             provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -2835,6 +2849,8 @@ mod tests {
             provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -2911,6 +2927,8 @@ mod tests {
             }),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -2975,6 +2993,8 @@ mod tests {
             }),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -3058,6 +3078,8 @@ mod tests {
             old_provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = task_hotswap(&temp, profiles);
         let history = agent_history();
@@ -3113,6 +3135,8 @@ mod tests {
             provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = task_hotswap(&temp, BTreeMap::new());
         let handle = tokio::spawn(run_agent_task(
@@ -3181,6 +3205,8 @@ mod tests {
             provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = task_hotswap(&temp, profiles);
         let handle = tokio::spawn(run_agent_task(
@@ -3264,6 +3290,8 @@ model = "zhipu/glm-5.2"
             old_provider.clone(),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
         );
         let task_config = RunAgentTaskConfig {
             profiles,

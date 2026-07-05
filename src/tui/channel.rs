@@ -5,6 +5,8 @@ use crate::permission::{
     PolicyEngine,
 };
 use crate::provider::{DeltaSink, ToolCall};
+use crate::tool::ask::{Answer, Question, UserPrompter};
+use crate::tool::plan::{Plan, PlanApprover, PlanDecision};
 use crate::tool::{Tool, ToolOutcome};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -27,6 +29,8 @@ pub enum AgentEvent {
     },
     StatusChanged(AgentStatus),
     PermissionRequired(PermissionRequest),
+    PlanApprovalRequired(PlanApprovalRequest),
+    UserQuestionRequired(QuestionRequest),
     Interrupted,
     TurnComplete,
     /// 手动 /compact 完成(成功或失败均发):置回 Ready 并作为排队推进闸门事件。
@@ -54,6 +58,18 @@ pub struct PermissionRequest {
     pub args: Value,
     pub allow_always_key: Option<String>,
     pub responder: oneshot::Sender<PermissionReply>,
+}
+
+#[derive(Debug)]
+pub struct PlanApprovalRequest {
+    pub plan: Plan,
+    pub responder: oneshot::Sender<PlanDecision>,
+}
+
+#[derive(Debug)]
+pub struct QuestionRequest {
+    pub question: Question,
+    pub responder: oneshot::Sender<Answer>,
 }
 
 pub struct ChannelSink {
@@ -191,15 +207,100 @@ impl PermissionDecider for ChannelDecider {
     }
 }
 
+pub struct ChannelPlanApprover {
+    tx: mpsc::UnboundedSender<AgentEvent>,
+    mode: Arc<Mutex<PermissionMode>>,
+}
+
+impl ChannelPlanApprover {
+    pub fn new(tx: mpsc::UnboundedSender<AgentEvent>, mode: Arc<Mutex<PermissionMode>>) -> Self {
+        Self { tx, mode }
+    }
+}
+
+#[async_trait]
+impl PlanApprover for ChannelPlanApprover {
+    async fn approve(&self, plan: &Plan) -> PlanDecision {
+        let (responder, rx) = oneshot::channel();
+        let request = PlanApprovalRequest {
+            plan: plan.clone(),
+            responder,
+        };
+
+        if self
+            .tx
+            .send(AgentEvent::PlanApprovalRequired(request))
+            .is_err()
+        {
+            return PlanDecision::Reject("UI unavailable".to_string());
+        }
+
+        let decision = rx
+            .await
+            .unwrap_or(PlanDecision::Reject("UI disconnected".to_string()));
+
+        if matches!(decision, PlanDecision::Approve) {
+            *self
+                .mode
+                .lock()
+                .expect("permission mode mutex poisoned") = PermissionMode::AcceptEdits;
+        }
+
+        decision
+    }
+}
+
+pub struct ChannelPrompter {
+    tx: mpsc::UnboundedSender<AgentEvent>,
+}
+
+impl ChannelPrompter {
+    pub fn new(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait]
+impl UserPrompter for ChannelPrompter {
+    async fn prompt(&self, question: &Question) -> Answer {
+        let (responder, rx) = oneshot::channel();
+        let request = QuestionRequest {
+            question: question.clone(),
+            responder,
+        };
+
+        if self
+            .tx
+            .send(AgentEvent::UserQuestionRequired(request))
+            .is_err()
+        {
+            return Answer {
+                selected: Vec::new(),
+                supplement: None,
+            };
+        }
+
+        rx.await.unwrap_or(Answer {
+            selected: Vec::new(),
+            supplement: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AgentEvent, ChannelDecider, ChannelObserver, ChannelSink};
+    use super::{
+        AgentEvent, ChannelDecider, ChannelObserver, ChannelPlanApprover, ChannelPrompter,
+        ChannelSink,
+    };
     use crate::agent::{AgentObserver, AgentStatus};
     use crate::config::read_raw_config;
     use crate::permission::{
         PermissionDecider, PermissionDecision, PermissionMode, PermissionReply, PolicyEngine,
     };
     use crate::provider::{DeltaSink, ToolCall};
+    use crate::tool::ask::{Question, UserPrompter};
+    use crate::tool::plan::{Plan, PlanApprover, PlanDecision};
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -713,5 +814,89 @@ mod tests {
         }
 
         assert_eq!(decision.await, PermissionDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn channel_plan_approver_rejects_when_responder_is_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let approver = ChannelPlanApprover::new(tx, Arc::new(Mutex::new(PermissionMode::Plan)));
+        let plan = Plan {
+            title: "Test".to_string(),
+            steps: vec![],
+        };
+        let decision = approver.approve(&plan);
+        tokio::pin!(decision);
+
+        let request = tokio::select! {
+            event = rx.recv() => event.expect("plan approval request should be sent"),
+            decision = &mut decision => panic!("approve returned before UI response: {decision:?}"),
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for plan approval request"),
+        };
+
+        match request {
+            AgentEvent::PlanApprovalRequired(request) => drop(request.responder),
+            other => panic!("expected PlanApprovalRequired, got {other:?}"),
+        }
+
+        assert!(matches!(
+            decision.await,
+            PlanDecision::Reject(reason) if reason.contains("disconnected")
+        ));
+    }
+
+    #[tokio::test]
+    async fn channel_plan_approver_flips_mode_after_approve() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mode = Arc::new(Mutex::new(PermissionMode::Plan));
+        let approver = ChannelPlanApprover::new(tx, mode.clone());
+        let plan = Plan {
+            title: "Test".to_string(),
+            steps: vec![],
+        };
+        let decision = approver.approve(&plan);
+        tokio::pin!(decision);
+
+        let request = tokio::select! {
+            event = rx.recv() => event.expect("plan approval request should be sent"),
+            decision = &mut decision => panic!("approve returned before UI response: {decision:?}"),
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for plan approval request"),
+        };
+        match request {
+            AgentEvent::PlanApprovalRequired(request) => {
+                request.responder.send(PlanDecision::Approve).unwrap();
+            }
+            other => panic!("expected PlanApprovalRequired, got {other:?}"),
+        }
+
+        assert_eq!(decision.await, PlanDecision::Approve);
+        assert_eq!(*mode.lock().unwrap(), PermissionMode::AcceptEdits);
+    }
+
+    #[tokio::test]
+    async fn channel_prompter_returns_empty_answer_when_responder_is_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let prompter = ChannelPrompter::new(tx);
+        let question = Question {
+            question: "Pick one".to_string(),
+            options: vec![],
+            allow_multi: false,
+            allow_other: false,
+        };
+        let answer = prompter.prompt(&question);
+        tokio::pin!(answer);
+
+        let request = tokio::select! {
+            event = rx.recv() => event.expect("question request should be sent"),
+            answer = &mut answer => panic!("prompt returned before UI response: {answer:?}"),
+            _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for question request"),
+        };
+        match request {
+            AgentEvent::UserQuestionRequired(request) => drop(request.responder),
+            other => panic!("expected UserQuestionRequired, got {other:?}"),
+        }
+
+        let answer = answer.await;
+        assert!(answer.selected.is_empty());
+        assert!(answer.supplement.is_none());
     }
 }

@@ -17,7 +17,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use std::ops::Range;
 use std::time::Instant;
@@ -28,6 +28,9 @@ const INPUT_MAX_CONTENT_ROWS: u16 = 10;
 pub(crate) const QUEUE_MAX_ROWS: usize = 5;
 const DIFF_MAX_ROWS: usize = 24;
 const DIFF_COLLAPSED_MAX_ROWS: usize = 8;
+const PLAN_APPROVAL_FOOTER_LINES: u16 = 2;
+const MAX_PLAN_DIALOG_HEIGHT: u16 = 16;
+const MAX_QUESTION_DIALOG_HEIGHT: u16 = 20;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     let area = frame.area();
@@ -47,6 +50,10 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     render_jump_to_bottom_pill(frame, rows[1], state, theme);
     if state.pending_permission.is_some() {
         render_permission(frame, rows[2], state, theme);
+    } else if state.pending_plan_approval.is_some() {
+        render_plan_approval(frame, rows[2], state, theme);
+    } else if state.pending_question.is_some() {
+        render_user_question(frame, rows[2], state, theme);
     }
     render_activity(frame, rows[4], state, theme);
     if let Some(row) = queue_row {
@@ -76,11 +83,19 @@ fn queue_height(state: &AppState) -> u16 {
     state.pending_queue.len().min(QUEUE_MAX_ROWS) as u16
 }
 
+fn transcript_min_height(state: &AppState) -> u16 {
+    if state.pending_plan_approval.is_some() || state.pending_question.is_some() {
+        0
+    } else {
+        8
+    }
+}
+
 fn layout_rows(area: Rect, state: &AppState) -> std::rc::Rc<[Rect]> {
     let qh = queue_height(state);
     let mut constraints = vec![
         Constraint::Length(3),
-        Constraint::Min(8),
+        Constraint::Min(transcript_min_height(state)),
         Constraint::Length(permission_height(state)),
         Constraint::Length(status_top_gap_height(state)),
         Constraint::Length(1),
@@ -174,7 +189,7 @@ fn input_box_height(area: Rect, state: &AppState) -> u16 {
 }
 
 fn status_top_gap_height(state: &AppState) -> u16 {
-    if state.pending_permission.is_none() && !state.transcript.is_empty() {
+    if !state.has_pending_dialog() && !state.transcript.is_empty() {
         STATUS_TOP_GAP_LINES
     } else {
         0
@@ -182,11 +197,22 @@ fn status_top_gap_height(state: &AppState) -> u16 {
 }
 
 fn permission_height(state: &AppState) -> u16 {
-    let Some(request) = &state.pending_permission else {
-        return 0;
-    };
-    let diff_rows = compute_diff(&request.tool_name, &request.args).len() as u16;
-    7 + diff_rows
+    if let Some(request) = &state.pending_permission {
+        let diff_rows = compute_diff(&request.tool_name, &request.args).len() as u16;
+        return 7 + diff_rows;
+    }
+    if let Some(request) = &state.pending_plan_approval {
+        let step_count = request.plan.steps.len() as u16;
+        let content = 2 + step_count.saturating_mul(2).min(8);
+        let total = 2 + content + PLAN_APPROVAL_FOOTER_LINES;
+        return total.clamp(8, MAX_PLAN_DIALOG_HEIGHT);
+    }
+    if let Some(pending) = &state.pending_question {
+        let opt_count = pending.request.question.options.len() as u16;
+        let total = 10 + opt_count.saturating_mul(2);
+        return total.clamp(13, MAX_QUESTION_DIALOG_HEIGHT);
+    }
+    0
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -1148,6 +1174,282 @@ fn render_permission(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
     frame.render_widget(paragraph, area);
 }
 
+fn render_plan_approval(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(request) = &state.pending_plan_approval else {
+        return;
+    };
+    let bg = theme.bg_surface;
+    let accent = theme.info_fg;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent).bg(bg))
+        .style(Style::default().fg(theme.text_primary).bg(bg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(PLAN_APPROVAL_FOOTER_LINES),
+        ])
+        .split(inner);
+
+    let mut content_lines = vec![
+        Line::from(Span::styled(
+            "◔ 计划审批",
+            Style::default()
+                .fg(accent)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("标题: ", Style::default().fg(theme.text_secondary).bg(bg)),
+            Span::styled(
+                request.plan.title.clone(),
+                Style::default().fg(theme.text_body).bg(bg),
+            ),
+        ]),
+    ];
+
+    let mut lines_budget = chunks[0].height.saturating_sub(2) as usize;
+    let mut shown_steps = 0usize;
+    for (index, step) in request.plan.steps.iter().enumerate() {
+        let remaining = request.plan.steps.len() - index;
+        if lines_budget < 2 {
+            break;
+        }
+        if remaining > 1 && lines_budget < 3 {
+            break;
+        }
+        content_lines.push(Line::from(vec![
+            Span::styled(
+                format!("步骤 {}: ", index + 1),
+                Style::default().fg(theme.text_secondary).bg(bg),
+            ),
+            Span::styled(
+                step.description.clone(),
+                Style::default().fg(theme.text_body).bg(bg),
+            ),
+        ]));
+        content_lines.push(Line::from(vec![
+            Span::styled(
+                "验收: ",
+                Style::default().fg(theme.text_secondary).bg(bg),
+            ),
+            Span::styled(
+                step.validation.clone(),
+                Style::default().fg(theme.text_muted).bg(bg),
+            ),
+        ]));
+        lines_budget = lines_budget.saturating_sub(2);
+        shown_steps += 1;
+    }
+    if shown_steps < request.plan.steps.len() {
+        content_lines.push(Line::from(Span::styled(
+            format!(
+                "⋯ 其余 {} 步(完整见上方 submit_plan 卡)",
+                request.plan.steps.len() - shown_steps
+            ),
+            Style::default().fg(theme.text_muted).bg(bg),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(content_lines)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(theme.text_primary).bg(bg)),
+        chunks[0],
+    );
+
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "[y · 批准]",
+                Style::default().fg(theme.success_fg).bg(bg),
+            ),
+            Span::styled("   ", Style::default().bg(bg)),
+            Span::styled(
+                "[n · 驳回]",
+                Style::default().fg(theme.error_fg).bg(bg),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "提示:Enter = 批准 · Esc = 驳回",
+            Style::default().fg(theme.text_secondary).bg(bg),
+        )),
+    ])
+    .style(Style::default().fg(theme.text_primary).bg(bg));
+    frame.render_widget(footer, chunks[1]);
+}
+
+fn user_question_other_content_line(option_count: usize) -> usize {
+    let mut line = 4usize;
+    for index in 0..option_count {
+        line += 1;
+        if index + 1 < option_count {
+            line += 1;
+        }
+    }
+    line += 1;
+    line
+}
+
+fn user_question_other_label(option_count: usize) -> String {
+    format!("{}. ✎ 其它(自己输入): ", option_count + 1)
+}
+
+fn user_question_other_cursor_position(
+    dialog_area: Rect,
+    option_count: usize,
+    supplement: &str,
+) -> Position {
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(dialog_area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let content_area = chunks[0];
+    let other_line = user_question_other_content_line(option_count);
+    let prefix = "❯  ";
+    let label = user_question_other_label(option_count);
+    let max_x = content_area
+        .x
+        .saturating_add(content_area.width.saturating_sub(1));
+    let max_y = content_area
+        .y
+        .saturating_add(content_area.height.saturating_sub(1));
+    let x = content_area
+        .x
+        .saturating_add(display_width(prefix) as u16)
+        .saturating_add(display_width(&label) as u16)
+        .saturating_add(display_width(supplement) as u16)
+        .min(max_x);
+    let y = content_area
+        .y
+        .saturating_add(other_line as u16)
+        .min(max_y);
+    Position::new(x, y)
+}
+
+fn question_other_input_active(state: &AppState) -> bool {
+    state.pending_question.as_ref().is_some_and(|pending| {
+        pending.cursor == pending.request.question.options.len()
+    })
+}
+
+fn render_user_question(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(pending) = &state.pending_question else {
+        return;
+    };
+    let question = &pending.request.question;
+    let bg = theme.bg_surface_alt;
+    let accent = theme.accent_primary;
+    let other_index = question.options.len();
+    let is_other = pending.cursor == other_index;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent).bg(bg))
+        .style(Style::default().fg(theme.text_primary).bg(bg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let mut content_lines = vec![Line::from(Span::styled(
+        "? 需要你的选择",
+        Style::default()
+            .fg(accent)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    content_lines.push(Line::from(""));
+    content_lines.push(Line::from(Span::styled(
+        question.question.clone(),
+        Style::default().fg(theme.text_body).bg(bg),
+    )));
+    content_lines.push(Line::from(""));
+
+    for (index, option) in question.options.iter().enumerate() {
+        let is_cursor = index == pending.cursor;
+        let is_selected = pending.selected.iter().any(|label| label == &option.label);
+        let cursor_prefix = if is_cursor { "❯  " } else { "   " };
+        let multi_marker = if question.allow_multi {
+            if is_selected {
+                "✓ "
+            } else if is_cursor {
+                "▸ "
+            } else {
+                "  "
+            }
+        } else {
+            ""
+        };
+        let line_style = if is_cursor || is_selected {
+            Style::default().fg(accent).bg(bg)
+        } else {
+            Style::default().fg(theme.text_secondary).bg(bg)
+        };
+        content_lines.push(Line::from(vec![
+            Span::styled(cursor_prefix, line_style),
+            Span::styled(format!("{multi_marker}{}. ", index + 1), line_style),
+            Span::styled(format!("[{}] ", option.label), line_style),
+            Span::styled(
+                option.description.clone(),
+                Style::default().fg(theme.text_body).bg(bg),
+            ),
+        ]));
+        if index + 1 < question.options.len() {
+            content_lines.push(Line::from(""));
+        }
+    }
+
+    content_lines.push(Line::from(""));
+
+    let other_prefix = if is_other { "❯  " } else { "   " };
+    let other_style = if is_other {
+        Style::default().fg(accent).bg(bg)
+    } else {
+        Style::default().fg(theme.text_secondary).bg(bg)
+    };
+    let other_cursor = if is_other { "▏" } else { "" };
+    content_lines.push(Line::from(vec![
+        Span::styled(other_prefix, other_style),
+        Span::styled(
+            format!("{}. ✎ 其它(自己输入): ", other_index + 1),
+            other_style,
+        ),
+        Span::styled(pending.supplement.as_str(), other_style),
+        Span::styled(other_cursor, other_style),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(content_lines).style(Style::default().fg(theme.text_primary).bg(bg)),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑↓/数字 选 · Enter 确认 · Esc 取消",
+            Style::default().fg(theme.text_secondary).bg(bg),
+        )))
+        .style(Style::default().fg(theme.text_primary).bg(bg)),
+        chunks[1],
+    );
+
+    if is_other {
+        frame.set_cursor_position(user_question_other_cursor_position(
+            area,
+            other_index,
+            &pending.supplement,
+        ));
+    }
+}
+
 fn permission_args_preview(tool_name: &str, args: &serde_json::Value) -> String {
     match tool_name {
         "write_file" | "edit_file" => args
@@ -1382,6 +1684,10 @@ fn mode_glyph_and_style(mode: PermissionMode, theme: &Theme) -> (&'static str, S
             Style::default().fg(theme.accent_primary).bg(theme.bg_base),
         ),
         PermissionMode::Yolo => ("▲", Style::default().fg(theme.warning_fg).bg(theme.bg_base)),
+        PermissionMode::Plan => (
+            "◔",
+            Style::default().fg(theme.info_fg).bg(theme.bg_base),
+        ),
     }
 }
 
@@ -1449,7 +1755,9 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &The
         )
         .style(text_style);
     frame.render_widget(paragraph, area);
-    frame.set_cursor_position(input_cursor_position(area, &layout, scroll_offset));
+    if !question_other_input_active(state) {
+        frame.set_cursor_position(input_cursor_position(area, &layout, scroll_offset));
+    }
 }
 
 fn input_content_lines<'a>(
@@ -1896,8 +2204,9 @@ pub fn bubble_sort<T: PartialOrd>(slice: &mut [T]) {
 mod tests {
     use super::{
         collapsed_tool_summary, diff_body_lines, display_cursor, expand_for_display, fold_label,
-        input_content_spans, render, selection_text, tool_card_lines, transcript_line_count,
-        DIFF_COLLAPSED_MAX_ROWS, DIFF_MAX_ROWS,
+        input_content_spans, layout_rows, render, selection_text, tool_card_lines,
+        transcript_line_count, user_question_other_cursor_position, DIFF_COLLAPSED_MAX_ROWS,
+        DIFF_MAX_ROWS,
     };
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::PermissionMode;
@@ -1907,7 +2216,9 @@ mod tests {
         AppState, DiffKind, DiffLine, ModelsPicker, Phase, SessionSnapshot, ToolCard,
         ToolCardStatus, TranscriptBlock,
     };
-    use crate::tui::channel::{AgentEvent, PermissionRequest};
+    use crate::tui::channel::{AgentEvent, PermissionRequest, PlanApprovalRequest, QuestionRequest};
+    use crate::tool::plan::{Plan, PlanStep};
+    use crate::tool::ask::{Question, QuestionOption};
     use crate::tui::input_batch::PasteTailMatcher;
     use crate::tui::input_buffer::PastedChunk;
     use crate::tui::selection::{Point, Selection, SelectionState};
@@ -2278,6 +2589,27 @@ mod tests {
         assert!(lines.iter().any(|line| line.starts_with("  Mysteries")));
         assert!(!lines.iter().any(|line| line.starts_with("Mysteries")));
         assert!(!text.contains("m 你好"));
+    }
+
+    #[test]
+    fn user_question_other_row_sets_cursor_at_supplement_caret() {
+        let mut state = user_question_state();
+        let supplement = "再考虑测试覆盖";
+        if let Some(pending) = state.pending_question.as_mut() {
+            pending.supplement = supplement.to_string();
+        }
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &state, &Theme::midnight()))
+            .unwrap();
+
+        let option_count = 2usize;
+        let supplement = "再考虑测试覆盖";
+        let rows = layout_rows(*terminal.backend().buffer().area(), &state);
+        let expected = user_question_other_cursor_position(rows[2], option_count, supplement);
+        terminal.backend_mut().assert_cursor_position(expected);
     }
 
     #[test]
@@ -3369,6 +3701,27 @@ mod tests {
     }
 
     #[test]
+    fn mode_line_plan_snapshot() {
+        let state = state_with_permission_mode(PermissionMode::Plan);
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!("tui_mode_line_plan", mode_line(&text));
+    }
+
+    #[test]
+    fn plan_approval_state_snapshot() {
+        let state = plan_approval_state();
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!("tui_plan_approval_state", text);
+    }
+
+    #[test]
+    fn user_question_state_snapshot() {
+        let state = user_question_state();
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!("tui_user_question_state", text);
+    }
+
+    #[test]
     fn yolo_mode_shows_mode_line_without_permission_box() {
         let state = state_with_permission_mode(PermissionMode::Yolo);
         let text = render_to_styled(&state, &Theme::midnight());
@@ -3816,6 +4169,55 @@ mod tests {
             "\n--- fatal error daylight frame ---\n{text}\n--- end fatal error daylight frame ---"
         );
         insta::assert_snapshot!("tui_fatal_error_daylight", text);
+    }
+
+    fn plan_approval_state() -> AppState {
+        let (tx, _rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state.apply(AgentEvent::PlanApprovalRequired(PlanApprovalRequest {
+            plan: Plan {
+                title: "Add plan mode".to_string(),
+                steps: vec![
+                    PlanStep {
+                        description: "Wire permission gate".to_string(),
+                        validation: "cargo test permission passes".to_string(),
+                    },
+                    PlanStep {
+                        description: "Add submit_plan tool".to_string(),
+                        validation: "plan approval snapshot matches".to_string(),
+                    },
+                ],
+            },
+            responder: tx,
+        }));
+        state
+    }
+
+    fn user_question_state() -> AppState {
+        let (tx, _rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state.apply(AgentEvent::UserQuestionRequired(QuestionRequest {
+            question: Question {
+                question: "采用哪种实现路径?".to_string(),
+                options: vec![
+                    QuestionOption {
+                        label: "终端 TUI 版".to_string(),
+                        description: "最小改动,沿用现有 seam".to_string(),
+                    },
+                    QuestionOption {
+                        label: "Web 版".to_string(),
+                        description: "独立弹框,后续再统一 channel".to_string(),
+                    },
+                ],
+                allow_multi: false,
+                allow_other: true,
+            },
+            responder: tx,
+        }));
+        if let Some(pending) = state.pending_question.as_mut() {
+            pending.cursor = 2;
+        }
+        state
     }
 
     fn permission_state() -> AppState {

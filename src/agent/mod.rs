@@ -8,12 +8,13 @@ pub use context::{ContextError, ContextStrategy, Passthrough};
 
 use crate::agent::message::Message;
 use crate::error::{AgentError, ProviderError};
-use crate::permission::{gate, PermissionDecider, PermissionDecision};
+use crate::permission::{gate, PermissionDecider, PermissionDecision, PermissionMode};
 use crate::provider::{DeltaSink, ModelRequest, Provider, Usage};
 use crate::tool::{PermissionLevel, ToolContext, ToolOutcome, ToolRegistry};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant. Do not claim to be Claude, ChatGPT, OpenAI, Anthropic, or any specific upstream model. If asked about your model identity, say you are running inside Mysteries and the configured model name is shown in the status line.";
+pub const PLAN_MODE_INSTRUCTION: &str = "你在 plan 模式(只读:read_file/grep/glob/web_*,不改文件/不执行命令)。用户只是问 → 直接答;撞到岔路/歧义 → ask_user 弹选项让用户定;用户要执行任务 → 调研够了 submit_plan 交结构化 plan、每步带可验收 validation";
 const DEFAULT_MODEL: &str = "mock-model";
 
 pub async fn run_single_turn(
@@ -75,6 +76,7 @@ pub struct Agent {
     model: String,
     max_iterations: u32,
     strategy: Box<dyn ContextStrategy>,
+    permission_mode: Arc<Mutex<PermissionMode>>,
 }
 
 impl Agent {
@@ -92,7 +94,12 @@ impl Agent {
             model,
             max_iterations,
             strategy: Box::new(Passthrough),
+            permission_mode: Arc::new(Mutex::new(PermissionMode::Normal)),
         }
+    }
+
+    pub fn set_permission_mode(&mut self, mode: Arc<Mutex<PermissionMode>>) {
+        self.permission_mode = mode;
     }
 
     pub fn set_model(&mut self, model: String) {
@@ -129,14 +136,21 @@ impl Agent {
 
         for _ in 0..self.max_iterations {
             observer.on_status(AgentStatus::CallingModel);
-            let msgs = self.strategy.prepare(history, last_usage.as_ref()).await?;
+            let mode = *self
+                .permission_mode
+                .lock()
+                .expect("permission_mode mutex poisoned");
+            let mut msgs = self.strategy.prepare(history, last_usage.as_ref()).await?;
+            if mode == PermissionMode::Plan {
+                msgs.insert(0, Message::System(PLAN_MODE_INSTRUCTION.to_string()));
+            }
             let response = self
                 .provider
                 .complete(
                     ModelRequest {
                         model: self.model.clone(),
                         messages: msgs,
-                        tools: self.registry.schemas(),
+                        tools: self.registry.schemas_for(mode),
                         max_tokens: None,
                     },
                     sink,
@@ -178,6 +192,39 @@ impl Agent {
 
                 let readonly = tool.permission_level() == PermissionLevel::ReadOnly;
                 observer.on_tool_call_started(&call.id, &call.name, &call.arguments, readonly);
+
+                if mode == PermissionMode::Plan && tool.permission_level() != PermissionLevel::ReadOnly
+                {
+                    let outcome = ToolOutcome {
+                        content: "plan mode forbids non-readonly tools".to_string(),
+                        is_error: true,
+                        truncated: false,
+                        exit: None,
+                    };
+                    history.push(Message::ToolResult {
+                        call_id: call.id.clone(),
+                        content: outcome.content.clone(),
+                        is_error: outcome.is_error,
+                    });
+                    observer.on_tool_call_finished(&call.id, &outcome);
+                    continue;
+                }
+
+                if mode != PermissionMode::Plan && tool.plan_only() {
+                    let outcome = ToolOutcome {
+                        content: "submit_plan is only available in plan mode".to_string(),
+                        is_error: true,
+                        truncated: false,
+                        exit: None,
+                    };
+                    history.push(Message::ToolResult {
+                        call_id: call.id.clone(),
+                        content: outcome.content.clone(),
+                        is_error: outcome.is_error,
+                    });
+                    observer.on_tool_call_finished(&call.id, &outcome);
+                    continue;
+                }
 
                 if !readonly {
                     observer.on_status(AgentStatus::WaitingForPermission);
@@ -252,13 +299,15 @@ impl From<ContextError> for AgentError {
 mod tests {
     use super::{
         run_single_turn, Agent, AgentObserver, AgentStatus, ContextStrategy, DEFAULT_SYSTEM_PROMPT,
+        PLAN_MODE_INSTRUCTION,
     };
     use crate::agent::message::Message;
     use crate::error::{AgentError, ProviderError};
-    use crate::permission::{PermissionDecider, PermissionDecision};
+    use crate::permission::{PermissionDecider, PermissionDecision, PermissionMode};
     use crate::provider::mock::MockProvider;
     use crate::provider::{DeltaSink, FinishReason, ModelResponse, Provider, ToolCall, Usage};
     use crate::tool::edit::WriteFileTool;
+    use crate::tool::plan::{MockPlanApprover, Plan, PlanApprover, PlanDecision, SubmitPlanTool};
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome, ToolRegistry};
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -1295,6 +1344,228 @@ mod tests {
         assert!(matches!(
             err,
             AgentError::Provider(ProviderError::Transport(_))
+        ));
+    }
+
+    struct FlippingPlanApprover {
+        mode: Arc<Mutex<PermissionMode>>,
+    }
+
+    #[async_trait]
+    impl PlanApprover for FlippingPlanApprover {
+        async fn approve(&self, _plan: &Plan) -> PlanDecision {
+            *self
+                .mode
+                .lock()
+                .expect("permission_mode mutex poisoned") = PermissionMode::AcceptEdits;
+            PlanDecision::Approve
+        }
+    }
+
+    struct CountingPlanApprover {
+        calls: Arc<AtomicUsize>,
+        decision: PlanDecision,
+    }
+
+    #[async_trait]
+    impl PlanApprover for CountingPlanApprover {
+        async fn approve(&self, _plan: &Plan) -> PlanDecision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.decision.clone()
+        }
+    }
+
+    fn registry_with_plan_tools(approver: Box<dyn PlanApprover>) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool)).unwrap();
+        registry.register(Box::new(WriteFileTool)).unwrap();
+        registry
+            .register(Box::new(SubmitPlanTool::new(approver)))
+            .unwrap();
+        registry
+    }
+
+    fn sample_plan_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "submit_plan".to_string(),
+            arguments: json!({
+                "title": "Test plan",
+                "steps": [
+                    {
+                        "description": "Do work",
+                        "validation": "tests pass"
+                    }
+                ]
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_plan_mode_exposes_readonly_and_plan_only_schemas_only() {
+        let mode = Arc::new(Mutex::new(PermissionMode::Plan));
+        let provider = Arc::new(MockProvider::new(vec![response("planning")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            registry_with_plan_tools(Box::new(MockPlanApprover::new(PlanDecision::Approve))),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        agent.set_permission_mode(mode);
+        let sink = NoopSink;
+        let mut history = vec![Message::User("plan this".to_string())];
+
+        agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        let recorded = provider.recorded_requests();
+        let tool_names = recorded[0]
+            .tools
+            .iter()
+            .map(|schema| schema.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_names, vec!["echo", "submit_plan"]);
+    }
+
+    #[tokio::test]
+    async fn agent_plan_mode_injects_transient_instruction_not_history() {
+        let mode = Arc::new(Mutex::new(PermissionMode::Plan));
+        let provider = Arc::new(MockProvider::new(vec![response("planning")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            registry_with_plan_tools(Box::new(MockPlanApprover::new(PlanDecision::Approve))),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        agent.set_permission_mode(mode);
+        let sink = NoopSink;
+        let mut history = vec![
+            Message::System("base".to_string()),
+            Message::User("plan this".to_string()),
+        ];
+
+        agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        let request_msgs = &provider.recorded_requests()[0].messages;
+        assert_eq!(
+            request_msgs[0],
+            Message::System(PLAN_MODE_INSTRUCTION.to_string())
+        );
+        assert_eq!(request_msgs[1], Message::System("base".to_string()));
+        assert_eq!(history[0], Message::System("base".to_string()));
+    }
+
+    #[tokio::test]
+    async fn agent_normal_mode_does_not_inject_plan_instruction() {
+        let provider = Arc::new(MockProvider::new(vec![response("ok")]));
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_plan_tools(Box::new(MockPlanApprover::new(PlanDecision::Approve))),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let mut history = vec![
+            Message::System("base".to_string()),
+            Message::User("hello".to_string()),
+        ];
+
+        agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        let request_msgs = &provider.recorded_requests()[0].messages;
+        assert!(!request_msgs.iter().any(|message| {
+            matches!(message, Message::System(text) if text == PLAN_MODE_INSTRUCTION)
+        }));
+        assert_eq!(request_msgs, &history[..2]);
+    }
+
+    #[tokio::test]
+    async fn agent_plan_mode_snapshot_blocks_edit_after_submit_plan_flips_mode() {
+        let mode = Arc::new(Mutex::new(PermissionMode::Plan));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                sample_plan_call("call-plan"),
+                ToolCall {
+                    id: "call-write".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "blocked.txt", "content": "nope" }),
+                },
+            ]),
+            response("done"),
+        ]));
+        let temp = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(
+            provider,
+            registry_with_plan_tools(Box::new(FlippingPlanApprover {
+                mode: mode.clone(),
+            })),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        agent.set_permission_mode(mode.clone());
+        let sink = NoopSink;
+        let mut history = vec![Message::User("execute".to_string())];
+        let tool_ctx = ToolContext {
+            cwd: temp.path().to_path_buf(),
+            max_output_bytes: 4096,
+        };
+
+        let text = agent.run(&mut history, &tool_ctx, &sink).await.unwrap();
+
+        assert_eq!(text, "done");
+        assert_eq!(*mode.lock().unwrap(), PermissionMode::AcceptEdits);
+        assert!(!temp.path().join("blocked.txt").exists());
+        assert_eq!(
+            history[2],
+            Message::ToolResult {
+                call_id: "call-plan".to_string(),
+                content: "计划已批准,按上述 plan 逐步执行、每步完成后自检其 validation".to_string(),
+                is_error: false,
+            }
+        );
+        assert!(matches!(
+            &history[3],
+            Message::ToolResult {
+                call_id,
+                is_error: true,
+                ..
+            } if call_id == "call-write"
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_normal_mode_rejects_plan_only_tools_without_executing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![sample_plan_call("call-plan")]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry_with_plan_tools(Box::new(CountingPlanApprover {
+                calls: calls.clone(),
+                decision: PlanDecision::Approve,
+            })),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let mut history = vec![Message::User("submit".to_string())];
+
+        agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            &history[2],
+            Message::ToolResult {
+                call_id,
+                is_error: true,
+                ..
+            } if call_id == "call-plan"
         ));
     }
 }

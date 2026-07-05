@@ -5,7 +5,11 @@ use crate::permission::{cycle_permission_mode, PermissionMode, PermissionReply};
 use crate::provider::registry::models_for;
 use crate::provider::Usage;
 use crate::session::SessionSummary;
-use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
+use crate::tui::channel::{
+    AgentEvent, PermissionRequest, PlanApprovalRequest, QuestionRequest, UserInput,
+};
+use crate::tool::ask::Answer;
+use crate::tool::plan::PlanDecision;
 use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
 use crate::tui::input_batch::{PasteTailMatcher, TailAction};
 use crate::tui::input_buffer::{reduce_input_buffer, InputBufferAction, InputBufferState};
@@ -463,6 +467,8 @@ pub struct AppState {
     pub permission_mode: Arc<Mutex<PermissionMode>>,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
+    pub pending_plan_approval: Option<PlanApprovalRequest>,
+    pub pending_question: Option<PendingQuestion>,
     pub scroll_offset: usize,
     pub spinner_frame: usize,
     pub should_exit: bool,
@@ -484,6 +490,13 @@ pub struct AppState {
     copy_hint: Option<CopyHint>,
     pub paste_tail: Option<PasteTailState>,
     paste_receiving_hint: bool,
+}
+
+pub struct PendingQuestion {
+    pub request: QuestionRequest,
+    pub cursor: usize,
+    pub selected: Vec<String>,
+    pub supplement: String,
 }
 
 impl AppState {
@@ -519,6 +532,8 @@ impl AppState {
             permission_mode: Arc::new(Mutex::new(PermissionMode::Normal)),
             phase: Phase::Ready,
             pending_permission: None,
+            pending_plan_approval: None,
+            pending_question: None,
             scroll_offset: 0,
             spinner_frame: 0,
             should_exit: false,
@@ -693,6 +708,12 @@ impl AppState {
             .permission_mode
             .lock()
             .expect("permission mode mutex poisoned")
+    }
+
+    pub fn has_pending_dialog(&self) -> bool {
+        self.pending_permission.is_some()
+            || self.pending_plan_approval.is_some()
+            || self.pending_question.is_some()
     }
 
     fn apply_input_action(&mut self, action: InputBufferAction) {
@@ -1114,9 +1135,24 @@ impl AppState {
                 self.pending_permission = Some(request);
                 self.phase = Phase::WaitingForPermission;
             }
+            AgentEvent::PlanApprovalRequired(request) => {
+                self.pending_plan_approval = Some(request);
+                self.phase = Phase::WaitingForPermission;
+            }
+            AgentEvent::UserQuestionRequired(request) => {
+                self.pending_question = Some(PendingQuestion {
+                    request,
+                    cursor: 0,
+                    selected: Vec::new(),
+                    supplement: String::new(),
+                });
+                self.phase = Phase::WaitingForPermission;
+            }
             AgentEvent::TurnComplete => {
                 let was_busy = self.phase != Phase::Ready;
                 self.pending_permission = None;
+                self.pending_plan_approval = None;
+                self.pending_question = None;
                 self.iteration = 0;
                 self.phase = Phase::Ready;
                 self.save_idle_token_summary();
@@ -1135,6 +1171,8 @@ impl AppState {
             AgentEvent::Interrupted => {
                 let was_busy = self.phase != Phase::Ready;
                 self.pending_permission = None;
+                self.pending_plan_approval = None;
+                self.pending_question = None;
                 self.iteration = 0;
                 self.phase = Phase::Ready;
                 self.transcript
@@ -1147,6 +1185,8 @@ impl AppState {
             AgentEvent::Error(message) => {
                 let was_busy = self.phase != Phase::Ready;
                 self.pending_permission = None;
+                self.pending_plan_approval = None;
+                self.pending_question = None;
                 self.iteration = 0;
                 self.phase = Phase::Ready;
                 self.transcript.push(TranscriptBlock::Error(message));
@@ -1214,6 +1254,100 @@ impl AppState {
                 _ => {}
             }
             return;
+        }
+
+        if self.pending_plan_approval.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.answer_pending_plan_approval(PlanDecision::Approve);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.answer_pending_plan_approval(PlanDecision::Reject(
+                        "用户驳回".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if let Some(pending) = self.pending_question.as_mut() {
+            let options_len = pending.request.question.options.len();
+            let other_index = options_len;
+            match key.code {
+                KeyCode::Enter => {
+                    self.submit_pending_question();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.cancel_pending_question();
+                    return;
+                }
+                KeyCode::Up => {
+                    pending.cursor = pending.cursor.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    pending.cursor = (pending.cursor + 1).min(other_index);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    if pending.cursor == other_index {
+                        pending.supplement.pop();
+                    }
+                    return;
+                }
+                KeyCode::Char(' ') => {
+                    if pending.request.question.allow_multi && pending.cursor < options_len {
+                        let label =
+                            pending.request.question.options[pending.cursor].label.clone();
+                        if let Some(index) = pending
+                            .selected
+                            .iter()
+                            .position(|selected| selected == &label)
+                        {
+                            pending.selected.remove(index);
+                        } else {
+                            pending.selected.push(label);
+                        }
+                    }
+                    return;
+                }
+                KeyCode::Char(ch @ '1'..='9') => {
+                    let picked = (ch as u8 - b'1') as usize;
+                    if picked <= other_index {
+                        pending.cursor = picked;
+                        if picked < options_len && pending.request.question.allow_multi {
+                            let label =
+                                pending.request.question.options[picked].label.clone();
+                            if let Some(selected_index) = pending
+                                .selected
+                                .iter()
+                                .position(|selected| selected == &label)
+                            {
+                                pending.selected.remove(selected_index);
+                            } else {
+                                pending.selected.push(label);
+                            }
+                        }
+                    } else if pending.cursor == other_index {
+                        pending.supplement.push(ch);
+                    }
+                    return;
+                }
+                KeyCode::Char(ch) => {
+                    let pure_control = key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT);
+                    if pure_control {
+                        return;
+                    }
+                    if pending.cursor == other_index {
+                        pending.supplement.push(ch);
+                    }
+                    return;
+                }
+                _ => return,
+            }
         }
 
         if self.handle_models_picker_key(key, input_tx) {
@@ -1362,6 +1496,50 @@ impl AppState {
             self.phase = Phase::Busy;
         }
     }
+
+    fn answer_pending_plan_approval(&mut self, decision: PlanDecision) {
+        if let Some(request) = self.pending_plan_approval.take() {
+            let _ = request.responder.send(decision);
+            self.phase = Phase::Busy;
+        }
+    }
+
+    fn submit_pending_question(&mut self) {
+        if let Some(pending) = self.pending_question.take() {
+            let question = &pending.request.question;
+            let other_index = question.options.len();
+            let (selected, supplement) = if pending.cursor == other_index {
+                (
+                    Vec::new(),
+                    (!pending.supplement.is_empty()).then_some(pending.supplement),
+                )
+            } else if question.allow_multi {
+                (pending.selected, None)
+            } else if question.options.is_empty() {
+                (Vec::new(), None)
+            } else {
+                (
+                    vec![question.options[pending.cursor].label.clone()],
+                    None,
+                )
+            };
+            let _ = pending.request.responder.send(Answer {
+                selected,
+                supplement,
+            });
+            self.phase = Phase::Busy;
+        }
+    }
+
+    fn cancel_pending_question(&mut self) {
+        if let Some(pending) = self.pending_question.take() {
+            let _ = pending.request.responder.send(Answer {
+                selected: Vec::new(),
+                supplement: None,
+            });
+            self.phase = Phase::Busy;
+        }
+    }
 }
 
 pub(crate) enum ApplyBatchKeyResult {
@@ -1404,10 +1582,14 @@ pub(crate) fn apply_batch_input_key(
 ) -> ApplyBatchKeyResult {
     use crate::tui::input_batch::KeyIntent;
 
-    if state.pending_permission.is_some() {
+    if state.has_pending_dialog() {
         flush_merged_input_chars(state, pending_str);
         state.on_key_with_interrupt(key, input_tx, interrupt_tx);
-        return ApplyBatchKeyResult::BreakBatch;
+        return if state.has_pending_dialog() {
+            ApplyBatchKeyResult::Continue
+        } else {
+            ApplyBatchKeyResult::BreakBatch
+        };
     }
 
     if state.models_picker.is_some() {
@@ -1494,7 +1676,8 @@ mod tests {
     use crate::provider::Usage;
     use crate::session::SessionSummary;
     use crate::tool::ToolOutcome;
-    use crate::tui::channel::{AgentEvent, PermissionRequest, UserInput};
+    use crate::tui::channel::{AgentEvent, PermissionRequest, QuestionRequest, UserInput};
+    use crate::tool::ask::{Answer, Question, QuestionOption};
     use crate::tui::command::Command;
     use crate::tui::input_batch::{PasteTailMatcher, TailAction};
     use crate::tui::selection::{Point, SelectionAction};
@@ -3503,7 +3686,7 @@ mod tests {
     }
 
     #[test]
-    fn backtab_cycles_permission_mode_normal_accept_edits_yolo() {
+    fn backtab_cycles_permission_mode_normal_accept_edits_yolo_plan() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = AppState::new();
 
@@ -3514,6 +3697,9 @@ mod tests {
 
         state.on_key(key(KeyCode::BackTab), &tx);
         assert_eq!(state.current_permission_mode(), PermissionMode::Yolo);
+
+        state.on_key(key(KeyCode::BackTab), &tx);
+        assert_eq!(state.current_permission_mode(), PermissionMode::Plan);
 
         state.on_key(key(KeyCode::BackTab), &tx);
         assert_eq!(state.current_permission_mode(), PermissionMode::Normal);
@@ -3748,6 +3934,86 @@ mod tests {
         assert_eq!(state.input(), "");
         assert!(!state.input().contains('\n'));
         assert!(input_rx.try_recv().is_err());
+    }
+
+    fn pending_question_on_other_row(responder: oneshot::Sender<Answer>) -> AppState {
+        let mut state = AppState::new();
+        state.apply(AgentEvent::UserQuestionRequired(QuestionRequest {
+            question: Question {
+                question: "选一个".to_string(),
+                options: vec![QuestionOption {
+                    label: "选项".to_string(),
+                    description: "说明".to_string(),
+                }],
+                allow_multi: false,
+                allow_other: true,
+            },
+            responder,
+        }));
+        if let Some(pending) = state.pending_question.as_mut() {
+            pending.cursor = 1;
+        }
+        state
+    }
+
+    #[test]
+    fn batch_pending_question_other_row_keeps_all_chars_in_supplement() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = oneshot::channel();
+        let mut state = pending_question_on_other_row(question_tx);
+
+        apply_press_key_batch(
+            &mut state,
+            &[
+                key(KeyCode::Char('你')),
+                key(KeyCode::Char('好')),
+                key(KeyCode::Char('测')),
+            ],
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        let supplement = state
+            .pending_question
+            .as_ref()
+            .expect("dialog still open")
+            .supplement
+            .clone();
+        assert_eq!(supplement, "你好测");
+        assert_eq!(state.input(), "");
+    }
+
+    #[test]
+    fn batch_pending_question_submit_breaks_batch_and_drops_rest() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let (question_tx, mut question_rx) = oneshot::channel();
+        let mut state = pending_question_on_other_row(question_tx);
+        if let Some(pending) = state.pending_question.as_mut() {
+            pending.supplement = "已有".to_string();
+        }
+
+        apply_press_key_batch(
+            &mut state,
+            &[
+                key(KeyCode::Enter),
+                key(KeyCode::Char('x')),
+                key(KeyCode::Char('y')),
+            ],
+            &input_tx,
+            &interrupt_tx,
+        );
+
+        assert_eq!(
+            question_rx.try_recv().unwrap(),
+            Answer {
+                selected: vec![],
+                supplement: Some("已有".to_string()),
+            }
+        );
+        assert!(state.pending_question.is_none());
+        assert_eq!(state.input(), "");
     }
 
     #[test]
