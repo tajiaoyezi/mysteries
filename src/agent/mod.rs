@@ -9,7 +9,7 @@ pub use context::{ContextError, ContextStrategy, Passthrough};
 use crate::agent::message::Message;
 use crate::error::{AgentError, ProviderError};
 use crate::permission::{gate, PermissionDecider, PermissionDecision, PermissionMode};
-use crate::provider::{Depth, DeltaSink, ModelRequest, Provider, ThinkingConfig, Usage};
+use crate::provider::{DeltaSink, Depth, ModelRequest, Provider, ThinkingConfig, Usage};
 use crate::tool::{PermissionLevel, ToolContext, ToolOutcome, ToolRegistry};
 use std::sync::{Arc, Mutex};
 
@@ -332,7 +332,10 @@ mod tests {
     use crate::error::{AgentError, ProviderError};
     use crate::permission::{PermissionDecider, PermissionDecision, PermissionMode};
     use crate::provider::mock::MockProvider;
-    use crate::provider::{Depth, DeltaSink, FinishReason, ModelResponse, Provider, ThinkingBlock, ThinkingConfig, ToolCall, Usage};
+    use crate::provider::{
+        DeltaSink, Depth, FinishReason, ModelResponse, Provider, ThinkingBlock, ThinkingConfig,
+        ToolCall, Usage,
+    };
     use crate::tool::edit::WriteFileTool;
     use crate::tool::plan::{MockPlanApprover, Plan, PlanApprover, PlanDecision, SubmitPlanTool};
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome, ToolRegistry};
@@ -444,7 +447,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }
     }
 
@@ -454,7 +457,7 @@ mod tests {
             tool_calls,
             finish_reason: FinishReason::ToolCalls,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }
     }
 
@@ -464,7 +467,7 @@ mod tests {
             tool_calls,
             finish_reason: FinishReason::ToolCalls,
             usage: Some(usage),
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }
     }
 
@@ -474,7 +477,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: Some(usage),
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }
     }
 
@@ -521,7 +524,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             })
         }
     }
@@ -825,7 +828,7 @@ mod tests {
             Some(&Message::Assistant {
                 text: "final reply".to_string(),
                 tool_calls: Vec::new(),
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             })
         );
         assert_eq!(provider.recorded_requests().len(), 1);
@@ -977,7 +980,7 @@ mod tests {
             Message::Assistant {
                 text: "done".to_string(),
                 tool_calls: Vec::new(),
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             }
         );
 
@@ -1314,7 +1317,7 @@ mod tests {
             Some(&Message::Assistant {
                 text: "forced final".to_string(),
                 tool_calls: Vec::new(),
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             })
         );
 
@@ -1643,15 +1646,11 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         assert_eq!(
             recorded[0].thinking,
-            Some(ThinkingConfig {
-                depth: Depth::High,
-            })
+            Some(ThinkingConfig { depth: Depth::High })
         );
         assert_eq!(
             recorded[1].thinking,
-            Some(ThinkingConfig {
-                depth: Depth::High,
-            }),
+            Some(ThinkingConfig { depth: Depth::High }),
             "forced-final must re-read depth snapshot outside the loop"
         );
     }

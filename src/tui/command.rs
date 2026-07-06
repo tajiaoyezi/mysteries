@@ -189,14 +189,7 @@ mod tests {
     #[test]
     fn command_metadata_covers_all_builtin_commands_and_matches_parser() {
         let expected = [
-            "/help",
-            "/clear",
-            "/model",
-            "/models",
-            "/status",
-            "/exit",
-            "/compact",
-            "/think",
+            "/help", "/clear", "/model", "/models", "/status", "/exit", "/compact", "/think",
         ];
         let metadata = command_metadata();
         let names = metadata

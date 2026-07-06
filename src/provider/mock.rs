@@ -84,7 +84,7 @@ mod tests {
             messages: vec![Message::User(prompt.to_string())],
             tools: Vec::new(),
             max_tokens: None,
-        thinking: None,
+            thinking: None,
         }
     }
 
@@ -94,7 +94,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }
     }
 

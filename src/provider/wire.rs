@@ -63,7 +63,9 @@ fn serialize_message(message: &Message) -> Value {
             "role": "user",
             "content": content,
         }),
-        Message::Assistant { text, tool_calls, .. } => {
+        Message::Assistant {
+            text, tool_calls, ..
+        } => {
             let content = if text.is_empty() && !tool_calls.is_empty() {
                 Value::Null
             } else {
@@ -188,7 +190,9 @@ mod tests {
     use super::{parse_response, serialize_request};
     use crate::agent::message::Message;
     use crate::error::ProviderError;
-    use crate::provider::{Depth, FinishReason, ModelRequest, ModelResponse, ThinkingConfig, ToolCall, ToolSchema};
+    use crate::provider::{
+        Depth, FinishReason, ModelRequest, ModelResponse, ThinkingConfig, ToolCall, ToolSchema,
+    };
     use serde_json::json;
 
     #[test]
@@ -324,7 +328,7 @@ mod tests {
             messages: vec![Message::User("no tools".to_string())],
             tools: Vec::new(),
             max_tokens: None,
-        thinking: None,
+            thinking: None,
         };
 
         assert!(serialize_request(&no_tools_req).get("tools").is_none());
@@ -351,7 +355,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             }
         );
     }
@@ -462,9 +466,7 @@ mod tests {
             messages: vec![Message::User("hello".to_string())],
             tools: Vec::new(),
             max_tokens: Some(128),
-            thinking: Some(ThinkingConfig {
-                depth: Depth::Off,
-            }),
+            thinking: Some(ThinkingConfig { depth: Depth::Off }),
         };
 
         let body = serialize_request(&req);
@@ -481,9 +483,7 @@ mod tests {
             messages: vec![Message::User("hello".to_string())],
             tools: Vec::new(),
             max_tokens: Some(128),
-            thinking: Some(ThinkingConfig {
-                depth: Depth::High,
-            }),
+            thinking: Some(ThinkingConfig { depth: Depth::High }),
         };
 
         let body = serialize_request(&req);
@@ -590,7 +590,10 @@ mod tests {
 
         let message = &serialize_request(&req)["messages"][0];
         assert_eq!(message["content"], json!("calling tool"));
-        assert_eq!(message["tool_calls"][0]["function"]["name"], json!("lookup"));
+        assert_eq!(
+            message["tool_calls"][0]["function"]["name"],
+            json!("lookup")
+        );
     }
 
     #[test]
@@ -638,9 +641,7 @@ mod tests {
                 messages: vec![Message::User("hi".to_string())],
                 tools: Vec::new(),
                 max_tokens: Some(128),
-                thinking: Some(ThinkingConfig {
-                    depth: Depth::Off,
-                }),
+                thinking: Some(ThinkingConfig { depth: Depth::Off }),
             }),
         );
         dump(
@@ -650,9 +651,7 @@ mod tests {
                 messages: vec![Message::User("hi".to_string())],
                 tools: Vec::new(),
                 max_tokens: Some(128),
-                thinking: Some(ThinkingConfig {
-                    depth: Depth::High,
-                }),
+                thinking: Some(ThinkingConfig { depth: Depth::High }),
             }),
         );
     }

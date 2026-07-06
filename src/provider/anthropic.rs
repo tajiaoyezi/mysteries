@@ -387,7 +387,10 @@ mod tests {
     #[test]
     fn anthropic_provider_default_uses_official_base_url() {
         let provider = AnthropicProvider::default(CredentialChain::new(Vec::new()));
-        assert_eq!(provider.messages_url(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            provider.messages_url(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     async fn one_shot_http_server(status_line: &str, extra_headers: &str, body: &str) -> String {
@@ -480,12 +483,8 @@ mod tests {
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
-        let base_url = one_shot_http_server(
-            "200 OK",
-            "Content-Type: text/event-stream\r\n",
-            sse,
-        )
-        .await;
+        let base_url =
+            one_shot_http_server("200 OK", "Content-Type: text/event-stream\r\n", sse).await;
         let provider = provider_for_base_url(&base_url);
         let sink = CaptureSink::new();
 
@@ -515,7 +514,7 @@ mod tests {
                     messages: vec![Message::User("Reply with exactly: pong".to_string())],
                     tools: Vec::new(),
                     max_tokens: Some(16),
-                thinking: None,
+                    thinking: None,
                 },
                 &sink,
             )

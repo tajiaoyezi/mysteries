@@ -337,7 +337,7 @@ kind = "mock"
             model_context_window: None,
             compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
             keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
-        thinking: DEFAULT_THINKING,
+            thinking: DEFAULT_THINKING,
         }
     }
 
@@ -398,7 +398,7 @@ kind = "mock"
                     messages: Vec::new(),
                     tools: Vec::new(),
                     max_tokens: None,
-                thinking: None,
+                    thinking: None,
                 },
                 &sink,
             )
@@ -428,7 +428,7 @@ kind = "mock"
                     messages: Vec::new(),
                     tools: Vec::new(),
                     max_tokens: None,
-                thinking: None,
+                    thinking: None,
                 },
                 &sink,
             )
@@ -451,7 +451,7 @@ kind = "mock"
                     messages: Vec::new(),
                     tools: Vec::new(),
                     max_tokens: None,
-                thinking: None,
+                    thinking: None,
                 },
                 &sink,
             )
@@ -521,7 +521,7 @@ kind = "mock"
             model_context_window: None,
             compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
             keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
-        thinking: DEFAULT_THINKING,
+            thinking: DEFAULT_THINKING,
         };
         let provider = Arc::new(MockProvider::new(vec![
             ModelResponse {
@@ -540,7 +540,7 @@ kind = "mock"
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             },
         ]));
         let assembled = assemble_agent(
@@ -590,7 +590,7 @@ kind = "mock"
                 model_context_window: window,
                 compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
                 keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
-            thinking: DEFAULT_THINKING,
+                thinking: DEFAULT_THINKING,
             }
         }
         let history = vec![
@@ -599,13 +599,13 @@ kind = "mock"
             Message::Assistant {
                 text: "r1".to_string(),
                 tool_calls: Vec::new(),
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             },
             Message::User("two".to_string()),
             Message::Assistant {
                 text: "r2".to_string(),
                 tool_calls: Vec::new(),
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             },
         ];
         let usage = Usage {
@@ -619,7 +619,7 @@ kind = "mock"
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }]));
         let assembled = assemble_agent(
             provider,
@@ -712,14 +712,14 @@ kind = "mock"
             model_context_window: None,
             compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
             keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
-        thinking: DEFAULT_THINKING,
+            thinking: DEFAULT_THINKING,
         };
         let provider = Arc::new(MockProvider::new(vec![ModelResponse {
             text: "ok".to_string(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }]));
         let assembled = assemble_agent(
             provider.clone(),

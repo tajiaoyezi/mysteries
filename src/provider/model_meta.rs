@@ -9,7 +9,9 @@ pub const DEFAULT_CONTEXT_WINDOW: u32 = 65_536;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnthropicThinking {
     None,
-    Budget { effort: bool },
+    Budget {
+        effort: bool,
+    },
     Adaptive {
         can_disable: bool,
         max_effort: Depth,
@@ -73,8 +75,14 @@ const ANTHROPIC_THINKING_TABLE: &[(&str, AnthropicThinking)] = &[
             max_effort: Depth::High,
         },
     ),
-    ("claude-opus-4-5", AnthropicThinking::Budget { effort: true }),
-    ("claude-haiku-4-5", AnthropicThinking::Budget { effort: false }),
+    (
+        "claude-opus-4-5",
+        AnthropicThinking::Budget { effort: true },
+    ),
+    (
+        "claude-haiku-4-5",
+        AnthropicThinking::Budget { effort: false },
+    ),
 ];
 
 const OPENAI_THINKING_TABLE: &[(&str, OpenAiThinking)] = &[
@@ -86,9 +94,10 @@ const OPENAI_THINKING_TABLE: &[(&str, OpenAiThinking)] = &[
 
 pub fn anthropic_thinking_capability(model: &str) -> AnthropicThinking {
     let model = model.to_ascii_lowercase();
-    if let Some(cap) = ANTHROPIC_THINKING_TABLE.iter().find_map(|(pattern, cap)| {
-        pattern_matches(&model, pattern).then(|| cap.clone())
-    }) {
+    if let Some(cap) = ANTHROPIC_THINKING_TABLE
+        .iter()
+        .find_map(|(pattern, cap)| pattern_matches(&model, pattern).then(|| cap.clone()))
+    {
         return cap;
     }
     if model.contains("claude") {
@@ -277,9 +286,7 @@ mod tests {
 
         assert_eq!(
             openai_thinking_capability("gpt-5"),
-            OpenAiThinking::Effort {
-                max: Depth::High,
-            }
+            OpenAiThinking::Effort { max: Depth::High }
         );
         assert_eq!(
             openai_thinking_capability("totally-unknown-model"),

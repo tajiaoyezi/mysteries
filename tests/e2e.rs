@@ -132,7 +132,10 @@ fn stop_response(text: &str) -> ModelResponse {
     }
 }
 
-fn tool_response_with_thinking(calls: Vec<ToolCall>, thinking: Vec<ThinkingBlock>) -> ModelResponse {
+fn tool_response_with_thinking(
+    calls: Vec<ToolCall>,
+    thinking: Vec<ThinkingBlock>,
+) -> ModelResponse {
     ModelResponse {
         text: String::new(),
         tool_calls: calls,
@@ -183,9 +186,7 @@ fn assemble_with_plan_seams(
         provider,
         config,
         decider,
-        Some(Box::new(FlippingPlanApprover {
-            mode: mode.clone(),
-        })),
+        Some(Box::new(FlippingPlanApprover { mode: mode.clone() })),
         Some(Box::new(MockPrompter::new(Answer {
             selected: Vec::new(),
             supplement: None,
@@ -371,9 +372,7 @@ async fn assembled_agent_propagates_thinking_depth_and_round_trips_blocks() {
     assert_eq!(recorded.len(), 2);
     assert_eq!(
         recorded[0].thinking,
-        Some(ThinkingConfig {
-            depth: Depth::High,
-        })
+        Some(ThinkingConfig { depth: Depth::High })
     );
     assert!(recorded[1].messages.iter().any(|msg| {
         matches!(
@@ -619,9 +618,7 @@ async fn assembled_agent_set_model_strips_thinking_from_history() {
         },
     ];
 
-    assembled
-        .agent
-        .set_model("m2".to_string(), &mut history);
+    assembled.agent.set_model("m2".to_string(), &mut history);
 
     assert_eq!(history, expected_after_strip);
 

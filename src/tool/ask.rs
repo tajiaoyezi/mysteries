@@ -169,9 +169,7 @@ mod tests {
             selected: vec!["A".to_string()],
             supplement: None,
         })));
-        let outcome = tool
-            .execute(json!({ "options": [] }), &ctx())
-            .await;
+        let outcome = tool.execute(json!({ "options": [] }), &ctx()).await;
 
         assert!(outcome.is_error);
     }

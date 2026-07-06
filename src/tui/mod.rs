@@ -167,9 +167,9 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
     state.thinking_depth = thinking_depth;
     state.transcript = session_startup.transcript;
     if state.thinking_cannot_disable_active() {
-        state
-            .transcript
-            .push(app::TranscriptBlock::Notice("该模型思考无法关闭".to_string()));
+        state.transcript.push(app::TranscriptBlock::Notice(
+            "该模型思考无法关闭".to_string(),
+        ));
     }
     if mode == StartupMode::Resume {
         let summaries = store.list_sessions().map_err(cli_io_error)?;
@@ -1817,7 +1817,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             })
         }
     }
@@ -2638,7 +2638,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             },
         ]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -2760,7 +2760,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             },
         ]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -2835,7 +2835,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
@@ -2887,14 +2887,14 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             },
             ModelResponse {
                 text: "second reply".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
-            thinking: Vec::new(),
+                thinking: Vec::new(),
             },
         ]));
         let history = agent_history();
@@ -3118,7 +3118,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
@@ -3188,7 +3188,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
@@ -3249,7 +3249,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
@@ -3347,7 +3347,7 @@ model = "zhipu/glm-5.2"
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
-        thinking: Vec::new(),
+            thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();

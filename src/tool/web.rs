@@ -47,12 +47,10 @@ pub fn decode_uddg(href: &str) -> Option<String> {
 }
 
 pub fn html_to_text(html: &str) -> String {
-    let script_re =
-        Regex::new(r"(?si)<script[^>]*>.*?</script>").expect("script strip regex");
+    let script_re = Regex::new(r"(?si)<script[^>]*>.*?</script>").expect("script strip regex");
     let style_re = Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("style strip regex");
     let tag_re = Regex::new(r"<[^>]*>").expect("tag strip regex");
-    let hex_entity_re =
-        Regex::new(r"&#x([0-9a-fA-F]+);").expect("hex entity regex");
+    let hex_entity_re = Regex::new(r"&#x([0-9a-fA-F]+);").expect("hex entity regex");
     let dec_entity_re = Regex::new(r"&#([0-9]+);").expect("dec entity regex");
     let whitespace_re = Regex::new(r"\s+").expect("whitespace regex");
 
@@ -248,13 +246,16 @@ fn is_readable_content_type(content_type: Option<&str>) -> bool {
     let Some(raw) = content_type else {
         return true;
     };
-    let mime = raw.split(';').next().unwrap_or(raw).trim().to_ascii_lowercase();
+    let mime = raw
+        .split(';')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .to_ascii_lowercase();
     if mime.starts_with("text/") {
         return true;
     }
-    !(mime.starts_with("image/")
-        || mime == "application/octet-stream"
-        || mime == "application/pdf")
+    !(mime.starts_with("image/") || mime == "application/octet-stream" || mime == "application/pdf")
 }
 
 async fn read_body_capped(
@@ -397,8 +398,8 @@ async fn process_http_response(response: reqwest::Response) -> Result<String, We
 #[async_trait]
 impl WebFetcher for ReqwestFetcher {
     async fn fetch(&self, url: &str) -> Result<String, WebError> {
-        let mut url = reqwest::Url::parse(url)
-            .map_err(|err| WebError::new(format!("invalid url: {err}")))?;
+        let mut url =
+            reqwest::Url::parse(url).map_err(|err| WebError::new(format!("invalid url: {err}")))?;
         let mut redirects = 0u32;
 
         let response = loop {
@@ -407,10 +408,7 @@ impl WebFetcher for ReqwestFetcher {
             let response = self
                 .client
                 .get(url.clone())
-                .header(
-                    USER_AGENT,
-                    HeaderValue::from_static(BROWSER_USER_AGENT),
-                )
+                .header(USER_AGENT, HeaderValue::from_static(BROWSER_USER_AGENT))
                 .send()
                 .await
                 .map_err(|err| WebError::new(format!("request failed: {err}")))?;
@@ -558,10 +556,10 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_resolved, ddg_search_url, decode_uddg, html_to_text, is_blocked_ip,
-        is_readable_content_type, parse_ddg_results, precheck_url, bytes_to_text,
-        process_http_response, MockFetcher, ReqwestFetcher, WebFetcher, WebFetchTool,
-        WebSearchTool, MAX_SEARCH_RESULTS, WEB_MAX_BYTES,
+        bytes_to_text, check_resolved, ddg_search_url, decode_uddg, html_to_text, is_blocked_ip,
+        is_readable_content_type, parse_ddg_results, precheck_url, process_http_response,
+        MockFetcher, ReqwestFetcher, WebFetchTool, WebFetcher, WebSearchTool, MAX_SEARCH_RESULTS,
+        WEB_MAX_BYTES,
     };
     use crate::tool::{Tool, ToolContext};
     use serde_json::json;
@@ -629,10 +627,7 @@ mod tests {
 
     #[test]
     fn decode_uddg_returns_none_for_ad_or_missing_uddg() {
-        assert_eq!(
-            decode_uddg("//duckduckgo.com/y.js?d=123"),
-            None
-        );
+        assert_eq!(decode_uddg("//duckduckgo.com/y.js?d=123"), None);
         assert_eq!(decode_uddg("//example.com/page"), None);
     }
 
@@ -818,9 +813,7 @@ mod tests {
 
     #[test]
     fn check_resolved_allows_all_public() {
-        assert!(
-            check_resolved(&["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()]).is_ok()
-        );
+        assert!(check_resolved(&["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()]).is_ok());
         assert!(check_resolved(&["2606:4700::1".parse().unwrap()]).is_ok());
     }
 
@@ -854,9 +847,7 @@ mod tests {
     #[test]
     fn precheck_url_rejects_redirect_target_to_loopback() {
         let base = reqwest::Url::parse("https://example.com/start").unwrap();
-        let target = base
-            .join("http://127.0.0.1/secret")
-            .expect("redirect join");
+        let target = base.join("http://127.0.0.1/secret").expect("redirect join");
         assert!(precheck_url(&target).is_err());
     }
 
@@ -910,12 +901,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_http_response_rejects_redirect_target_to_internal() {
-        let base_url = one_shot_http_server(
-            "302 Found",
-            "Location: http://127.0.0.1/secret\r\n",
-            "",
-        )
-        .await;
+        let base_url =
+            one_shot_http_server("302 Found", "Location: http://127.0.0.1/secret\r\n", "").await;
         let response = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -942,12 +929,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_http_response_rejects_unsupported_content_type() {
-        let base_url = one_shot_http_server(
-            "200 OK",
-            "Content-Type: application/pdf\r\n",
-            "%PDF-1.4",
-        )
-        .await;
+        let base_url =
+            one_shot_http_server("200 OK", "Content-Type: application/pdf\r\n", "%PDF-1.4").await;
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -963,12 +946,7 @@ mod tests {
     #[tokio::test]
     async fn process_http_response_caps_response_body_bytes() {
         let body = "x".repeat(WEB_MAX_BYTES + 1024);
-        let base_url = one_shot_http_server(
-            "200 OK",
-            "Content-Type: text/plain\r\n",
-            &body,
-        )
-        .await;
+        let base_url = one_shot_http_server("200 OK", "Content-Type: text/plain\r\n", &body).await;
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -1041,25 +1019,23 @@ mod tests {
             .await;
         assert!(!outcome.is_error);
         assert!(outcome.content.contains("What is Ownership?"));
-        assert!(outcome.content.contains("doc.rust-lang.org/book/ch04-01-what-is-ownership.html"));
+        assert!(outcome
+            .content
+            .contains("doc.rust-lang.org/book/ch04-01-what-is-ownership.html"));
         assert!(outcome.content.contains("Understanding Ownership"));
     }
 
     #[tokio::test]
     async fn web_search_returns_error_when_fetcher_fails() {
         let tool = WebSearchTool::new(Box::new(MockFetcher::err("ddg blocked")));
-        let outcome = tool
-            .execute(json!({ "query": "rust" }), &ctx(4096))
-            .await;
+        let outcome = tool.execute(json!({ "query": "rust" }), &ctx(4096)).await;
         assert!(outcome.is_error);
     }
 
     #[tokio::test]
     async fn web_search_returns_error_when_no_results_parsed() {
         let tool = WebSearchTool::new(Box::new(MockFetcher::ok("<html></html>")));
-        let outcome = tool
-            .execute(json!({ "query": "rust" }), &ctx(4096))
-            .await;
+        let outcome = tool.execute(json!({ "query": "rust" }), &ctx(4096)).await;
         assert!(outcome.is_error);
     }
 }

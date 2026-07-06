@@ -791,9 +791,8 @@ impl AppState {
 
     fn maybe_notice_thinking_cannot_disable(&mut self) {
         if self.thinking_cannot_disable_active() {
-            self.transcript.push(TranscriptBlock::Notice(
-                "该模型思考无法关闭".to_string(),
-            ));
+            self.transcript
+                .push(TranscriptBlock::Notice("该模型思考无法关闭".to_string()));
         }
     }
 
@@ -3392,16 +3391,7 @@ mod tests {
         state.on_key(key(KeyCode::Char('/')), &tx);
         assert_eq!(
             completion_names(&state),
-            vec![
-                "/help",
-                "/clear",
-                "/model",
-                "/models",
-                "/status",
-                "/exit",
-                "/compact",
-                "/think",
-            ]
+            vec!["/help", "/clear", "/model", "/models", "/status", "/exit", "/compact", "/think",]
         );
         assert_eq!(selected_completion_name(&state), "/help");
 

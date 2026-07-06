@@ -177,8 +177,7 @@ pub fn serialize_request(req: &ModelRequest) -> Value {
 
     if let Some(config) = &req.thinking {
         let cap = anthropic_thinking_capability(&req.model);
-        let (thinking, output_config) =
-            anthropic_thinking_body(cap, config.depth, req.max_tokens);
+        let (thinking, output_config) = anthropic_thinking_body(cap, config.depth, req.max_tokens);
         if let Some(thinking) = thinking {
             body["thinking"] = thinking;
         }
@@ -197,7 +196,9 @@ mod tests {
     };
     use crate::agent::message::Message;
     use crate::provider::model_meta::anthropic_thinking_capability;
-    use crate::provider::{Depth, ModelRequest, ThinkingBlock, ThinkingConfig, ToolCall, ToolSchema};
+    use crate::provider::{
+        Depth, ModelRequest, ThinkingBlock, ThinkingConfig, ToolCall, ToolSchema,
+    };
     use serde_json::json;
 
     #[test]
@@ -311,8 +312,7 @@ mod tests {
     #[test]
     fn adaptive_model_medium_emits_adaptive_and_output_config() {
         let cap = anthropic_thinking_capability("claude-opus-4-8");
-        let (thinking, output_config) =
-            anthropic_thinking_body(cap, Depth::Medium, Some(16_000));
+        let (thinking, output_config) = anthropic_thinking_body(cap, Depth::Medium, Some(16_000));
 
         assert_eq!(
             thinking,
@@ -327,8 +327,7 @@ mod tests {
     #[test]
     fn budget_model_high_emits_enabled_budget_tokens() {
         let cap = anthropic_thinking_capability("claude-haiku-4-5");
-        let (thinking, output_config) =
-            anthropic_thinking_body(cap, Depth::High, Some(16_000));
+        let (thinking, output_config) = anthropic_thinking_body(cap, Depth::High, Some(16_000));
 
         assert_eq!(output_config, None);
         let thinking = thinking.expect("budget branch should emit thinking");
@@ -341,8 +340,7 @@ mod tests {
     #[test]
     fn off_can_disable_emits_disabled() {
         let cap = anthropic_thinking_capability("claude-sonnet-5");
-        let (thinking, output_config) =
-            anthropic_thinking_body(cap, Depth::Off, Some(16_000));
+        let (thinking, output_config) = anthropic_thinking_body(cap, Depth::Off, Some(16_000));
 
         assert_eq!(thinking, Some(json!({ "type": "disabled" })));
         assert_eq!(output_config, None);
@@ -351,8 +349,7 @@ mod tests {
     #[test]
     fn off_always_on_emits_low_effort_without_thinking() {
         let cap = anthropic_thinking_capability("claude-fable-5");
-        let (thinking, output_config) =
-            anthropic_thinking_body(cap, Depth::Off, Some(16_000));
+        let (thinking, output_config) = anthropic_thinking_body(cap, Depth::Off, Some(16_000));
 
         assert_eq!(thinking, None);
         assert_eq!(output_config, Some(json!({ "effort": "low" })));
@@ -362,8 +359,7 @@ mod tests {
     fn budget_guard_omits_thinking_when_max_tokens_too_small_or_none() {
         let cap = AnthropicThinking::Budget { effort: false };
 
-        let (thinking_small, _) =
-            anthropic_thinking_body(cap.clone(), Depth::High, Some(1_000));
+        let (thinking_small, _) = anthropic_thinking_body(cap.clone(), Depth::High, Some(1_000));
         assert_eq!(thinking_small, None);
 
         let (thinking_none, _) = anthropic_thinking_body(cap, Depth::High, None);
@@ -452,8 +448,7 @@ mod tests {
         let cap = anthropic_thinking_capability("totally-unknown-model");
         assert_eq!(cap, AnthropicThinking::None);
 
-        let (thinking, output_config) =
-            anthropic_thinking_body(cap, Depth::High, Some(16_000));
+        let (thinking, output_config) = anthropic_thinking_body(cap, Depth::High, Some(16_000));
         assert_eq!(thinking, None);
         assert_eq!(output_config, None);
 
@@ -462,9 +457,7 @@ mod tests {
             messages: vec![Message::User("hi".to_string())],
             tools: Vec::new(),
             max_tokens: Some(16_000),
-            thinking: Some(ThinkingConfig {
-                depth: Depth::High,
-            }),
+            thinking: Some(ThinkingConfig { depth: Depth::High }),
         };
         let body = serialize_request(&req);
         assert!(body.get("thinking").is_none());
@@ -474,8 +467,7 @@ mod tests {
     #[test]
     fn budget_model_off_depth_omits_thinking_fields() {
         let cap = AnthropicThinking::Budget { effort: false };
-        let (thinking, output_config) =
-            anthropic_thinking_body(cap, Depth::Off, Some(16_000));
+        let (thinking, output_config) = anthropic_thinking_body(cap, Depth::Off, Some(16_000));
         assert_eq!(thinking, None);
         assert_eq!(output_config, None);
     }
@@ -561,9 +553,7 @@ mod tests {
             messages: vec![Message::User("hi".to_string())],
             tools: Vec::new(),
             max_tokens: Some(16_000),
-            thinking: Some(ThinkingConfig {
-                depth: Depth::High,
-            }),
+            thinking: Some(ThinkingConfig { depth: Depth::High }),
         });
         dump("anthropic_budget_haiku45_high_16k", &budget);
 
@@ -572,9 +562,7 @@ mod tests {
             messages: vec![Message::User("hi".to_string())],
             tools: Vec::new(),
             max_tokens: Some(16_000),
-            thinking: Some(ThinkingConfig {
-                depth: Depth::Off,
-            }),
+            thinking: Some(ThinkingConfig { depth: Depth::Off }),
         });
         dump("anthropic_off_can_disable_sonnet5", &off_disable);
 
@@ -583,9 +571,7 @@ mod tests {
             messages: vec![Message::User("hi".to_string())],
             tools: Vec::new(),
             max_tokens: Some(16_000),
-            thinking: Some(ThinkingConfig {
-                depth: Depth::Off,
-            }),
+            thinking: Some(ThinkingConfig { depth: Depth::Off }),
         });
         dump("anthropic_off_always_on_fable5", &off_always);
 
@@ -594,9 +580,7 @@ mod tests {
             messages: vec![Message::User("hi".to_string())],
             tools: Vec::new(),
             max_tokens: Some(1_000),
-            thinking: Some(ThinkingConfig {
-                depth: Depth::High,
-            }),
+            thinking: Some(ThinkingConfig { depth: Depth::High }),
         });
         dump("anthropic_budget_guard_haiku45_1000", &guard_small);
 
@@ -605,9 +589,7 @@ mod tests {
             messages: vec![Message::User("hi".to_string())],
             tools: Vec::new(),
             max_tokens: None,
-            thinking: Some(ThinkingConfig {
-                depth: Depth::High,
-            }),
+            thinking: Some(ThinkingConfig { depth: Depth::High }),
         });
         dump("anthropic_budget_guard_haiku45_none", &guard_none);
 

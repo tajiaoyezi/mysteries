@@ -350,11 +350,11 @@ mod tests {
     #[test]
     fn auto_allows_plan_mode_never_auto_allows_edit_or_execute() {
         assert!(!auto_allows(PermissionMode::Plan, PermissionLevel::Edit));
+        assert!(!auto_allows(PermissionMode::Plan, PermissionLevel::Execute));
         assert!(!auto_allows(
             PermissionMode::Plan,
-            PermissionLevel::Execute
+            PermissionLevel::ReadOnly
         ));
-        assert!(!auto_allows(PermissionMode::Plan, PermissionLevel::ReadOnly));
     }
 
     #[test]

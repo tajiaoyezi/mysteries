@@ -569,7 +569,7 @@ mod tests {
                     messages: vec![Message::User("Reply with exactly: pong".to_string())],
                     tools: Vec::new(),
                     max_tokens: Some(16),
-                thinking: None,
+                    thinking: None,
                 },
                 &sink,
             )

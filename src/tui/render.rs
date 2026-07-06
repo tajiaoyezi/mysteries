@@ -2727,7 +2727,9 @@ mod tests {
     fn thinking_transcript_state(text: &str, expanded: bool) -> AppState {
         let mut state = AppState::new();
         state.tools_expanded = expanded;
-        state.transcript.push(TranscriptBlock::Thinking(text.to_string()));
+        state
+            .transcript
+            .push(TranscriptBlock::Thinking(text.to_string()));
         state.scroll_to_top(100, 20);
         state
     }

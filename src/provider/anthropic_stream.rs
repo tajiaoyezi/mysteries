@@ -142,9 +142,11 @@ impl AnthropicAccumulator {
 
             if partial.input_json.is_empty() {
                 if let Some(input) = block.get("input") {
-                    if input.is_object() && input.as_object().is_some_and(|object| !object.is_empty())
+                    if input.is_object()
+                        && input.as_object().is_some_and(|object| !object.is_empty())
                     {
-                        partial.input_json = serde_json::to_string(input).expect("Value serializes");
+                        partial.input_json =
+                            serde_json::to_string(input).expect("Value serializes");
                     }
                 }
             }
@@ -223,12 +225,13 @@ impl AnthropicAccumulator {
                 sink.on_thinking(text);
             }
             Some("signature_delta") => {
-                let signature = delta
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        ProviderError::Decode("signature_delta.signature missing".to_string())
-                    })?;
+                let signature =
+                    delta
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ProviderError::Decode("signature_delta.signature missing".to_string())
+                        })?;
                 let partial = self.thinking_blocks.entry(index).or_default();
                 match &mut partial.signature {
                     Some(existing) => existing.push_str(signature),
