@@ -2,13 +2,13 @@
 source: src/tui/render.rs
 expression: text
 ---
-‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 
 
 ‹text.primary›                                  ‹/›‹text.title +bold›✦ MYSTERIES‹/›
-‹text.primary›                          ‹/›‹accent.primary›AGENT · v1.0 · 终端编码助手‹/›
+‹text.primary›                         ‹/›‹accent.primary›AGENT · v1.1.0 · 终端编码助手‹/›
 ‹text.primary›        ‹/›‹text.body›读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等‹/›
 ‹border.strong bg=bg.surface›┌──────────────────────────────────────────────────┐‹/›
 ‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold +reversed›/help     ‹/›‹text.body bg=bg.surface +reversed›查看内置命令‹/›‹text.primary bg=bg.surface›                            ‹/›‹border.strong bg=bg.surface›│‹/›

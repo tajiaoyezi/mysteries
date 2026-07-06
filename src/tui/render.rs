@@ -275,7 +275,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "  agent · v1.0",
+            format!("  agent · v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(theme.text_muted).bg(theme.bg_base),
         ),
     ]))
@@ -365,7 +365,12 @@ fn welcome_lines(theme: &Theme, width: usize) -> Vec<Line<'static>> {
 
     let mut lines = vec![
         centered_text_line("✦ MYSTERIES", title_style, width, theme),
-        centered_text_line("AGENT · v1.0 · 终端编码助手", subtitle_style, width, theme),
+        centered_text_line(
+            &format!("AGENT · v{} · 终端编码助手", env!("CARGO_PKG_VERSION")),
+            subtitle_style,
+            width,
+            theme,
+        ),
     ];
     for line in wrap_text(
         "读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等你按下 y 才动手。",

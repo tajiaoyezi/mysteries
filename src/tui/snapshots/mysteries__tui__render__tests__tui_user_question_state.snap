@@ -2,7 +2,7 @@
 source: src/tui/render.rs
 expression: text
 ---
-‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 ‹text.primary›                   ‹/›‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
