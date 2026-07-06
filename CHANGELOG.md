@@ -3,6 +3,17 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 条目由 git 历史与 `.ai_history/logs/` 决策记录蒸馏而来。
 
+## [Unreleased]
+
+### 新增
+- **CLI `--help` / `-h` / `--version`**:输出用法 / 版本号后退出;此前这些及任意未知 flag 都会静默进入 TUI。
+
+### 变更
+- README tests badge 去数字化(`800+`),不再硬编码具体数,避免与实际测试数漂移。
+
+### 测试
+- 新增 CLI flag 解析 5 组单测(`wants_help` / `wants_version` / `help_text` / `version_text`);`tui::width` CJK 显示宽度补 8 组 characterization 测试(全 / 半角边界、零宽标记、截断),经 mutation check 防假绿。
+
 ## [1.1.0] - 2026-07-06
 
 ### 新增
