@@ -2,6 +2,12 @@
 name = "mysteries"
 version = "1.1.0"
 edition = "2021"
+description = "自研 terminal Agent CLI:对话驱动、可调用本地工具的编码 agent(Claude Code 风格);核心 Agent Loop / 工具 / 权限自实现,不依赖第三方 Agent SDK"
+license = "MIT"
+repository = "https://github.com/tajiaoyezi/mysteries"
+readme = "README.md"
+keywords = ["agent", "cli", "tui", "llm", "coding-assistant"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 arboard = "3"
