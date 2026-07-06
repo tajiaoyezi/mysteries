@@ -1,0 +1,49 @@
+# mysteries 配置示例
+# 复制到 ~/.config/mysteries/config.toml(用户级)或项目根 ./mysteries.toml(项目级,优先合并)。
+# API Key 不写在这里 —— 由 `mysteries auth login` 交互式写入 ~/.config/mysteries/credentials;
+# 也可用环境变量覆盖(env 优先于文件)。
+
+# 当前激活的 provider(对应下方某个 [providers.<名>])
+active = "wps"
+
+# ── Agent 行为 ────────────────────────────────────────────
+# max_iterations = 50            # 单轮 Agent Loop 最多迭代次数(默认 50)
+# timeout_secs = 120             # 单次请求 / 工具执行超时(秒)
+# allowed_commands = []          # run_shell 免确认白名单,如 ["ls", "cat", "git status"]
+
+# ── 上下文压缩 ────────────────────────────────────────────
+# model_context_window = 128000  # 模型上下文窗口;不设则按内置模型表推断
+# compact_trigger_ratio = 0.8    # 用量超过此比例触发自动压缩
+# keep_recent_turns = 4          # 压缩时保留最近 N 轮对话
+
+# ── 思考模式 ──────────────────────────────────────────────
+# thinking = "low"               # off | low | medium | high | xhigh(默认 low;运行时可 /think 覆盖)
+
+# ── Provider profiles ─────────────────────────────────────
+# kind: openai(含所有 OpenAI 兼容 endpoint)| anthropic | mock
+# auth_type: api_key
+
+# WPS CodingPlan(默认,OpenAI 兼容协议)
+[providers.wps]
+kind = "openai"
+base_url = "https://ai-kas.kso.net/codeplan/v1"
+model = "zhipu/glm-5.2"
+auth_type = "api_key"
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+auth_type = "api_key"
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-5"
+auth_type = "api_key"
+
+[providers.deepseek]
+kind = "openai"
+base_url = "https://api.deepseek.com"
+model = "deepseek-reasoner"
+auth_type = "api_key"
