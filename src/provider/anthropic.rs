@@ -103,6 +103,14 @@ impl AnthropicProvider {
         }
     }
 
+    /// 测试专用:注入一个绕开环境代理的 client。生产走 `Client::new()`(尊重用户代理),
+    /// 但单测打的是本地回环 server,须无视 `all_proxy` 等环境代理才能连上(否则 socks5 等代理会拦截)。
+    #[cfg(test)]
+    pub(crate) fn with_test_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
     pub fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
     }
@@ -374,6 +382,117 @@ mod tests {
             body["tools"][0]["input_schema"],
             json!({ "type": "object" })
         );
+    }
+
+    #[test]
+    fn anthropic_provider_default_uses_official_base_url() {
+        let provider = AnthropicProvider::default(CredentialChain::new(Vec::new()));
+        assert_eq!(provider.messages_url(), "https://api.anthropic.com/v1/messages");
+    }
+
+    async fn one_shot_http_server(status_line: &str, extra_headers: &str, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        let extra_headers = extra_headers.to_string();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16_384];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn provider_for_base_url(base_url: &str) -> AnthropicProvider {
+        AnthropicProvider::with_retry_policy(
+            base_url,
+            CredentialChain::new(vec![Box::new(MapCredentialSource::new(&[(
+                "anthropic",
+                "sk-test",
+            )]))]),
+            no_retry_policy(),
+        )
+        .with_test_client(reqwest::Client::builder().no_proxy().build().unwrap())
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_maps_http_403_to_fatal_forbidden_transport() {
+        let base_url = one_shot_http_server(
+            "403 Forbidden",
+            "Content-Type: application/json\r\n",
+            r#"{"error":{"type":"forbidden"}}"#,
+        )
+        .await;
+        let provider = provider_for_base_url(&base_url);
+        let sink = CaptureSink::new();
+
+        let err = provider.complete(request(), &sink).await.unwrap_err();
+
+        match err {
+            ProviderError::Transport(message) => {
+                assert!(message.contains("forbidden (403)"));
+                assert!(message.contains("模型无权限或配额"));
+            }
+            other => panic!("expected fatal transport for 403, got {other:?}"),
+        }
+        assert_eq!(sink.chunks(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_maps_http_400_to_fatal_transport() {
+        let base_url = one_shot_http_server(
+            "400 Bad Request",
+            "Content-Type: application/json\r\n",
+            r#"{"error":{"type":"invalid_request"}}"#,
+        )
+        .await;
+        let provider = provider_for_base_url(&base_url);
+        let sink = CaptureSink::new();
+
+        let err = provider.complete(request(), &sink).await.unwrap_err();
+
+        assert_eq!(
+            err,
+            ProviderError::Transport("Anthropic HTTP status 400".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_complete_accumulates_successful_sse_stream() {
+        let sse = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"pong\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let base_url = one_shot_http_server(
+            "200 OK",
+            "Content-Type: text/event-stream\r\n",
+            sse,
+        )
+        .await;
+        let provider = provider_for_base_url(&base_url);
+        let sink = CaptureSink::new();
+
+        let response = provider.complete(request(), &sink).await.unwrap();
+
+        assert_eq!(response.text, "pong");
+        assert_eq!(sink.chunks(), vec!["pong"]);
     }
 
     #[tokio::test]

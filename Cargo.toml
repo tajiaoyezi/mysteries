@@ -13,7 +13,7 @@ ignore = "0.4"
 pulldown-cmark = "0.13"
 ratatui = "0.29"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

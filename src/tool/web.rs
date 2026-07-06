@@ -374,6 +374,26 @@ impl Default for ReqwestFetcher {
     }
 }
 
+async fn process_http_response(response: reqwest::Response) -> Result<String, WebError> {
+    if !response.status().is_success() {
+        return Err(WebError::new(format!("HTTP {}", response.status())));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if !is_readable_content_type(content_type) {
+        return Err(WebError::new(format!(
+            "unsupported content-type: {}",
+            content_type.unwrap_or("unknown")
+        )));
+    }
+
+    let body = read_body_capped(response, WEB_MAX_BYTES).await?;
+    Ok(bytes_to_text(body))
+}
+
 #[async_trait]
 impl WebFetcher for ReqwestFetcher {
     async fn fetch(&self, url: &str) -> Result<String, WebError> {
@@ -415,23 +435,7 @@ impl WebFetcher for ReqwestFetcher {
             break response;
         };
 
-        if !response.status().is_success() {
-            return Err(WebError::new(format!("HTTP {}", response.status())));
-        }
-
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok());
-        if !is_readable_content_type(content_type) {
-            return Err(WebError::new(format!(
-                "unsupported content-type: {}",
-                content_type.unwrap_or("unknown")
-            )));
-        }
-
-        let body = read_body_capped(response, WEB_MAX_BYTES).await?;
-        Ok(bytes_to_text(body))
+        process_http_response(response).await
     }
 }
 
@@ -555,8 +559,9 @@ impl Tool for WebSearchTool {
 mod tests {
     use super::{
         check_resolved, ddg_search_url, decode_uddg, html_to_text, is_blocked_ip,
-        parse_ddg_results, precheck_url, MockFetcher, WebFetchTool, WebSearchTool,
-        MAX_SEARCH_RESULTS,
+        is_readable_content_type, parse_ddg_results, precheck_url, bytes_to_text,
+        process_http_response, MockFetcher, ReqwestFetcher, WebFetcher, WebFetchTool,
+        WebSearchTool, MAX_SEARCH_RESULTS, WEB_MAX_BYTES,
     };
     use crate::tool::{Tool, ToolContext};
     use serde_json::json;
@@ -831,6 +836,180 @@ mod tests {
         assert!(!outcome.is_error);
         assert_eq!(outcome.content, html_to_text(html));
         assert!(!outcome.truncated);
+    }
+
+    #[test]
+    fn decode_uddg_handles_https_href_without_leading_slashes() {
+        assert_eq!(
+            decode_uddg("https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdoc"),
+            Some("https://example.com/doc".to_string())
+        );
+    }
+
+    #[test]
+    fn html_to_text_preserves_invalid_decimal_entity_literal() {
+        assert_eq!(html_to_text("bad&#99999999;token"), "bad&#99999999;token");
+    }
+
+    #[test]
+    fn precheck_url_rejects_redirect_target_to_loopback() {
+        let base = reqwest::Url::parse("https://example.com/start").unwrap();
+        let target = base
+            .join("http://127.0.0.1/secret")
+            .expect("redirect join");
+        assert!(precheck_url(&target).is_err());
+    }
+
+    #[test]
+    fn is_readable_content_type_allows_text_and_missing_header() {
+        assert!(is_readable_content_type(None));
+        assert!(is_readable_content_type(Some("text/html; charset=utf-8")));
+        assert!(!is_readable_content_type(Some("application/pdf")));
+        assert!(!is_readable_content_type(Some("image/png")));
+    }
+
+    #[test]
+    fn bytes_to_text_recovers_valid_prefix_from_invalid_utf8_tail() {
+        let mut bytes = b"hello \xFF world".to_vec();
+        while !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
+            bytes.pop();
+        }
+        assert_eq!(bytes_to_text(b"hello \xFF world".to_vec()), "hello ");
+    }
+
+    #[tokio::test]
+    async fn reqwest_fetcher_rejects_localhost_via_dns_resolution() {
+        let fetcher = ReqwestFetcher::new();
+        let err = fetcher.fetch("http://localhost/").await.unwrap_err();
+        assert!(err.to_string().contains("blocked IP"));
+    }
+
+    async fn one_shot_http_server(status_line: &str, extra_headers: &str, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        let extra_headers = extra_headers.to_string();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16_384];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn process_http_response_rejects_redirect_target_to_internal() {
+        let base_url = one_shot_http_server(
+            "302 Found",
+            "Location: http://127.0.0.1/secret\r\n",
+            "",
+        )
+        .await;
+        let response = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&base_url)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+        let joined = response
+            .url()
+            .join(
+                response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(precheck_url(&joined).is_err());
+    }
+
+    #[tokio::test]
+    async fn process_http_response_rejects_unsupported_content_type() {
+        let base_url = one_shot_http_server(
+            "200 OK",
+            "Content-Type: application/pdf\r\n",
+            "%PDF-1.4",
+        )
+        .await;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&base_url)
+            .send()
+            .await
+            .unwrap();
+        let err = process_http_response(response).await.unwrap_err();
+        assert!(err.to_string().contains("unsupported content-type"));
+    }
+
+    #[tokio::test]
+    async fn process_http_response_caps_response_body_bytes() {
+        let body = "x".repeat(WEB_MAX_BYTES + 1024);
+        let base_url = one_shot_http_server(
+            "200 OK",
+            "Content-Type: text/plain\r\n",
+            &body,
+        )
+        .await;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&base_url)
+            .send()
+            .await
+            .unwrap();
+        let text = process_http_response(response).await.unwrap();
+        assert_eq!(text.len(), WEB_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn process_http_response_rejects_non_success_http_status() {
+        let base_url = one_shot_http_server("404 Not Found", "", "missing").await;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&base_url)
+            .send()
+            .await
+            .unwrap();
+        let err = process_http_response(response).await.unwrap_err();
+        assert!(err.to_string().contains("HTTP 404"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_returns_error_for_missing_url_argument() {
+        let tool = WebFetchTool::new(Box::new(MockFetcher::ok("unused")));
+        let outcome = tool.execute(json!({}), &ctx(4096)).await;
+        assert!(outcome.is_error);
+        assert_eq!(outcome.content, "missing or invalid url");
+    }
+
+    #[tokio::test]
+    async fn web_search_returns_error_for_missing_query_argument() {
+        let tool = WebSearchTool::new(Box::new(MockFetcher::ok(DDG_FIXTURE)));
+        let outcome = tool.execute(json!({}), &ctx(4096)).await;
+        assert!(outcome.is_error);
+        assert_eq!(outcome.content, "missing or invalid query");
     }
 
     #[tokio::test]

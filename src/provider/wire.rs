@@ -494,6 +494,121 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_rejects_non_string_message_content() {
+        let body = json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": [{ "type": "text", "text": "x" }] },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let err = parse_response(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderError::Decode(message) if message == "message.content must be string or null"
+        ));
+    }
+
+    #[test]
+    fn parse_response_rejects_non_array_tool_calls() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": { "id": "call-1" }
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let err = parse_response(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderError::Decode(message) if message == "message.tool_calls must be an array"
+        ));
+    }
+
+    #[test]
+    fn parse_response_rejects_invalid_tool_arguments_json() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": "{not json"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let err = parse_response(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderError::Decode(message) if message.starts_with("tool_call.function.arguments invalid JSON:")
+        ));
+    }
+
+    #[test]
+    fn parse_response_treats_missing_finish_reason_as_other_empty() {
+        let body = json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "hello" }
+            }]
+        });
+
+        assert_eq!(
+            parse_response(&body).unwrap().finish_reason,
+            FinishReason::Other(String::new())
+        );
+    }
+
+    #[test]
+    fn serialize_assistant_with_text_and_tool_calls_keeps_string_content() {
+        let req = ModelRequest {
+            model: "gpt-test".to_string(),
+            messages: vec![Message::Assistant {
+                text: "calling tool".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "lookup".to_string(),
+                    arguments: json!({ "query": "rust" }),
+                }],
+                thinking: Vec::new(),
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let message = &serialize_request(&req)["messages"][0];
+        assert_eq!(message["content"], json!("calling tool"));
+        assert_eq!(message["tool_calls"][0]["function"]["name"], json!("lookup"));
+    }
+
+    #[test]
+    fn reasoning_model_without_thinking_config_omits_reasoning_effort() {
+        let req = ModelRequest {
+            model: "gpt-5".to_string(),
+            messages: vec![Message::User("hello".to_string())],
+            tools: Vec::new(),
+            max_tokens: Some(64),
+            thinking: None,
+        };
+
+        let body = serialize_request(&req);
+        assert_eq!(body["max_completion_tokens"], json!(64));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     #[ignore = "manual: cargo test dump_openai_wire_samples --lib -- --ignored --nocapture"]
     fn dump_openai_wire_samples() {
         let dump = |name: &str, body: &serde_json::Value| {

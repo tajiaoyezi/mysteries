@@ -448,6 +448,93 @@ mod tests {
     }
 
     #[test]
+    fn none_capability_model_omits_thinking_and_output_config() {
+        let cap = anthropic_thinking_capability("totally-unknown-model");
+        assert_eq!(cap, AnthropicThinking::None);
+
+        let (thinking, output_config) =
+            anthropic_thinking_body(cap, Depth::High, Some(16_000));
+        assert_eq!(thinking, None);
+        assert_eq!(output_config, None);
+
+        let req = ModelRequest {
+            model: "totally-unknown-model".to_string(),
+            messages: vec![Message::User("hi".to_string())],
+            tools: Vec::new(),
+            max_tokens: Some(16_000),
+            thinking: Some(ThinkingConfig {
+                depth: Depth::High,
+            }),
+        };
+        let body = serialize_request(&req);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn budget_model_off_depth_omits_thinking_fields() {
+        let cap = AnthropicThinking::Budget { effort: false };
+        let (thinking, output_config) =
+            anthropic_thinking_body(cap, Depth::Off, Some(16_000));
+        assert_eq!(thinking, None);
+        assert_eq!(output_config, None);
+    }
+
+    #[test]
+    fn assistant_tool_calls_without_text_omit_text_block() {
+        let req = ModelRequest {
+            model: "claude-test".to_string(),
+            messages: vec![Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "toolu_01".to_string(),
+                    name: "lookup".to_string(),
+                    arguments: json!({ "query": "rust" }),
+                }],
+                thinking: Vec::new(),
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let content = &serialize_request(&req)["messages"][0]["content"];
+        assert_eq!(
+            content,
+            &json!([{
+                "type": "tool_use",
+                "id": "toolu_01",
+                "name": "lookup",
+                "input": { "query": "rust" },
+            }])
+        );
+    }
+
+    #[test]
+    fn thinking_block_without_signature_omits_signature_key() {
+        let req = ModelRequest {
+            model: "claude-opus-4-8".to_string(),
+            messages: vec![Message::Assistant {
+                text: String::new(),
+                tool_calls: Vec::new(),
+                thinking: vec![ThinkingBlock {
+                    text: "silent plan".to_string(),
+                    signature: None,
+                    redacted: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let block = &serialize_request(&req)["messages"][0]["content"][0];
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "silent plan");
+        assert!(block.get("signature").is_none());
+    }
+
+    #[test]
     #[ignore = "manual: cargo test dump_thinking_wire_samples --lib -- --ignored --nocapture"]
     fn dump_thinking_wire_samples() {
         let dump = |name: &str, body: &serde_json::Value| {
