@@ -1,6 +1,6 @@
 use mysteries::cli::{
-    run_auth_list, run_auth_login_interactive, run_auth_logout_interactive, run_cli, AuthPaths,
-    CliError, CliPaths,
+    help_text, run_auth_list, run_auth_login_interactive, run_auth_logout_interactive, run_cli,
+    version_text, wants_help, wants_version, AuthPaths, CliError, CliPaths,
 };
 use mysteries::tui::{run_tui, startup_mode};
 use std::env;
@@ -36,6 +36,16 @@ async fn real_main() -> Result<(), CliError> {
             }
         })
         .collect::<Vec<_>>();
+
+    if wants_help(&args) {
+        print!("{}", help_text());
+        return Ok(());
+    }
+    if wants_version(&args) {
+        println!("{}", version_text());
+        return Ok(());
+    }
+
     let paths = default_paths()?;
 
     if args.first().map(String::as_str) == Some("auth") {

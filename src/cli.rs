@@ -577,12 +577,46 @@ fn initial_history(prompt: &str) -> Vec<Message> {
     ]
 }
 
+/// 顶层 `--help` / `-h` 的用法文本。
+pub fn help_text() -> String {
+    format!(
+        concat!(
+            "mysteries {} — 终端编码 agent\n",
+            "\n",
+            "USAGE:\n",
+            "    mysteries                          进入 TUI(交互式)\n",
+            "    mysteries --resume                 续接最近一次会话\n",
+            "    mysteries --continue               继续当前目录的会话\n",
+            "    mysteries --headless <prompt>      无头单轮模式\n",
+            "    mysteries auth <list|login|logout> 管理 provider 与凭据\n",
+            "    mysteries --help | -h              显示本帮助\n",
+            "    mysteries --version                显示版本号\n",
+        ),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// `--version` 的输出文本。
+pub fn version_text() -> String {
+    format!("mysteries {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// 参数中是否请求了帮助(`--help` / `-h`)。
+pub fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--help" || arg == "-h")
+}
+
+/// 参数中是否请求了版本号(`--version`)。
+pub fn wants_version(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--version")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_secret_key, apply_select_key, initial_history, parse_decision, preset_patch,
-        run_auth_login, run_auth_logout, AuthError, AuthPaths, AuthPrompter, ProviderPreset,
-        SecretKeyAction, SelectAction,
+        apply_secret_key, apply_select_key, help_text, initial_history, parse_decision,
+        preset_patch, run_auth_login, run_auth_logout, version_text, wants_help, wants_version,
+        AuthError, AuthPaths, AuthPrompter, ProviderPreset, SecretKeyAction, SelectAction,
     };
     use crate::agent::message::Message;
     use crate::agent::DEFAULT_SYSTEM_PROMPT;
@@ -1242,5 +1276,61 @@ mod tests {
             ])
             .as_deref()
         );
+    }
+
+    #[test]
+    fn help_text_covers_key_usage() {
+        let text = help_text();
+        assert!(text.contains("mysteries"), "help 应含程序名");
+        assert!(text.contains("--headless"), "help 应说明 --headless");
+        assert!(text.contains("auth"), "help 应说明 auth 子命令");
+        assert!(text.contains("--help"), "help 应自述 --help");
+        assert!(text.contains("--version"), "help 应说明 --version");
+    }
+
+    #[test]
+    fn version_text_embeds_crate_version() {
+        let text = version_text();
+        assert!(text.contains("mysteries"), "version 应含程序名");
+        assert!(
+            text.contains(env!("CARGO_PKG_VERSION")),
+            "version 应含 CARGO_PKG_VERSION"
+        );
+    }
+
+    #[test]
+    fn wants_help_matches_exact_help_flags() {
+        assert!(wants_help(&["--help".to_string()]), "--help 应触发");
+        assert!(wants_help(&["-h".to_string()]), "-h 应触发");
+        assert!(
+            wants_help(&["--headless".to_string(), "--help".to_string()]),
+            "--help 混在其它参数中也应触发"
+        );
+    }
+
+    #[test]
+    fn wants_help_rejects_non_help_flags() {
+        assert!(!wants_help(&[]), "空参数不应触发 help");
+        assert!(
+            !wants_help(&["--headless".to_string()]),
+            "--headless 不应被误判为 help(防 contains(\"-h\") 类实现)"
+        );
+        assert!(
+            !wants_help(&["--foo".to_string()]),
+            "未知 flag 不应被判为 help"
+        );
+    }
+
+    #[test]
+    fn wants_version_matches_only_version_flag() {
+        assert!(
+            wants_version(&["--version".to_string()]),
+            "--version 应触发"
+        );
+        assert!(
+            !wants_version(&["--help".to_string()]),
+            "--help 不应触发 version"
+        );
+        assert!(!wants_version(&[]), "空参数不应触发 version");
     }
 }

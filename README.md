@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 [![CI](https://github.com/tajiaoyezi/mysteries/actions/workflows/ci.yml/badge.svg)](https://github.com/tajiaoyezi/mysteries/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-805%20passing-brightgreen.svg)](#-工程方法与质量)
+[![tests](https://img.shields.io/badge/tests-800%2B%20passing-brightgreen.svg)](#-工程方法与质量)
 [![no Agent SDK](https://img.shields.io/badge/Agent%20SDK-none%20(self--built)-blueviolet.svg)](#-架构总览)
 
 </div>
@@ -138,7 +138,7 @@ mysteries --headless "解释一下 src/agent 的结构"   # 无头单轮模式
 
 - **OpenSpec 流程**:每个变更 propose(proposal/design/tasks/spec delta)→ apply → archive。已归档 **56 个 change**,15+ 个能力域 spec 沉淀在 `openspec/specs/`(RFC 2119 风格),每个 change 附一条决策记录到 `.ai_history/logs/`。
 - **TDD**:内核(Loop / 工具 / 权限 / Provider 归一化 / 配置 merge)强制先测后码、红灯独立成步;TUI 外壳走 `TestBackend` + `insta` 快照事后回归。
-- **当前**:**805 tests 全绿**(797 lib + 8 e2e)、`clippy -D warnings` 零警告、行覆盖 **~91%**(llvm-cov;内核如 Agent Loop 99%、工具 96–100%)。
+- **当前**:**800+ tests 全绿**(lib 单测 + e2e 集成)、`clippy -D warnings` 零警告、行覆盖 **~91%**(llvm-cov;内核如 Agent Loop 99%、工具 96–100%)。
 - **CI**(`.github/workflows/ci.yml`):Windows + Linux 上强制 `fmt --check` + `clippy -D` + **全量 `cargo test`** + `build`。
 
 ```bash
