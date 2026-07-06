@@ -27,7 +27,7 @@ active = "wps"
 [providers.wps]
 kind = "openai"
 base_url = "https://ai-kas.kso.net/codeplan/v1"
-model = "zhipu/glm-5.2"
+model = "ali/qwen3.7-max"
 auth_type = "api_key"
 
 [providers.openai]

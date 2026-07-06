@@ -76,11 +76,19 @@
 ## 🚀 快速开始
 
 ```bash
-cargo build --release
-mysteries auth login      # 交互式配置 provider + API Key
-mysteries                 # 进入 TUI
+cargo build --release         # 二进制产出在 target/release/mysteries(.exe)
+cargo install --path .        # 安装到 ~/.cargo/bin,让 mysteries 全局可用(推荐)
+
+mysteries auth login          # 交互式配置 provider + API Key
+mysteries                     # 进入 TUI
 mysteries --headless "解释一下 src/agent 的结构"   # 无头单轮模式
 ```
+
+> 不想全局安装,也可直接用构建产物或 `cargo run`:
+> ```bash
+> ./target/release/mysteries auth login
+> cargo run --release -- --headless "..."
+> ```
 
 首次运行若未配置会自动进入 onboarding。
 
