@@ -5,12 +5,12 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› path=src/new_config.rs‹/›
-‹border.subtle›│ ‹/›‹success.fg›+ pub struct Config {‹/›
-‹border.subtle›│ ‹/›‹success.fg›+     pub timeout_secs: u64,‹/›
-‹border.subtle›│ ‹/›‹success.fg›+ }‹/›
-‹border.subtle›│ ‹/›‹text.body›created src/new_config.rs‹/›
-‹border.subtle›└───────────────────────────────────────────────────────────────────────────────‹/›
+‹text.secondary +bold›✻ 思考‹/›
+‹text.muted›  short thought 1‹/›
+‹text.muted›  short thought 2‹/›
+‹text.muted›  short thought 3‹/›
+‹text.muted›  short thought 4‹/›
+‹text.muted›  short thought 5‹/›
 
 
 
@@ -18,6 +18,10 @@ expression: text
 
 
 
+
+
+
+‹text.primary›                            ‹/›‹accent.primary bg=bg.surface›跳到底部 (ctrl+End) ↓‹/›
 
 
 ‹text.muted›◇ 就绪‹/›

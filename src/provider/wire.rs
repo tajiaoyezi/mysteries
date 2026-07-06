@@ -1,6 +1,7 @@
 use crate::agent::message::Message;
 use crate::error::ProviderError;
-use crate::provider::{FinishReason, ModelRequest, ModelResponse, ToolCall};
+use crate::provider::model_meta::{openai_thinking_capability, OpenAiThinking};
+use crate::provider::{Depth, FinishReason, ModelRequest, ModelResponse, ToolCall};
 use serde_json::{json, Value};
 
 pub fn serialize_request(req: &ModelRequest) -> Value {
@@ -14,8 +15,22 @@ pub fn serialize_request(req: &ModelRequest) -> Value {
         "messages": messages,
     });
 
-    if let Some(max_tokens) = req.max_tokens {
-        body["max_tokens"] = json!(max_tokens);
+    match openai_thinking_capability(&req.model) {
+        OpenAiThinking::Effort { max } => {
+            if let Some(max_tokens) = req.max_tokens {
+                body["max_completion_tokens"] = json!(max_tokens);
+            }
+            if let Some(config) = &req.thinking {
+                if config.depth != Depth::Off {
+                    body["reasoning_effort"] = json!(config.depth.as_effort(max));
+                }
+            }
+        }
+        OpenAiThinking::None => {
+            if let Some(max_tokens) = req.max_tokens {
+                body["max_tokens"] = json!(max_tokens);
+            }
+        }
     }
 
     if !req.tools.is_empty() {
@@ -48,7 +63,7 @@ fn serialize_message(message: &Message) -> Value {
             "role": "user",
             "content": content,
         }),
-        Message::Assistant { text, tool_calls } => {
+        Message::Assistant { text, tool_calls, .. } => {
             let content = if text.is_empty() && !tool_calls.is_empty() {
                 Value::Null
             } else {
@@ -115,6 +130,7 @@ pub fn parse_response(body: &Value) -> Result<ModelResponse, ProviderError> {
         tool_calls,
         finish_reason,
         usage: None,
+        thinking: Vec::new(),
     })
 }
 
@@ -172,7 +188,7 @@ mod tests {
     use super::{parse_response, serialize_request};
     use crate::agent::message::Message;
     use crate::error::ProviderError;
-    use crate::provider::{FinishReason, ModelRequest, ModelResponse, ToolCall, ToolSchema};
+    use crate::provider::{Depth, FinishReason, ModelRequest, ModelResponse, ThinkingConfig, ToolCall, ToolSchema};
     use serde_json::json;
 
     #[test]
@@ -189,6 +205,7 @@ mod tests {
                         name: "lookup".to_string(),
                         arguments: json!({ "query": "rust" }),
                     }],
+                    thinking: Vec::new(),
                 },
                 Message::ToolResult {
                     call_id: "call-1".to_string(),
@@ -198,6 +215,7 @@ mod tests {
             ],
             tools: Vec::new(),
             max_tokens: Some(128),
+            thinking: None,
         };
 
         let body = serialize_request(&req);
@@ -263,6 +281,7 @@ mod tests {
                 },
             ],
             max_tokens: None,
+            thinking: None,
         };
 
         let body = serialize_request(&req);
@@ -305,6 +324,7 @@ mod tests {
             messages: vec![Message::User("no tools".to_string())],
             tools: Vec::new(),
             max_tokens: None,
+        thinking: None,
         };
 
         assert!(serialize_request(&no_tools_req).get("tools").is_none());
@@ -331,6 +351,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
+            thinking: Vec::new(),
             }
         );
     }
@@ -413,5 +434,111 @@ mod tests {
         let err = parse_response(&json!({ "choices": [] })).unwrap_err();
 
         assert!(matches!(err, ProviderError::Decode(_)));
+    }
+
+    #[test]
+    fn reasoning_model_medium_emits_max_completion_tokens_and_reasoning_effort() {
+        let req = ModelRequest {
+            model: "gpt-5".to_string(),
+            messages: vec![Message::User("hello".to_string())],
+            tools: Vec::new(),
+            max_tokens: Some(128),
+            thinking: Some(ThinkingConfig {
+                depth: Depth::Medium,
+            }),
+        };
+
+        let body = serialize_request(&req);
+
+        assert_eq!(body["max_completion_tokens"], json!(128));
+        assert_eq!(body["reasoning_effort"], json!("medium"));
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn reasoning_model_off_uses_max_completion_tokens_without_reasoning_effort() {
+        let req = ModelRequest {
+            model: "gpt-5".to_string(),
+            messages: vec![Message::User("hello".to_string())],
+            tools: Vec::new(),
+            max_tokens: Some(128),
+            thinking: Some(ThinkingConfig {
+                depth: Depth::Off,
+            }),
+        };
+
+        let body = serialize_request(&req);
+
+        assert_eq!(body["max_completion_tokens"], json!(128));
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn non_reasoning_model_keeps_max_tokens_without_reasoning_effort() {
+        let req = ModelRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message::User("hello".to_string())],
+            tools: Vec::new(),
+            max_tokens: Some(128),
+            thinking: Some(ThinkingConfig {
+                depth: Depth::High,
+            }),
+        };
+
+        let body = serialize_request(&req);
+
+        assert_eq!(body["max_tokens"], json!(128));
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    #[ignore = "manual: cargo test dump_openai_wire_samples --lib -- --ignored --nocapture"]
+    fn dump_openai_wire_samples() {
+        let dump = |name: &str, body: &serde_json::Value| {
+            eprintln!(
+                "=== {} ===\n{}",
+                name,
+                serde_json::to_string_pretty(body).unwrap()
+            );
+        };
+
+        dump(
+            "openai_gpt5_medium",
+            &serialize_request(&ModelRequest {
+                model: "gpt-5".to_string(),
+                messages: vec![Message::User("hi".to_string())],
+                tools: Vec::new(),
+                max_tokens: Some(128),
+                thinking: Some(ThinkingConfig {
+                    depth: Depth::Medium,
+                }),
+            }),
+        );
+        dump(
+            "openai_gpt5_off",
+            &serialize_request(&ModelRequest {
+                model: "gpt-5".to_string(),
+                messages: vec![Message::User("hi".to_string())],
+                tools: Vec::new(),
+                max_tokens: Some(128),
+                thinking: Some(ThinkingConfig {
+                    depth: Depth::Off,
+                }),
+            }),
+        );
+        dump(
+            "openai_unknown_none",
+            &serialize_request(&ModelRequest {
+                model: "totally-unknown-model".to_string(),
+                messages: vec![Message::User("hi".to_string())],
+                tools: Vec::new(),
+                max_tokens: Some(128),
+                thinking: Some(ThinkingConfig {
+                    depth: Depth::High,
+                }),
+            }),
+        );
     }
 }

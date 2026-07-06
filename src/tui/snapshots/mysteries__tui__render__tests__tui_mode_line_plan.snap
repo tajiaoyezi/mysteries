@@ -2,4 +2,4 @@
 source: src/tui/render.rs
 expression: mode_line(&text)
 ---
-‹info.fg›◔ plan‹/›‹text.muted› · shift+tab 切换‹/›
+‹info.fg›◔ plan‹/›‹text.muted› · shift+tab 切换 · think low‹/›

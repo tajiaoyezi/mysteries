@@ -9,12 +9,12 @@ pub use context::{ContextError, ContextStrategy, Passthrough};
 use crate::agent::message::Message;
 use crate::error::{AgentError, ProviderError};
 use crate::permission::{gate, PermissionDecider, PermissionDecision, PermissionMode};
-use crate::provider::{DeltaSink, ModelRequest, Provider, Usage};
+use crate::provider::{Depth, DeltaSink, ModelRequest, Provider, ThinkingConfig, Usage};
 use crate::tool::{PermissionLevel, ToolContext, ToolOutcome, ToolRegistry};
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant. Do not claim to be Claude, ChatGPT, OpenAI, Anthropic, or any specific upstream model. If asked about your model identity, say you are running inside Mysteries and the configured model name is shown in the status line.";
-pub const PLAN_MODE_INSTRUCTION: &str = "你在 plan 模式(只读:read_file/grep/glob/web_*,不改文件/不执行命令)。用户只是问 → 直接答;撞到岔路/歧义 → ask_user 弹选项让用户定;用户要执行任务 → 调研够了 submit_plan 交结构化 plan、每步带可验收 validation";
+pub const PLAN_MODE_INSTRUCTION: &str = "你在 plan 模式(只读:read_file/grep/glob/web_*,不改文件/不执行命令)。用户只是问 → 直接答;撞到岔路/歧义 → ask_user 弹选项让用户定;用户要执行任务 → 调研够了 submit_plan 交结构化 plan、每步带可验收 validation。每步 description 一句话简述(尽量 ≤30 字),不写长段落、不堆细节;细节留到执行时或放进 validation";
 const DEFAULT_MODEL: &str = "mock-model";
 
 pub async fn run_single_turn(
@@ -32,6 +32,7 @@ pub async fn run_single_turn(
                 ],
                 tools: Vec::new(),
                 max_tokens: None,
+                thinking: None,
             },
             sink,
         )
@@ -77,6 +78,7 @@ pub struct Agent {
     max_iterations: u32,
     strategy: Box<dyn ContextStrategy>,
     permission_mode: Arc<Mutex<PermissionMode>>,
+    thinking_depth: Arc<Mutex<Depth>>,
 }
 
 impl Agent {
@@ -95,14 +97,24 @@ impl Agent {
             max_iterations,
             strategy: Box::new(Passthrough),
             permission_mode: Arc::new(Mutex::new(PermissionMode::Normal)),
+            thinking_depth: Arc::new(Mutex::new(Depth::Low)),
         }
+    }
+
+    pub fn set_thinking_depth(&mut self, depth: Arc<Mutex<Depth>>) {
+        self.thinking_depth = depth;
     }
 
     pub fn set_permission_mode(&mut self, mode: Arc<Mutex<PermissionMode>>) {
         self.permission_mode = mode;
     }
 
-    pub fn set_model(&mut self, model: String) {
+    pub fn set_model(&mut self, model: String, history: &mut [Message]) {
+        for message in history.iter_mut() {
+            if let Message::Assistant { thinking, .. } = message {
+                thinking.clear();
+            }
+        }
         self.model = model.clone();
         self.strategy.set_model(model);
     }
@@ -136,6 +148,10 @@ impl Agent {
 
         for _ in 0..self.max_iterations {
             observer.on_status(AgentStatus::CallingModel);
+            let depth = *self
+                .thinking_depth
+                .lock()
+                .expect("thinking_depth mutex poisoned");
             let mode = *self
                 .permission_mode
                 .lock()
@@ -152,12 +168,14 @@ impl Agent {
                         messages: msgs,
                         tools: self.registry.schemas_for(mode),
                         max_tokens: None,
+                        thinking: Some(ThinkingConfig { depth }),
                     },
                     sink,
                 )
                 .await?;
             let text = response.text;
             let tool_calls = response.tool_calls;
+            let thinking = response.thinking;
             last_usage = response.usage;
             if let Some(ref usage) = last_usage {
                 observer.on_usage(usage);
@@ -166,6 +184,7 @@ impl Agent {
             history.push(Message::Assistant {
                 text: text.clone(),
                 tool_calls: tool_calls.clone(),
+                thinking,
             });
 
             if tool_calls.is_empty() {
@@ -259,6 +278,10 @@ impl Agent {
             }
         }
 
+        let depth = *self
+            .thinking_depth
+            .lock()
+            .expect("thinking_depth mutex poisoned");
         let msgs = self.strategy.prepare(history, last_usage.as_ref()).await?;
         let response = self
             .provider
@@ -268,16 +291,19 @@ impl Agent {
                     messages: msgs,
                     tools: Vec::new(),
                     max_tokens: None,
+                    thinking: Some(ThinkingConfig { depth }),
                 },
                 sink,
             )
             .await?;
         let text = response.text;
         let tool_calls = response.tool_calls;
+        let thinking = response.thinking;
 
         history.push(Message::Assistant {
             text: text.clone(),
             tool_calls,
+            thinking,
         });
 
         if text.is_empty() {
@@ -306,7 +332,7 @@ mod tests {
     use crate::error::{AgentError, ProviderError};
     use crate::permission::{PermissionDecider, PermissionDecision, PermissionMode};
     use crate::provider::mock::MockProvider;
-    use crate::provider::{DeltaSink, FinishReason, ModelResponse, Provider, ToolCall, Usage};
+    use crate::provider::{Depth, DeltaSink, FinishReason, ModelResponse, Provider, ThinkingBlock, ThinkingConfig, ToolCall, Usage};
     use crate::tool::edit::WriteFileTool;
     use crate::tool::plan::{MockPlanApprover, Plan, PlanApprover, PlanDecision, SubmitPlanTool};
     use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome, ToolRegistry};
@@ -399,12 +425,26 @@ mod tests {
         }
     }
 
+    fn tool_response_with_thinking(
+        tool_calls: Vec<ToolCall>,
+        thinking: Vec<ThinkingBlock>,
+    ) -> ModelResponse {
+        ModelResponse {
+            text: String::new(),
+            tool_calls,
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+            thinking,
+        }
+    }
+
     fn response(text: &str) -> ModelResponse {
         ModelResponse {
             text: text.to_string(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
+        thinking: Vec::new(),
         }
     }
 
@@ -414,6 +454,7 @@ mod tests {
             tool_calls,
             finish_reason: FinishReason::ToolCalls,
             usage: None,
+        thinking: Vec::new(),
         }
     }
 
@@ -423,6 +464,7 @@ mod tests {
             tool_calls,
             finish_reason: FinishReason::ToolCalls,
             usage: Some(usage),
+        thinking: Vec::new(),
         }
     }
 
@@ -432,6 +474,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: Some(usage),
+        thinking: Vec::new(),
         }
     }
 
@@ -478,6 +521,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
+            thinking: Vec::new(),
             })
         }
     }
@@ -781,6 +825,7 @@ mod tests {
             Some(&Message::Assistant {
                 text: "final reply".to_string(),
                 tool_calls: Vec::new(),
+            thinking: Vec::new(),
             })
         );
         assert_eq!(provider.recorded_requests().len(), 1);
@@ -799,7 +844,7 @@ mod tests {
         let sink = NoopSink;
         let mut history = vec![Message::User("hello".to_string())];
 
-        agent.set_model("m2".to_string());
+        agent.set_model("m2".to_string(), &mut history);
         let text = agent.run(&mut history, &ctx(), &sink).await.unwrap();
 
         assert_eq!(text, "after switch");
@@ -824,7 +869,7 @@ mod tests {
         }));
 
         agent.set_provider(new_provider);
-        agent.set_model("m2".to_string());
+        agent.set_model("m2".to_string(), &mut []);
 
         assert_eq!(
             recorder.provider_names.lock().unwrap().as_slice(),
@@ -916,6 +961,7 @@ mod tests {
                     name: "echo".to_string(),
                     arguments: json!({ "input": "from tool" }),
                 }],
+                thinking: Vec::new(),
             }
         );
         assert_eq!(
@@ -931,6 +977,7 @@ mod tests {
             Message::Assistant {
                 text: "done".to_string(),
                 tool_calls: Vec::new(),
+            thinking: Vec::new(),
             }
         );
 
@@ -1267,6 +1314,7 @@ mod tests {
             Some(&Message::Assistant {
                 text: "forced final".to_string(),
                 tool_calls: Vec::new(),
+            thinking: Vec::new(),
             })
         );
 
@@ -1564,5 +1612,135 @@ mod tests {
                 ..
             } if call_id == "call-plan"
         ));
+    }
+
+    #[tokio::test]
+    async fn run_observed_forced_final_request_carries_current_thinking_depth() {
+        let depth = Arc::new(Mutex::new(Depth::High));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "echo".to_string(),
+                arguments: json!({ "input": "loop" }),
+            }]),
+            response("forced final"),
+        ]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            registry_with_echo(),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            1,
+        );
+        agent.set_thinking_depth(depth);
+        let sink = NoopSink;
+        let mut history = vec![Message::User("hello".to_string())];
+
+        let text = agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        assert_eq!(text, "forced final");
+        let recorded = provider.recorded_requests();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(
+            recorded[0].thinking,
+            Some(ThinkingConfig {
+                depth: Depth::High,
+            })
+        );
+        assert_eq!(
+            recorded[1].thinking,
+            Some(ThinkingConfig {
+                depth: Depth::High,
+            }),
+            "forced-final must re-read depth snapshot outside the loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_observed_round_trips_assistant_thinking_in_history() {
+        let thinking = vec![ThinkingBlock {
+            text: "plan".to_string(),
+            signature: Some("sig-abc".to_string()),
+            redacted: false,
+        }];
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response_with_thinking(
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({ "input": "first" }),
+                }],
+                thinking.clone(),
+            ),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_echo(),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let mut history = vec![Message::User("hello".to_string())];
+
+        let text = agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        assert_eq!(text, "done");
+        assert_eq!(
+            history[1],
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({ "input": "first" }),
+                }],
+                thinking: thinking.clone(),
+            }
+        );
+        let recorded = provider.recorded_requests();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded[1].messages.iter().any(|msg| {
+            matches!(
+                msg,
+                Message::Assistant {
+                    thinking: roundtrip,
+                    ..
+                } if *roundtrip == thinking
+            )
+        }));
+    }
+
+    #[test]
+    fn set_model_strips_assistant_thinking_from_history() {
+        let provider = Arc::new(NamedProvider("mock"));
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            Box::new(AllowAll),
+            "m1".to_string(),
+            4,
+        );
+        let mut history = vec![Message::Assistant {
+            text: "done".to_string(),
+            tool_calls: Vec::new(),
+            thinking: vec![ThinkingBlock {
+                text: "secret".to_string(),
+                signature: Some("sig-cross-model".to_string()),
+                redacted: false,
+            }],
+        }];
+
+        agent.set_model("m2".to_string(), &mut history);
+
+        assert_eq!(
+            history,
+            vec![Message::Assistant {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                thinking: Vec::new(),
+            }]
+        );
     }
 }

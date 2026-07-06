@@ -2,15 +2,16 @@ use crate::agent::message::Message;
 use crate::agent::AgentStatus;
 use crate::config::ProviderProfile;
 use crate::permission::{cycle_permission_mode, PermissionMode, PermissionReply};
+use crate::provider::model_meta::{anthropic_thinking_capability, AnthropicThinking};
 use crate::provider::registry::models_for;
-use crate::provider::Usage;
+use crate::provider::{Depth, Usage};
 use crate::session::SessionSummary;
 use crate::tool::ask::Answer;
 use crate::tool::plan::{Plan, PlanDecision, PlanProgressUpdate, StepStatus};
 use crate::tui::channel::{
     AgentEvent, PermissionRequest, PlanApprovalRequest, QuestionRequest, UserInput,
 };
-use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata};
+use crate::tui::command::{command_metadata, parse_command, Command, CommandMetadata, ThinkArg};
 use crate::tui::input_batch::{PasteTailMatcher, TailAction};
 use crate::tui::input_buffer::{reduce_input_buffer, InputBufferAction, InputBufferState};
 use crate::tui::jump_to_bottom::{bump_new_message_count, new_message_count_on_follow_bottom};
@@ -26,6 +27,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const ASCII_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+pub const THINK_DEPTH_OPTIONS: &str = "off, low, medium, high, xhigh";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -53,6 +55,7 @@ pub enum TranscriptBlock {
     Help,
     Status(StatusSnapshot),
     Notice(String),
+    Thinking(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -465,6 +468,7 @@ pub struct AppState {
     pub input_line: InputBufferState,
     pub selection: SelectionState,
     pub permission_mode: Arc<Mutex<PermissionMode>>,
+    pub thinking_depth: Arc<Mutex<Depth>>,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
     pub pending_plan_approval: Option<PlanApprovalRequest>,
@@ -563,6 +567,7 @@ impl AppState {
             input_line: InputBufferState::default(),
             selection: SelectionState::default(),
             permission_mode: Arc::new(Mutex::new(PermissionMode::Normal)),
+            thinking_depth: Arc::new(Mutex::new(Depth::Low)),
             phase: Phase::Ready,
             pending_permission: None,
             pending_plan_approval: None,
@@ -762,6 +767,44 @@ impl AppState {
             .permission_mode
             .lock()
             .expect("permission mode mutex poisoned")
+    }
+
+    pub fn current_thinking_depth(&self) -> Depth {
+        *self
+            .thinking_depth
+            .lock()
+            .expect("thinking depth mutex poisoned")
+    }
+
+    pub fn thinking_cannot_disable_active(&self) -> bool {
+        if self.current_thinking_depth() != Depth::Off {
+            return false;
+        }
+        matches!(
+            anthropic_thinking_capability(&self.session.model),
+            AnthropicThinking::Adaptive {
+                can_disable: false,
+                ..
+            }
+        )
+    }
+
+    fn maybe_notice_thinking_cannot_disable(&mut self) {
+        if self.thinking_cannot_disable_active() {
+            self.transcript.push(TranscriptBlock::Notice(
+                "该模型思考无法关闭".to_string(),
+            ));
+        }
+    }
+
+    pub fn depth_label(depth: Depth) -> &'static str {
+        match depth {
+            Depth::Off => "off",
+            Depth::Low => "low",
+            Depth::Medium => "medium",
+            Depth::High => "high",
+            Depth::Xhigh => "xhigh",
+        }
     }
 
     pub fn has_pending_dialog(&self) -> bool {
@@ -1138,6 +1181,15 @@ impl AppState {
                 match self.transcript.last_mut() {
                     Some(TranscriptBlock::Assistant(current)) => current.push_str(&text),
                     _ => self.transcript.push(TranscriptBlock::Assistant(text)),
+                }
+            }
+            AgentEvent::ThinkingDelta(text) => {
+                if self.phase == Phase::Ready {
+                    self.phase = Phase::Busy;
+                }
+                match self.transcript.last_mut() {
+                    Some(TranscriptBlock::Thinking(current)) => current.push_str(&text),
+                    _ => self.transcript.push(TranscriptBlock::Thinking(text)),
                 }
             }
             AgentEvent::ToolCallStarted {
@@ -1529,6 +1581,7 @@ impl AppState {
             Command::Model(Some(model)) => {
                 self.session.model = model.clone();
                 let _ = _input_tx.send(UserInput::SetModel(model));
+                self.maybe_notice_thinking_cannot_disable();
             }
             Command::Compact => {
                 // 仅就绪且无排队时可发起:压缩期间 phase 非 Ready,后续提交自然入队;
@@ -1543,6 +1596,32 @@ impl AppState {
                 }
             }
             Command::Models => self.open_models_picker(),
+            Command::Think(arg) => match arg {
+                ThinkArg::Query => {
+                    let current = self.current_thinking_depth();
+                    self.transcript.push(TranscriptBlock::Notice(format!(
+                        "当前思考档位: {} — 可选: {}",
+                        Self::depth_label(current),
+                        THINK_DEPTH_OPTIONS
+                    )));
+                }
+                ThinkArg::Set(depth) => {
+                    *self
+                        .thinking_depth
+                        .lock()
+                        .expect("thinking depth mutex poisoned") = depth;
+                    self.transcript.push(TranscriptBlock::Notice(format!(
+                        "思考档位已设为 {}",
+                        Self::depth_label(depth)
+                    )));
+                    self.maybe_notice_thinking_cannot_disable();
+                }
+                ThinkArg::Invalid(value) => {
+                    self.transcript.push(TranscriptBlock::Notice(format!(
+                        "无效档位 \"{value}\" — 可选: {THINK_DEPTH_OPTIONS}"
+                    )));
+                }
+            },
         }
     }
 
@@ -1858,6 +1937,7 @@ mod tests {
             TranscriptBlock::Help,
             TranscriptBlock::Status(status_snapshot()),
             TranscriptBlock::Notice("session saved".to_string()),
+            TranscriptBlock::Thinking("reasoning trace".to_string()),
         ];
 
         for block in blocks {
@@ -3312,7 +3392,16 @@ mod tests {
         state.on_key(key(KeyCode::Char('/')), &tx);
         assert_eq!(
             completion_names(&state),
-            vec!["/help", "/clear", "/model", "/models", "/status", "/exit", "/compact"]
+            vec![
+                "/help",
+                "/clear",
+                "/model",
+                "/models",
+                "/status",
+                "/exit",
+                "/compact",
+                "/think",
+            ]
         );
         assert_eq!(selected_completion_name(&state), "/help");
 

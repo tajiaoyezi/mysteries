@@ -107,6 +107,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
     let permission_mode = Arc::new(std::sync::Mutex::new(PermissionMode::Normal));
+    let thinking_depth = Arc::new(std::sync::Mutex::new(config.thinking));
     let mut assembled = crate::app::assemble_agent(
         provider,
         &config,
@@ -126,6 +127,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
         ))),
     );
     assembled.agent.set_permission_mode(permission_mode.clone());
+    assembled.agent.set_thinking_depth(thinking_depth.clone());
     let compacting = assembled.compacting;
     let agent = assembled.agent;
     let agent_history = Arc::new(Mutex::new(session_startup.history));
@@ -162,7 +164,13 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
     );
     state.provider_profiles = profiles;
     state.permission_mode = permission_mode;
+    state.thinking_depth = thinking_depth;
     state.transcript = session_startup.transcript;
+    if state.thinking_cannot_disable_active() {
+        state
+            .transcript
+            .push(app::TranscriptBlock::Notice("该模型思考无法关闭".to_string()));
+    }
     if mode == StartupMode::Resume {
         let summaries = store.list_sessions().map_err(cli_io_error)?;
         if !summaries.is_empty() {
@@ -1351,8 +1359,12 @@ pub async fn run_agent_task(
     } = task_config;
     while let Some(input) = input_rx.recv().await {
         match input {
-            channel::UserInput::SetModel(model) => agent.set_model(model),
+            channel::UserInput::SetModel(model) => {
+                let mut history = agent_history.lock().await;
+                agent.set_model(model, &mut history);
+            }
             channel::UserInput::SetProvider { id, model } => {
+                let mut history = agent_history.lock().await;
                 if let Err(notice) = apply_set_provider(
                     &profiles,
                     &startup_config,
@@ -1361,6 +1373,7 @@ pub async fn run_agent_task(
                     &model,
                     &mut agent,
                     &mut compacting,
+                    &mut history,
                 ) {
                     let _ = ui_tx.send(channel::AgentEvent::Notice(notice));
                 }
@@ -1413,6 +1426,7 @@ fn build_credential_chain(credentials_path: &std::path::Path) -> CredentialChain
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_set_provider(
     profiles: &BTreeMap<String, ProviderProfile>,
     startup_config: &Config,
@@ -1421,6 +1435,7 @@ fn apply_set_provider(
     model: &str,
     agent: &mut Agent,
     compacting: &mut Compacting,
+    history: &mut [Message],
 ) -> Result<(), String> {
     let Some(profile) = profiles.get(id) else {
         return Err(format!("未知 provider: {id}"));
@@ -1445,11 +1460,12 @@ fn apply_set_provider(
         model_context_window: startup_config.model_context_window,
         compact_trigger_ratio: startup_config.compact_trigger_ratio,
         keep_recent_turns: startup_config.keep_recent_turns,
+        thinking: startup_config.thinking,
     };
 
     let provider = select_provider(&transient, credentials).map_err(|err| err.to_string())?;
     agent.set_provider(provider.clone());
-    agent.set_model(model.to_string());
+    agent.set_model(model.to_string(), history);
     compacting.set_provider(provider);
     compacting.set_model(model.to_string());
 
@@ -1488,7 +1504,7 @@ mod tests {
     use crate::cli::CliPaths;
     use crate::config::{
         AuthType, Config, ProviderConfig, ProviderKind, ProviderProfile,
-        DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS,
+        DEFAULT_COMPACT_TRIGGER_RATIO, DEFAULT_KEEP_RECENT_TURNS, DEFAULT_THINKING,
     };
     use crate::error::ProviderError;
     use crate::permission::{PermissionMode, PermissionReply, PolicyEngine};
@@ -1571,6 +1587,7 @@ mod tests {
             model_context_window: None,
             compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
             keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
+            thinking: DEFAULT_THINKING,
         }
     }
 
@@ -1608,6 +1625,33 @@ mod tests {
                 max_output_bytes: 4096,
             },
         }
+    }
+
+    #[test]
+    fn thinking_depth_injection_matches_config() {
+        use crate::provider::Depth;
+
+        let mut cfg = config();
+        cfg.thinking = Depth::Medium;
+        let thinking_depth = Arc::new(std::sync::Mutex::new(cfg.thinking));
+        let mut assembled = assemble_agent(
+            Arc::new(MockProvider::new(vec![ModelResponse {
+                text: "ok".to_string(),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            }])),
+            &cfg,
+            Box::new(normal_channel_decider(mpsc::unbounded_channel().0)),
+            None,
+            None,
+            None,
+        );
+        assembled.agent.set_thinking_depth(thinking_depth.clone());
+        assert_eq!(*thinking_depth.lock().unwrap(), Depth::Medium);
+        *thinking_depth.lock().unwrap() = Depth::High;
+        assert_eq!(*thinking_depth.lock().unwrap(), Depth::High);
     }
 
     #[test]
@@ -1773,6 +1817,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
+            thinking: Vec::new(),
             })
         }
     }
@@ -2586,12 +2631,14 @@ mod tests {
                 }],
                 finish_reason: FinishReason::ToolCalls,
                 usage: None,
+                thinking: Vec::new(),
             },
             ModelResponse {
                 text: "done".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
+            thinking: Vec::new(),
             },
         ]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -2706,12 +2753,14 @@ mod tests {
                 }],
                 finish_reason: FinishReason::ToolCalls,
                 usage: None,
+                thinking: Vec::new(),
             },
             ModelResponse {
                 text: "done".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
+            thinking: Vec::new(),
             },
         ]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -2786,6 +2835,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
+        thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
@@ -2837,12 +2887,14 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
+            thinking: Vec::new(),
             },
             ModelResponse {
                 text: "second reply".to_string(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
+            thinking: Vec::new(),
             },
         ]));
         let history = agent_history();
@@ -2897,7 +2949,7 @@ mod tests {
             second_request_messages.iter().any(|msg| {
                 matches!(
                     msg,
-                    Message::Assistant { text, tool_calls }
+                    Message::Assistant { text, tool_calls, .. }
                         if text == "first reply" && tool_calls.is_empty()
                 )
             }),
@@ -3066,6 +3118,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
+        thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
@@ -3135,6 +3188,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
+        thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
@@ -3195,6 +3249,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
+        thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
@@ -3292,6 +3347,7 @@ model = "zhipu/glm-5.2"
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
+        thinking: Vec::new(),
         }]));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();

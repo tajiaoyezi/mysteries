@@ -2,4 +2,4 @@
 source: src/tui/render.rs
 expression: mode_line(&text)
 ---
-‹warning.fg›▲ yolo‹/›‹text.muted› · shift+tab 切换‹/›
+‹warning.fg›▲ yolo‹/›‹text.muted› · shift+tab 切换 · think low‹/›

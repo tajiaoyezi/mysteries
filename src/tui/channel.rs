@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Debug)]
 pub enum AgentEvent {
     TextDelta(String),
+    ThinkingDelta(String),
     ToolCallStarted {
         id: String,
         name: String,
@@ -92,6 +93,14 @@ impl DeltaSink for ChannelSink {
         }
 
         let _ = self.tx.send(AgentEvent::TextDelta(text.to_string()));
+    }
+
+    fn on_thinking(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let _ = self.tx.send(AgentEvent::ThinkingDelta(text.to_string()));
     }
 }
 

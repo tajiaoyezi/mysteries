@@ -1,6 +1,6 @@
 use crate::error::ProviderError;
 use crate::provider::transport::SseAccumulator;
-use crate::provider::{DeltaSink, FinishReason, ModelResponse, ToolCall, Usage};
+use crate::provider::{DeltaSink, FinishReason, ModelResponse, ThinkingBlock, ToolCall, Usage};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -8,6 +8,7 @@ pub struct AnthropicAccumulator {
     buffer: Vec<u8>,
     text: String,
     tool_calls: BTreeMap<usize, PartialToolUse>,
+    thinking_blocks: BTreeMap<usize, PartialThinkingBlock>,
     finish_reason: FinishReason,
     usage_input_tokens: Option<u32>,
     usage_output_tokens: Option<u32>,
@@ -22,12 +23,20 @@ struct PartialToolUse {
     input_json: String,
 }
 
+#[derive(Default)]
+struct PartialThinkingBlock {
+    text: String,
+    signature: Option<String>,
+    redacted: bool,
+}
+
 impl AnthropicAccumulator {
     pub fn new() -> Self {
         Self {
             buffer: Vec::new(),
             text: String::new(),
             tool_calls: BTreeMap::new(),
+            thinking_blocks: BTreeMap::new(),
             finish_reason: FinishReason::Other(String::new()),
             usage_input_tokens: None,
             usage_output_tokens: None,
@@ -118,27 +127,41 @@ impl AnthropicAccumulator {
             return Ok(());
         };
 
-        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+        if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+            let partial = self.tool_calls.entry(index).or_default();
+            if partial.id.is_none() {
+                if let Some(id) = block.get("id").and_then(Value::as_str) {
+                    partial.id = Some(id.to_string());
+                }
+            }
+            if partial.name.is_none() {
+                if let Some(name) = block.get("name").and_then(Value::as_str) {
+                    partial.name = Some(name.to_string());
+                }
+            }
+
+            if partial.input_json.is_empty() {
+                if let Some(input) = block.get("input") {
+                    if input.is_object() && input.as_object().is_some_and(|object| !object.is_empty())
+                    {
+                        partial.input_json = serde_json::to_string(input).expect("Value serializes");
+                    }
+                }
+            }
+
             return Ok(());
         }
 
-        let partial = self.tool_calls.entry(index).or_default();
-        if partial.id.is_none() {
-            if let Some(id) = block.get("id").and_then(Value::as_str) {
-                partial.id = Some(id.to_string());
-            }
-        }
-        if partial.name.is_none() {
-            if let Some(name) = block.get("name").and_then(Value::as_str) {
-                partial.name = Some(name.to_string());
-            }
+        if block.get("type").and_then(Value::as_str) == Some("thinking") {
+            self.thinking_blocks.entry(index).or_default();
+            return Ok(());
         }
 
-        if partial.input_json.is_empty() {
-            if let Some(input) = block.get("input") {
-                if input.is_object() && input.as_object().is_some_and(|object| !object.is_empty()) {
-                    partial.input_json = serde_json::to_string(input).expect("Value serializes");
-                }
+        if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+            let partial = self.thinking_blocks.entry(index).or_default();
+            partial.redacted = true;
+            if let Some(data) = block.get("data").and_then(Value::as_str) {
+                partial.signature = Some(data.to_string());
             }
         }
 
@@ -187,6 +210,30 @@ impl AnthropicAccumulator {
                     .or_default()
                     .input_json
                     .push_str(partial_json);
+            }
+            Some("thinking_delta") => {
+                let text = delta
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::Decode("thinking_delta.thinking missing".to_string())
+                    })?;
+                let partial = self.thinking_blocks.entry(index).or_default();
+                partial.text.push_str(text);
+                sink.on_thinking(text);
+            }
+            Some("signature_delta") => {
+                let signature = delta
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::Decode("signature_delta.signature missing".to_string())
+                    })?;
+                let partial = self.thinking_blocks.entry(index).or_default();
+                match &mut partial.signature {
+                    Some(existing) => existing.push_str(signature),
+                    None => partial.signature = Some(signature.to_string()),
+                }
             }
             Some(_) | None => {}
         }
@@ -241,11 +288,21 @@ impl AnthropicAccumulator {
             });
         }
 
+        let mut thinking = Vec::new();
+        for partial in self.thinking_blocks.values() {
+            thinking.push(ThinkingBlock {
+                text: partial.text.clone(),
+                signature: partial.signature.clone(),
+                redacted: partial.redacted,
+            });
+        }
+
         Ok(ModelResponse {
             text: self.text.clone(),
             tool_calls,
             finish_reason: self.finish_reason.clone(),
             usage: self.usage(),
+            thinking,
         })
     }
 
@@ -334,7 +391,7 @@ mod tests {
     use super::AnthropicAccumulator;
     use crate::error::ProviderError;
     use crate::provider::transport::accumulate_stream;
-    use crate::provider::{DeltaSink, FinishReason, ToolCall, Usage};
+    use crate::provider::{DeltaSink, FinishReason, ThinkingBlock, ToolCall, Usage};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -548,5 +605,111 @@ data: {"type":"message_stop"}
 
         assert!(matches!(err, ProviderError::Decode(message) if message.contains("tool_use")));
         assert_eq!(sink.chunks(), Vec::<String>::new());
+    }
+
+    struct ThinkingCaptureSink {
+        text: Mutex<Vec<String>>,
+        thinking: Mutex<Vec<String>>,
+    }
+
+    impl ThinkingCaptureSink {
+        fn new() -> Self {
+            Self {
+                text: Mutex::new(Vec::new()),
+                thinking: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DeltaSink for ThinkingCaptureSink {
+        fn on_text(&self, text: &str) {
+            self.text.lock().unwrap().push(text.to_string());
+        }
+
+        fn on_thinking(&self, text: &str) {
+            self.thinking.lock().unwrap().push(text.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_thinking_and_signature_accumulate_into_model_response() {
+        let sink = ThinkingCaptureSink::new();
+        let stream = futures_util::stream::iter([Ok::<_, &'static str>(
+            br#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me "}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"done"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+        )]);
+
+        let response =
+            accumulate_stream(stream, &sink, AnthropicAccumulator::new(), PROVIDER_LABEL)
+                .await
+                .unwrap();
+
+        assert_eq!(*sink.thinking.lock().unwrap(), vec!["Let me ", "think"]);
+        assert_eq!(response.text, "done");
+        assert_eq!(
+            response.thinking,
+            vec![ThinkingBlock {
+                text: "Let me think".to_string(),
+                signature: Some("sig-1".to_string()),
+                redacted: false,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_redacted_thinking_block_is_marked_redacted() {
+        let sink = CaptureSink::new();
+        let stream = futures_util::stream::iter([Ok::<_, &'static str>(
+            br#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"secret"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+        )]);
+
+        let response =
+            accumulate_stream(stream, &sink, AnthropicAccumulator::new(), PROVIDER_LABEL)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            response.thinking,
+            vec![ThinkingBlock {
+                text: String::new(),
+                signature: Some("secret".to_string()),
+                redacted: true,
+            }]
+        );
     }
 }

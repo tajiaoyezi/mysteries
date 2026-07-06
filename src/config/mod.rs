@@ -5,10 +5,13 @@ use std::io::ErrorKind;
 use std::path::Path;
 use thiserror::Error;
 
+use crate::provider::Depth;
+
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_COMPACT_TRIGGER_RATIO: f32 = 0.8;
 pub const DEFAULT_KEEP_RECENT_TURNS: u32 = 1;
+pub const DEFAULT_THINKING: Depth = Depth::Low;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -20,6 +23,7 @@ pub struct Config {
     pub model_context_window: Option<u32>,
     pub compact_trigger_ratio: f32,
     pub keep_recent_turns: u32,
+    pub thinking: Depth,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -44,6 +48,8 @@ pub struct RawConfig {
     pub compact_trigger_ratio: Option<f32>,
     #[serde(default)]
     pub keep_recent_turns: Option<u32>,
+    #[serde(default)]
+    pub thinking: Option<Depth>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,6 +228,7 @@ pub fn merge(user: RawConfig, project: RawConfig) -> RawConfig {
         model_context_window: project.model_context_window.or(user.model_context_window),
         compact_trigger_ratio: project.compact_trigger_ratio.or(user.compact_trigger_ratio),
         keep_recent_turns: project.keep_recent_turns.or(user.keep_recent_turns),
+        thinking: project.thinking.or(user.thinking),
     }
 }
 
@@ -323,6 +330,7 @@ pub fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         model_context_window: raw.model_context_window,
         compact_trigger_ratio,
         keep_recent_turns: raw.keep_recent_turns.unwrap_or(DEFAULT_KEEP_RECENT_TURNS),
+        thinking: raw.thinking.unwrap_or(DEFAULT_THINKING),
     })
 }
 
@@ -449,8 +457,9 @@ mod tests {
     use super::{
         append_allowed_command, merge, parse, read_raw_config, resolve, write_config, AuthType,
         ConfigError, ConfigWritePatch, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
-        DEFAULT_KEEP_RECENT_TURNS, DEFAULT_TIMEOUT_SECS,
+        DEFAULT_KEEP_RECENT_TURNS, DEFAULT_THINKING, DEFAULT_TIMEOUT_SECS,
     };
+    use crate::provider::Depth;
     use std::fs;
 
     #[test]
@@ -730,6 +739,50 @@ auth_type = "api_key"
         assert_eq!(config.compact_trigger_ratio, DEFAULT_COMPACT_TRIGGER_RATIO);
         assert_eq!(config.keep_recent_turns, DEFAULT_KEEP_RECENT_TURNS);
         assert_eq!(config.model_context_window, None);
+        assert_eq!(config.thinking, DEFAULT_THINKING);
+    }
+
+    #[test]
+    fn merge_thinking_project_overrides_user_and_defaults_to_low() {
+        let user = parse(
+            r#"
+model = "user-model"
+thinking = "high"
+
+[provider]
+kind = "mock"
+auth_type = "api_key"
+"#,
+        )
+        .unwrap();
+        let project = parse(
+            r#"
+model = "project-model"
+thinking = "medium"
+"#,
+        )
+        .unwrap();
+        let user_only = parse(
+            r#"
+model = "user-model"
+thinking = "high"
+
+[provider]
+kind = "mock"
+auth_type = "api_key"
+"#,
+        )
+        .unwrap();
+
+        let merged = merge(user, project);
+        let config = resolve(merged).unwrap();
+        assert_eq!(config.thinking, Depth::Medium);
+
+        let user_config = resolve(user_only).unwrap();
+        assert_eq!(user_config.thinking, Depth::High);
+
+        let default_config = resolve(parse(&minimal_raw()).unwrap()).unwrap();
+        assert_eq!(default_config.thinking, Depth::Low);
     }
 
     #[test]

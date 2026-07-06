@@ -73,7 +73,7 @@ impl Tool for SubmitPlanTool {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "description": { "type": "string" },
+                            "description": { "type": "string", "description": "一句话简述该步(≤30字),不堆细节,细节留到执行时" },
                             "validation": { "type": "string" }
                         },
                         "required": ["description", "validation"]

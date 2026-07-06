@@ -5,19 +5,23 @@ expression: text
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
-‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›write_file‹/›‹text.muted› path=src/new_config.rs‹/›
-‹border.subtle›│ ‹/›‹success.fg›+ pub struct Config {‹/›
-‹border.subtle›│ ‹/›‹success.fg›+     pub timeout_secs: u64,‹/›
-‹border.subtle›│ ‹/›‹success.fg›+ }‹/›
-‹border.subtle›│ ‹/›‹text.body›created src/new_config.rs‹/›
-‹border.subtle›└───────────────────────────────────────────────────────────────────────────────‹/›
-
-
-
-
-
-
-
+‹text.secondary +bold›✻ 思考‹/›
+‹text.muted›  reasoning line 01‹/›
+‹text.muted›  reasoning line 02‹/›
+‹text.muted›  reasoning line 03‹/›
+‹text.muted›  reasoning line 04‹/›
+‹text.muted›  reasoning line 05‹/›
+‹text.muted›  reasoning line 06‹/›
+‹text.muted›  reasoning line 07‹/›
+‹text.muted›  reasoning line 08‹/›
+‹text.muted›  reasoning line 09‹/›
+‹text.muted›  reasoning line 10‹/›
+‹text.muted›  reasoning line 11‹/›
+‹text.muted›  reasoning line 12‹/›
+‹text.muted›  reasoning line 13‹/›
+‹text.muted›  reasoning line 14‹/›
+‹text.muted›  reasoning line 15‹/›
+‹text.muted›  reasoning line 16‹/›‹text.primary›         ‹/›‹accent.primary bg=bg.surface›跳到底部 (ctrl+End) ↓‹/›
 
 
 ‹text.muted›◇ 就绪‹/›

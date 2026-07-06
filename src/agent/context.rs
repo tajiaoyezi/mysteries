@@ -65,6 +65,7 @@ mod tests {
                     name: "read_file".to_string(),
                     arguments: json!({ "path": "src/main.rs" }),
                 }],
+                thinking: Vec::new(),
             },
             Message::ToolResult {
                 call_id: "call-1".to_string(),

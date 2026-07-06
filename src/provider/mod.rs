@@ -17,6 +17,42 @@ pub mod stream;
 pub mod transport;
 pub mod wire;
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Depth {
+    Off,
+    #[default]
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl Depth {
+    pub fn as_effort(&self, cap: Depth) -> &'static str {
+        let effective = if *self > cap { cap } else { *self };
+        match effective {
+            Depth::Off => "off",
+            Depth::Low => "low",
+            Depth::Medium => "medium",
+            Depth::High => "high",
+            Depth::Xhigh => "xhigh",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    pub depth: Depth,
+}
+
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct ThinkingBlock {
+    pub text: String,
+    pub signature: Option<String>,
+    pub redacted: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct ToolCall {
     pub id: String,
@@ -31,12 +67,13 @@ pub struct ToolSchema {
     pub parameters: Value,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct ModelRequest {
     pub model: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSchema>,
     pub max_tokens: Option<u32>,
+    pub thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +94,7 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
     pub usage: Option<Usage>,
+    pub thinking: Vec<ThinkingBlock>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -70,6 +108,8 @@ pub enum FinishReason {
 
 pub trait DeltaSink: Send + Sync {
     fn on_text(&self, text: &str);
+
+    fn on_thinking(&self, _text: &str) {}
 }
 
 #[async_trait]
@@ -111,7 +151,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, Usage};
+    use super::{DeltaSink, Depth, FinishReason, ModelRequest, ModelResponse, Provider, Usage};
     use crate::agent::message::Message;
     use crate::error::ProviderError;
     use async_trait::async_trait;
@@ -167,6 +207,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 usage: None,
+            thinking: Vec::new(),
             })
         }
     }
@@ -177,6 +218,7 @@ mod tests {
             messages: vec![Message::User("hello provider".to_string())],
             tools: Vec::new(),
             max_tokens: Some(64),
+            thinking: None,
         }
     }
 
@@ -202,6 +244,7 @@ mod tests {
                 input_tokens: 11,
                 output_tokens: 7,
             }),
+            thinking: Vec::new(),
         };
 
         let usage = response.usage.as_ref().expect("usage should be present");
@@ -215,6 +258,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
+            thinking: Vec::new(),
         };
 
         assert_eq!(response.usage, None);
@@ -234,5 +278,46 @@ mod tests {
         let response = provider.complete(request(), &noop).await.unwrap();
 
         assert_eq!(response.text, "hello world");
+    }
+
+    #[test]
+    fn depth_serde_roundtrip() {
+        let depth = Depth::High;
+        let json = serde_json::to_string(&depth).unwrap();
+        assert_eq!(json, "\"high\"");
+        let parsed: Depth = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, Depth::High);
+    }
+
+    #[test]
+    fn depth_as_effort_caps_xhigh_to_model_max() {
+        assert_eq!(Depth::Xhigh.as_effort(Depth::High), "high");
+        assert_eq!(Depth::Medium.as_effort(Depth::Xhigh), "medium");
+        assert_eq!(Depth::Low.as_effort(Depth::High), "low");
+        assert_eq!(Depth::High.as_effort(Depth::High), "high");
+        assert_eq!(Depth::Xhigh.as_effort(Depth::Xhigh), "xhigh");
+    }
+
+    #[test]
+    fn model_request_default_leaves_thinking_empty() {
+        let req = ModelRequest {
+            model: "test".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: None,
+            ..Default::default()
+        };
+        assert_eq!(req.thinking, None);
+    }
+
+    #[test]
+    fn model_response_default_leaves_thinking_empty() {
+        let response = ModelResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            ..Default::default()
+        };
+        assert!(response.thinking.is_empty());
     }
 }

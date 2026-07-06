@@ -245,6 +245,7 @@ mod tests {
                     name: "shell".to_string(),
                     arguments: json!({ "command": "echo hi" }),
                 }],
+                thinking: Vec::new(),
             },
             Message::ToolResult {
                 call_id: "call-1".to_string(),
@@ -254,6 +255,7 @@ mod tests {
             Message::Assistant {
                 text: "done".to_string(),
                 tool_calls: vec![],
+                thinking: Vec::new(),
             },
         ]
     }
@@ -573,6 +575,33 @@ mod tests {
     }
 
     #[test]
+    fn load_legacy_assistant_without_thinking_key_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let id = "legacy-resume-session";
+        let meta_line = serde_json::to_string(&SessionLine::Meta(meta(id))).unwrap();
+        let legacy_msg = r#"{"Msg":{"Assistant":{"text":"done","tool_calls":[]}}}"#;
+        fs::write(
+            store_at(&root).session_path(id),
+            format!("{meta_line}\n{legacy_msg}\n"),
+        )
+        .unwrap();
+
+        let (_, history, _) = store_at(&root).load(id).unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0],
+            Message::Assistant {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                thinking: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
     fn load_returns_err_for_invalid_json_line() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sessions");
@@ -691,6 +720,7 @@ mod tests {
             Message::Assistant {
                 text: "keep assistant".to_string(),
                 tool_calls: vec![],
+                thinking: Vec::new(),
             },
         ];
 
@@ -703,6 +733,7 @@ mod tests {
             Message::Assistant {
                 text: "keep assistant".to_string(),
                 tool_calls: vec![],
+                thinking: Vec::new(),
             }
         );
     }

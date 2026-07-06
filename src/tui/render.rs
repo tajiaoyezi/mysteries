@@ -29,6 +29,7 @@ const INPUT_MAX_CONTENT_ROWS: u16 = 10;
 pub(crate) const QUEUE_MAX_ROWS: usize = 5;
 const DIFF_MAX_ROWS: usize = 24;
 const DIFF_COLLAPSED_MAX_ROWS: usize = 8;
+const THINKING_FOLD_THRESHOLD: usize = 12;
 const PLAN_APPROVAL_FOOTER_LINES: u16 = 2;
 const MAX_PLAN_DIALOG_HEIGHT: u16 = 16;
 const MAX_PLAN_PROGRESS_HEIGHT: u16 = 8;
@@ -472,6 +473,9 @@ fn transcript_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'
             TranscriptBlock::Notice(text) => {
                 lines.extend(notice_block_lines(text, theme, width));
             }
+            TranscriptBlock::Thinking(text) => {
+                lines.extend(thinking_block_lines(text, state, theme, width));
+            }
             TranscriptBlock::Tool(card) => {
                 let prev_is_tool =
                     index > 0 && matches!(state.transcript[index - 1], TranscriptBlock::Tool(_));
@@ -489,6 +493,32 @@ fn transcript_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'
         }
     }
     lines
+}
+
+fn thinking_block_lines(
+    text: &str,
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+    let header = Style::default()
+        .fg(theme.text_secondary)
+        .bg(theme.bg_base)
+        .add_modifier(Modifier::BOLD);
+    let mut out = vec![Line::from(Span::styled("✻ 思考", header))];
+    let body = message_lines("  ", text, width, muted, muted);
+    if state.tools_expanded || body.len() <= THINKING_FOLD_THRESHOLD {
+        out.extend(body);
+    } else {
+        let hidden = body.len() - THINKING_FOLD_THRESHOLD;
+        out.extend(body.into_iter().take(THINKING_FOLD_THRESHOLD));
+        out.push(Line::from(Span::styled(
+            format!("  … +{hidden} 行(Ctrl+O 展开)"),
+            muted,
+        )));
+    }
+    out
 }
 
 fn assistant_message_lines(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
@@ -1920,10 +1950,12 @@ fn render_mode_line(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: 
     let label = permission_mode_label(mode);
     let (glyph, mode_style) = mode_glyph_and_style(mode, theme);
     let tail_style = Style::default().fg(theme.text_muted).bg(theme.bg_base);
+    let think_label = AppState::depth_label(state.current_thinking_depth());
     let paragraph = Paragraph::new(Line::from(vec![
         Span::styled(glyph, mode_style),
         Span::styled(format!(" {label}"), mode_style),
         Span::styled(" · shift+tab 切换", tail_style),
+        Span::styled(format!(" · think {think_label}"), tail_style),
     ]))
     .style(Style::default().bg(theme.bg_base));
     frame.render_widget(paragraph, area);
@@ -2681,6 +2713,37 @@ mod tests {
             .lock()
             .expect("permission mode mutex poisoned") = mode;
         state
+    }
+
+    fn state_with_thinking_depth(depth: crate::provider::Depth) -> AppState {
+        let state = AppState::new();
+        *state
+            .thinking_depth
+            .lock()
+            .expect("thinking depth mutex poisoned") = depth;
+        state
+    }
+
+    fn thinking_transcript_state(text: &str, expanded: bool) -> AppState {
+        let mut state = AppState::new();
+        state.tools_expanded = expanded;
+        state.transcript.push(TranscriptBlock::Thinking(text.to_string()));
+        state.scroll_to_top(100, 20);
+        state
+    }
+
+    fn short_thinking_text() -> String {
+        (1..=5)
+            .map(|i| format!("short thought {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn long_thinking_text() -> String {
+        (1..=20)
+            .map(|i| format!("reasoning line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn find_symbol(buffer: &Buffer, symbol: &str) -> Position {
@@ -3932,6 +3995,63 @@ mod tests {
         let state = state_with_permission_mode(PermissionMode::Plan);
         let text = render_to_styled(&state, &Theme::midnight());
         insta::assert_snapshot!("tui_mode_line_plan", mode_line(&text));
+    }
+
+    #[test]
+    fn thinking_short_shown_midnight_snapshot() {
+        let state = thinking_transcript_state(&short_thinking_text(), false);
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 28);
+        insta::assert_snapshot!("tui_thinking_short_shown_midnight", text);
+    }
+
+    #[test]
+    fn thinking_folded_midnight_snapshot() {
+        let state = thinking_transcript_state(&long_thinking_text(), false);
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 28);
+        insta::assert_snapshot!("tui_thinking_folded_midnight", text);
+    }
+
+    #[test]
+    fn thinking_folded_daylight_snapshot() {
+        let state = thinking_transcript_state(&long_thinking_text(), false);
+        let text = render_to_styled_with_size(&state, &Theme::daylight(), 80, 28);
+        insta::assert_snapshot!("tui_thinking_folded_daylight", text);
+    }
+
+    #[test]
+    fn thinking_expanded_midnight_snapshot() {
+        let state = thinking_transcript_state(&long_thinking_text(), true);
+        let text = render_to_styled_with_size(&state, &Theme::midnight(), 80, 28);
+        insta::assert_snapshot!("tui_thinking_expanded_midnight", text);
+    }
+
+    #[test]
+    fn mode_line_think_high_midnight_snapshot() {
+        let state = state_with_thinking_depth(crate::provider::Depth::High);
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!("tui_mode_line_think_high_midnight", mode_line(&text));
+    }
+
+    #[test]
+    fn mode_line_think_high_daylight_snapshot() {
+        let state = state_with_thinking_depth(crate::provider::Depth::High);
+        let text = render_to_styled(&state, &Theme::daylight());
+        insta::assert_snapshot!("tui_mode_line_think_high_daylight", mode_line(&text));
+    }
+
+    #[test]
+    fn always_on_off_notice_snapshot() {
+        let mut state = AppState::new();
+        state.session.model = "claude-fable-5".to_string();
+        *state
+            .thinking_depth
+            .lock()
+            .expect("thinking depth mutex poisoned") = crate::provider::Depth::Off;
+        state
+            .transcript
+            .push(TranscriptBlock::Notice("该模型思考无法关闭".to_string()));
+        let text = render_to_styled(&state, &Theme::midnight());
+        insta::assert_snapshot!("tui_always_on_off_notice_midnight", text);
     }
 
     #[test]

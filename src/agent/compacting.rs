@@ -85,7 +85,7 @@ impl Compacting {
         match msg {
             Message::System(text) => format!("[system]\n{text}"),
             Message::User(text) => format!("[user]\n{text}"),
-            Message::Assistant { text, tool_calls } => {
+            Message::Assistant { text, tool_calls, .. } => {
                 let mut part = format!("[assistant]\n{text}");
                 for call in tool_calls {
                     part.push_str(&format!("\n[tool_call {} {}]", call.name, call.arguments));
@@ -164,6 +164,7 @@ impl Compacting {
                     messages: vec![Message::User(prompt)],
                     tools: Vec::new(),
                     max_tokens: None,
+                    thinking: None,
                 },
                 &NoopSink,
             )
@@ -285,6 +286,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
+        thinking: Vec::new(),
         }
     }
 
@@ -317,6 +319,7 @@ mod tests {
             Message::Assistant {
                 text: "reply one".to_string(),
                 tool_calls: Vec::new(),
+            thinking: Vec::new(),
             },
             Message::User("turn two".to_string()),
             Message::Assistant {
@@ -326,6 +329,7 @@ mod tests {
                     name: "read_file".to_string(),
                     arguments: json!({ "path": "src/main.rs" }),
                 }],
+                thinking: Vec::new(),
             },
             Message::ToolResult {
                 call_id: "call-1".to_string(),
@@ -336,6 +340,7 @@ mod tests {
             Message::Assistant {
                 text: "reply three".to_string(),
                 tool_calls: Vec::new(),
+            thinking: Vec::new(),
             },
         ]
     }
@@ -346,6 +351,7 @@ mod tests {
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
+        thinking: Vec::new(),
         }
     }
 
@@ -639,6 +645,7 @@ mod tests {
         extended.push(Message::Assistant {
             text: "reply four".to_string(),
             tool_calls: Vec::new(),
+        thinking: Vec::new(),
         });
 
         let second = compacting
@@ -698,6 +705,7 @@ mod tests {
         extended.push(Message::Assistant {
             text: "reply four".to_string(),
             tool_calls: Vec::new(),
+        thinking: Vec::new(),
         });
 
         let second = compacting

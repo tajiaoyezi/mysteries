@@ -10,19 +10,19 @@ expression: text
 ‹text.primary›                                  ‹/›‹text.title +bold›✦ MYSTERIES‹/›
 ‹text.primary›                          ‹/›‹accent.primary›AGENT · v1.0 · 终端编码助手‹/›
 ‹text.primary›        ‹/›‹text.body›读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等‹/›
-‹text.primary›                               ‹/›‹text.body›你按下 y 才动手。‹/›
 ‹border.strong bg=bg.surface›┌──────────────────────────────────────────────────┐‹/›
-‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold +reversed›/help     ‹/›‹text.body bg=bg.surface +reversed›查看内置命令‹/›‹text.primary bg=bg.surface›              试试 ↓        ‹/›‹border.strong bg=bg.surface›│‹/›
-‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/clear    ‹/›‹text.body bg=bg.surface›清空当前 transcript‹/›‹text.primary bg=bg.surface› Config 加 timeout_se‹/›‹border.strong bg=bg.surface›│‹/›‹text.primary›s 字段‹/›
-‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/model    ‹/›‹text.body bg=bg.surface›查看或切换后续请‹/›  ‹text.body bg=bg.surface› model‹/›‹text.primary bg=bg.surface›置命令          ‹/›‹border.strong bg=bg.surface›│‹/›
-‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/models   ‹/›‹text.body bg=bg.surface›浏览 / 切‹/›  ‹text.body bg=bg.surface› provider 与‹/›     ‹text.primary bg=bg.surface›快照        ‹/›‹border.strong bg=bg.surface›│‹/›
-‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/status   ‹/›‹text.body bg=bg.surface›当前会话快照‹/›‹text.primary bg=bg.surface›误〕 演示:鉴权失败(致命错误,‹/›‹border.strong bg=bg.surface›│‹/›‹text.primary› 止 Loop)‹/›
-‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/exit     ‹/›‹text.body bg=bg.surface›退出 TUI‹/›‹text.primary bg=bg.surface›                                ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold +reversed›/help     ‹/›‹text.body bg=bg.surface +reversed›查看内置命令‹/›‹text.primary bg=bg.surface›                            ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/clear    ‹/›‹text.body bg=bg.surface›清空当前 transcript‹/›‹text.primary bg=bg.surface›       试试 ↓        ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/model    ‹/›‹text.body bg=bg.surface›查看或切换后续请求‹/› ‹text.body bg=bg.surface›model‹/›‹text.primary bg=bg.surface›ig 加 timeout_se‹/›‹border.strong bg=bg.surface›│‹/›‹text.primary›s 字段‹/›
+‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/models   ‹/›‹text.body bg=bg.surface›浏览 / 切‹/›  ‹text.body bg=bg.surface› provider 与‹/›     ‹text.primary bg=bg.surface›令          ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/status   ‹/›‹text.body bg=bg.surface›当前会话快照‹/›‹text.primary bg=bg.surface›tatus〕 当前会话快照        ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/exit     ‹/›‹text.body bg=bg.surface›退出 TUI‹/›‹text.primary bg=bg.surface›〔错误〕 演示:鉴权失败(致命错误,‹/›‹border.strong bg=bg.surface›│‹/›‹text.primary› 止 Loop)‹/›
 ‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/compact  ‹/›‹text.body bg=bg.surface›压缩当前上下文‹/›‹text.primary bg=bg.surface›                          ‹/›‹border.strong bg=bg.surface›│‹/›
+‹border.strong bg=bg.surface›│‹/›‹accent.primary bg=bg.surface +bold›/think    ‹/›‹text.body bg=bg.surface›查看或切换思考深度‹/›‹text.primary bg=bg.surface›                      ‹/›‹border.strong bg=bg.surface›│‹/›
 ‹border.strong bg=bg.surface›└──────────────────────────────────────────────────┘‹/›
 ‹text.muted›◇ 就绪‹/›
 ‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
 ‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›/                                                                           ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
-‹text.muted›▸ normal · shift+tab 切换‹/›
+‹text.muted›▸ normal · shift+tab 切换 · think low‹/›

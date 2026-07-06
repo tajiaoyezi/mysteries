@@ -3,7 +3,7 @@ use mysteries::agent::message::Message;
 use mysteries::app::assemble_agent;
 use mysteries::config::{
     AuthType, Config, ProviderConfig, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
-    DEFAULT_KEEP_RECENT_TURNS,
+    DEFAULT_KEEP_RECENT_TURNS, DEFAULT_THINKING,
 };
 use mysteries::permission::{PermissionDecider, PermissionDecision};
 use mysteries::provider::mock::MockProvider;
@@ -60,6 +60,7 @@ fn config() -> Config {
         model_context_window: None,
         compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
         keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
+        thinking: DEFAULT_THINKING,
     }
 }
 

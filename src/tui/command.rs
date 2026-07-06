@@ -1,3 +1,12 @@
+use crate::provider::Depth;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThinkArg {
+    Query,
+    Set(Depth),
+    Invalid(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
@@ -7,6 +16,7 @@ pub enum Command {
     Status,
     Exit,
     Compact,
+    Think(ThinkArg),
     Unknown(String),
 }
 
@@ -19,6 +29,7 @@ enum BuiltinCommand {
     Status,
     Exit,
     Compact,
+    Think,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +40,7 @@ pub struct CommandMetadata {
     command: BuiltinCommand,
 }
 
-const COMMANDS: [CommandMetadata; 7] = [
+const COMMANDS: [CommandMetadata; 8] = [
     CommandMetadata {
         name: "/help",
         description: "查看内置命令",
@@ -72,10 +83,27 @@ const COMMANDS: [CommandMetadata; 7] = [
         usage: "/compact",
         command: BuiltinCommand::Compact,
     },
+    CommandMetadata {
+        name: "/think",
+        description: "查看或切换思考深度",
+        usage: "/think [off|low|medium|high|xhigh]",
+        command: BuiltinCommand::Think,
+    },
 ];
 
 pub fn command_metadata() -> &'static [CommandMetadata] {
     &COMMANDS
+}
+
+fn parse_depth(args: &str) -> ThinkArg {
+    match args {
+        "off" => ThinkArg::Set(Depth::Off),
+        "low" => ThinkArg::Set(Depth::Low),
+        "medium" => ThinkArg::Set(Depth::Medium),
+        "high" => ThinkArg::Set(Depth::High),
+        "xhigh" => ThinkArg::Set(Depth::Xhigh),
+        other => ThinkArg::Invalid(other.to_string()),
+    }
 }
 
 pub fn parse_command(input: &str) -> Option<Command> {
@@ -102,6 +130,8 @@ pub fn parse_command(input: &str) -> Option<Command> {
         BuiltinCommand::Status => Command::Status,
         BuiltinCommand::Exit => Command::Exit,
         BuiltinCommand::Compact => Command::Compact,
+        BuiltinCommand::Think if args.is_empty() => Command::Think(ThinkArg::Query),
+        BuiltinCommand::Think => Command::Think(parse_depth(args)),
     };
 
     Some(command)
@@ -109,7 +139,8 @@ pub fn parse_command(input: &str) -> Option<Command> {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_metadata, parse_command, Command};
+    use super::{command_metadata, parse_command, Command, ThinkArg};
+    use crate::provider::Depth;
 
     #[test]
     fn parse_command_recognizes_builtin_slash_commands() {
@@ -125,6 +156,15 @@ mod tests {
             ("/status", Some(Command::Status)),
             ("/compact", Some(Command::Compact)),
             ("/exit", Some(Command::Exit)),
+            ("/think", Some(Command::Think(ThinkArg::Query))),
+            (
+                "/think high",
+                Some(Command::Think(ThinkArg::Set(Depth::High))),
+            ),
+            (
+                "/think foo",
+                Some(Command::Think(ThinkArg::Invalid("foo".to_string()))),
+            ),
             ("/login", Some(Command::Unknown("login".to_string()))),
             ("/logout", Some(Command::Unknown("logout".to_string()))),
             ("/xyz", Some(Command::Unknown("xyz".to_string()))),
@@ -149,7 +189,14 @@ mod tests {
     #[test]
     fn command_metadata_covers_all_builtin_commands_and_matches_parser() {
         let expected = [
-            "/help", "/clear", "/model", "/models", "/status", "/exit", "/compact",
+            "/help",
+            "/clear",
+            "/model",
+            "/models",
+            "/status",
+            "/exit",
+            "/compact",
+            "/think",
         ];
         let metadata = command_metadata();
         let names = metadata

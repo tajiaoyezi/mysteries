@@ -109,6 +109,10 @@ impl StreamAccumulator {
             sink.on_text(content);
         }
 
+        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+            sink.on_thinking(reasoning);
+        }
+
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in tool_calls {
                 let index =
@@ -169,6 +173,7 @@ impl StreamAccumulator {
             tool_calls,
             finish_reason: self.finish_reason.clone(),
             usage: self.usage.clone(),
+            thinking: Vec::new(),
         })
     }
 }
@@ -247,23 +252,33 @@ mod tests {
 
     struct CaptureSink {
         chunks: Mutex<Vec<String>>,
+        thinking: Mutex<Vec<String>>,
     }
 
     impl CaptureSink {
         fn new() -> Self {
             Self {
                 chunks: Mutex::new(Vec::new()),
+                thinking: Mutex::new(Vec::new()),
             }
         }
 
         fn chunks(&self) -> Vec<String> {
             self.chunks.lock().unwrap().clone()
         }
+
+        fn thinking_chunks(&self) -> Vec<String> {
+            self.thinking.lock().unwrap().clone()
+        }
     }
 
     impl DeltaSink for CaptureSink {
         fn on_text(&self, text: &str) {
             self.chunks.lock().unwrap().push(text.to_string());
+        }
+
+        fn on_thinking(&self, text: &str) {
+            self.thinking.lock().unwrap().push(text.to_string());
         }
     }
 
@@ -467,5 +482,36 @@ data: [DONE]
         .unwrap_err();
 
         assert!(matches!(err, ProviderError::Decode(message) if message.contains("arguments")));
+    }
+
+    #[test]
+    fn reasoning_content_delta_calls_on_thinking() {
+        let mut accumulator = StreamAccumulator::new();
+        let sink = CaptureSink::new();
+
+        let response = push_all(
+            &mut accumulator,
+            &sink,
+            &[
+                br#"data: {"choices":[{"delta":{"reasoning_content":"step 1"},"finish_reason":null}]}
+
+"#,
+                br#"data: {"choices":[{"delta":{"reasoning_content":" step 2"},"finish_reason":null}]}
+
+"#,
+                br#"data: {"choices":[{"delta":{"content":"answer"},"finish_reason":null}]}
+
+"#,
+                br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(sink.thinking_chunks(), vec!["step 1", " step 2"]);
+        assert_eq!(response.text, "answer");
     }
 }

@@ -272,6 +272,7 @@ mod tests {
                         name: "lookup".to_string(),
                         arguments: json!({ "query": "rust" }),
                     }],
+                    thinking: Vec::new(),
                 },
             ],
             tools: vec![ToolSchema {
@@ -280,6 +281,7 @@ mod tests {
                 parameters: json!({ "type": "object" }),
             }],
             max_tokens: Some(128),
+            thinking: None,
         }
     }
 
@@ -567,6 +569,7 @@ mod tests {
                     messages: vec![Message::User("Reply with exactly: pong".to_string())],
                     tools: Vec::new(),
                     max_tokens: Some(16),
+                thinking: None,
                 },
                 &sink,
             )

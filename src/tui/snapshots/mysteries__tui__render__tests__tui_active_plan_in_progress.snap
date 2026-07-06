@@ -1,6 +1,5 @@
 ---
 source: src/tui/render.rs
-assertion_line: 3893
 expression: text
 ---
 ‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.0‹/›
@@ -26,4 +25,4 @@ expression: text
 ‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›implement panel rendering                                                   ‹/›‹border.subtle›│‹/›
 ‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
 ‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
-‹text.muted›▸ normal · shift+tab 切换‹/›
+‹text.muted›▸ normal · shift+tab 切换 · think low‹/›

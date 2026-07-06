@@ -2,4 +2,4 @@
 source: src/tui/render.rs
 expression: mode_line(&text)
 ---
-‹accent.primary›▸▸ accept-edits‹/›‹text.muted› · shift+tab 切换‹/›
+‹accent.primary›▸▸ accept-edits‹/›‹text.muted› · shift+tab 切换 · think low‹/›
