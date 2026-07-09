@@ -1,6 +1,6 @@
 use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -122,7 +122,7 @@ impl Tool for SubmitPlanTool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepStatus {
     Pending,
     InProgress,

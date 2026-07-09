@@ -4097,6 +4097,21 @@ mod tests {
     }
 
     #[test]
+    fn apply_loaded_plan_restored_folded_matches_hand_built_snapshot() {
+        // §3.6：经 seam 还原后渲染 == 既有折叠快照（不新增独立快照）
+        let hand_built = active_plan_all_done_ready_state();
+        let plan = hand_built.current_plan.clone();
+        let mut restored = AppState::new();
+        restored.phase = Phase::Ready;
+        restored.set_input_text("plan finished");
+        crate::tui::apply_loaded_plan(&mut restored, plan);
+        let hand_text = render_to_styled_with_size(&hand_built, &Theme::midnight(), 80, 24);
+        let restored_text = render_to_styled_with_size(&restored, &Theme::midnight(), 80, 24);
+        assert_eq!(restored_text, hand_text);
+        insta::assert_snapshot!("tui_active_plan_folded", restored_text);
+    }
+
+    #[test]
     fn active_plan_all_done_busy_renders_full_panel_snapshot() {
         let mut state = active_plan_all_done_ready_state();
         state.phase = Phase::Busy;

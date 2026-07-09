@@ -1,5 +1,5 @@
 use crate::agent::message::Message;
-use crate::tui::app::TranscriptBlock;
+use crate::tui::app::{ActivePlan, TranscriptBlock};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::fs;
@@ -31,6 +31,7 @@ pub enum SessionLine {
     Meta(SessionMeta),
     Msg(Message),
     Block(TranscriptBlock),
+    Plan(ActivePlan),
 }
 
 #[derive(Clone, Debug)]
@@ -61,15 +62,20 @@ impl SessionStore {
         meta: &SessionMeta,
         history: &[Message],
         transcript: &[TranscriptBlock],
+        plan: Option<&ActivePlan>,
     ) -> io::Result<()> {
         fs::create_dir_all(&self.root)?;
-        let mut lines = Vec::with_capacity(1 + history.len() + transcript.len());
+        let mut lines =
+            Vec::with_capacity(1 + history.len() + transcript.len() + usize::from(plan.is_some()));
         lines.push(serialize_line(&SessionLine::Meta(meta.clone()))?);
         for message in history {
             lines.push(serialize_line(&SessionLine::Msg(message.clone()))?);
         }
         for block in transcript {
             lines.push(serialize_line(&SessionLine::Block(block.clone()))?);
+        }
+        if let Some(plan) = plan {
+            lines.push(serialize_line(&SessionLine::Plan(plan.clone()))?);
         }
 
         fs::write(
@@ -78,11 +84,23 @@ impl SessionStore {
         )
     }
 
-    pub fn load(&self, id: &str) -> io::Result<(SessionMeta, Vec<Message>, Vec<TranscriptBlock>)> {
+    // 四元组风格与既有 3 元组一致(design D3 弃具名 LoadedSession 以最小 churn);
+    // clippy::type_complexity 在 4 元组临界触发,显式 allow。
+    #[allow(clippy::type_complexity)]
+    pub fn load(
+        &self,
+        id: &str,
+    ) -> io::Result<(
+        SessionMeta,
+        Vec<Message>,
+        Vec<TranscriptBlock>,
+        Option<ActivePlan>,
+    )> {
         let body = fs::read_to_string(self.session_path(id))?;
         let mut meta = None;
         let mut history = Vec::new();
         let mut transcript = Vec::new();
+        let mut plan = None;
 
         for line in body.lines() {
             match parse_line(line)? {
@@ -93,11 +111,16 @@ impl SessionStore {
                 }
                 SessionLine::Msg(message) => history.push(message),
                 SessionLine::Block(block) => transcript.push(block),
+                SessionLine::Plan(next_plan) => {
+                    if plan.replace(next_plan).is_some() {
+                        return Err(invalid_data("session contains more than one Plan line"));
+                    }
+                }
             }
         }
 
         let meta = meta.ok_or_else(|| invalid_data("session is missing Meta line"))?;
-        Ok((meta, history, transcript))
+        Ok((meta, history, transcript, plan))
     }
 
     pub fn latest(&self) -> io::Result<Option<String>> {
@@ -180,7 +203,7 @@ fn read_session_summary(path: &std::path::Path) -> io::Result<SessionSummary> {
             SessionLine::Msg(Message::User(text)) if first_user.is_none() => {
                 first_user = Some(text.chars().take(FIRST_USER_SUMMARY_CHARS).collect());
             }
-            SessionLine::Msg(_) | SessionLine::Block(_) => {}
+            SessionLine::Msg(_) | SessionLine::Block(_) | SessionLine::Plan(_) => {}
         }
     }
 
@@ -216,7 +239,10 @@ mod tests {
     use super::{replace_system_head, SessionLine, SessionMeta, SessionStore, SessionSummary};
     use crate::agent::message::Message;
     use crate::provider::ToolCall;
-    use crate::tui::app::{StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock};
+    use crate::tool::plan::StepStatus;
+    use crate::tui::app::{
+        ActivePlan, ActiveStep, StatusSnapshot, ToolCard, ToolCardStatus, TranscriptBlock,
+    };
     use serde_json::{json, Value};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -293,6 +319,26 @@ mod tests {
         ]
     }
 
+    fn active_plan(title: &str) -> ActivePlan {
+        ActivePlan {
+            title: title.to_string(),
+            steps: vec![
+                ActiveStep {
+                    description: "第一步".to_string(),
+                    validation: "cargo test".to_string(),
+                    status: StepStatus::Done,
+                    validation_result: Some("ok".to_string()),
+                },
+                ActiveStep {
+                    description: "第二步".to_string(),
+                    validation: "cargo clippy".to_string(),
+                    status: StepStatus::Pending,
+                    validation_result: None,
+                },
+            ],
+        }
+    }
+
     fn store_at(root: &Path) -> SessionStore {
         SessionStore::new(root.to_path_buf())
     }
@@ -311,7 +357,7 @@ mod tests {
 
     fn write_session(root: &Path, meta: SessionMeta, history: &[Message]) {
         store_at(root)
-            .write(&meta, history, &[])
+            .write(&meta, history, &[], None)
             .expect("session should be written");
     }
 
@@ -369,10 +415,10 @@ mod tests {
         let history = history();
         let transcript = transcript();
 
-        store.write(&meta, &history, &transcript).unwrap();
+        store.write(&meta, &history, &transcript, None).unwrap();
         let loaded = store.load(&meta.id).unwrap();
 
-        assert_eq!(loaded, (meta, history, transcript));
+        assert_eq!(loaded, (meta, history, transcript, None));
     }
 
     #[test]
@@ -383,11 +429,13 @@ mod tests {
         let meta = meta(id);
         let msg = Message::User("hi".to_string());
         let block = TranscriptBlock::Tool(tool_card(None, false));
+        let plan = active_plan("交错计划");
         write_lines(
             &root,
             id,
             &[
                 SessionLine::Block(block.clone()),
+                SessionLine::Plan(plan.clone()),
                 SessionLine::Meta(meta.clone()),
                 SessionLine::Msg(msg.clone()),
             ],
@@ -395,7 +443,7 @@ mod tests {
 
         let loaded = store_at(&root).load(id).unwrap();
 
-        assert_eq!(loaded, (meta, vec![msg], vec![block]));
+        assert_eq!(loaded, (meta, vec![msg], vec![block], Some(plan)));
     }
 
     #[test]
@@ -565,12 +613,12 @@ mod tests {
         let id = SessionStore::new_session_id();
         let meta = meta(&id);
 
-        store.write(&meta, &history(), &transcript()).unwrap();
+        store.write(&meta, &history(), &transcript(), None).unwrap();
 
         let path = store.session_path(&id);
         assert!(path.exists(), "{} should exist", path.display());
         assert_eq!(path.file_name().unwrap(), format!("{id}.jsonl").as_str());
-        let (loaded_meta, _, _) = store.load(&id).unwrap();
+        let (loaded_meta, _, _, _) = store.load(&id).unwrap();
         assert_eq!(loaded_meta.id, id);
     }
 
@@ -588,7 +636,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_, history, _) = store_at(&root).load(id).unwrap();
+        let (_, history, _, _) = store_at(&root).load(id).unwrap();
 
         assert_eq!(history.len(), 1);
         assert_eq!(
@@ -682,8 +730,8 @@ mod tests {
             .map(|i| Message::User(format!("after compact {i}")))
             .collect::<Vec<_>>();
 
-        store.write(&meta, &first_history, &[]).unwrap();
-        store.write(&meta, &second_history, &[]).unwrap();
+        store.write(&meta, &first_history, &[], None).unwrap();
+        store.write(&meta, &second_history, &[], None).unwrap();
 
         let body = fs::read_to_string(store.session_path(&meta.id)).unwrap();
         let msg_lines = body
@@ -701,13 +749,15 @@ mod tests {
         let store = store_at(&root);
         let meta = meta("session-empty");
 
-        store.write(&meta, &[], &[]).unwrap();
-        let (loaded_meta, loaded_history, loaded_transcript) = store.load(&meta.id).unwrap();
+        store.write(&meta, &[], &[], None).unwrap();
+        let (loaded_meta, loaded_history, loaded_transcript, loaded_plan) =
+            store.load(&meta.id).unwrap();
         let body = fs::read_to_string(store.session_path(&meta.id)).unwrap();
 
         assert_eq!(loaded_meta, meta);
         assert!(loaded_history.is_empty());
         assert!(loaded_transcript.is_empty());
+        assert!(loaded_plan.is_none());
         assert_eq!(body.lines().count(), 1);
         assert!(body.starts_with("{\"Meta\""));
     }
@@ -758,5 +808,128 @@ mod tests {
         replace_system_head(&mut history, "new system");
 
         assert_eq!(history, original);
+    }
+
+    // --- §2.1 行为红灯（骨架期应运行期失败）---
+
+    #[test]
+    fn write_with_plan_then_load_returns_that_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let store = store_at(&root);
+        let meta = meta("session-with-plan");
+        let plan = active_plan("计划 A");
+
+        store
+            .write(&meta, &history(), &transcript(), Some(&plan))
+            .unwrap();
+        let (_, _, _, loaded_plan) = store.load(&meta.id).unwrap();
+
+        assert_eq!(loaded_plan, Some(plan));
+    }
+
+    #[test]
+    fn second_write_keeps_only_latest_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let store = store_at(&root);
+        let meta = meta("session-plan-rewrite");
+        let plan_a = active_plan("计划 A");
+        let plan_b = active_plan("计划 B");
+
+        store
+            .write(&meta, &history(), &transcript(), Some(&plan_a))
+            .unwrap();
+        store
+            .write(&meta, &history(), &transcript(), Some(&plan_b))
+            .unwrap();
+
+        let body = fs::read_to_string(store.session_path(&meta.id)).unwrap();
+        let plan_lines: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with("{\"Plan\""))
+            .collect();
+        assert_eq!(plan_lines.len(), 1);
+
+        let (_, _, _, loaded_plan) = store.load(&meta.id).unwrap();
+        assert_eq!(loaded_plan, Some(plan_b));
+    }
+
+    #[test]
+    fn load_returns_err_when_plan_line_is_duplicated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let id = "session-two-plans";
+        let plan_a = active_plan("计划 A");
+        let plan_b = active_plan("计划 B");
+        write_lines(
+            &root,
+            id,
+            &[
+                SessionLine::Meta(meta(id)),
+                SessionLine::Plan(plan_a),
+                SessionLine::Msg(Message::User("hi".to_string())),
+                SessionLine::Plan(plan_b),
+            ],
+        );
+
+        assert!(store_at(&root).load(id).is_err());
+    }
+
+    // --- 兼容 / 序列化 / 摘要守护（骨架期预期绿）---
+
+    #[test]
+    fn load_without_plan_line_returns_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let store = store_at(&root);
+        let meta = meta("session-no-plan");
+
+        store.write(&meta, &history(), &transcript(), None).unwrap();
+        let (_, _, _, loaded_plan) = store.load(&meta.id).unwrap();
+
+        assert_eq!(loaded_plan, None);
+    }
+
+    #[test]
+    fn active_plan_and_step_status_serde_round_trip() {
+        let plan = active_plan("serde 计划");
+        let json = serde_json::to_value(&plan).unwrap();
+        let restored: ActivePlan = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, plan);
+
+        let status = StepStatus::InProgress;
+        let status_json = serde_json::to_value(status).unwrap();
+        let restored_status: StepStatus = serde_json::from_value(status_json).unwrap();
+        assert_eq!(restored_status, StepStatus::InProgress);
+        // 保留 Copy：赋值不 move
+        let _copy = status;
+        assert_eq!(status, StepStatus::InProgress);
+    }
+
+    #[test]
+    fn list_sessions_ignores_plan_lines_and_keeps_first_user() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let id = "session-list-with-plan";
+        write_lines(
+            &root,
+            id,
+            &[
+                SessionLine::Meta(meta(id)),
+                SessionLine::Plan(active_plan("列表计划")),
+                SessionLine::Msg(Message::User("首条用户消息".to_string())),
+                SessionLine::Msg(Message::Assistant {
+                    text: "ok".to_string(),
+                    tool_calls: vec![],
+                    thinking: Vec::new(),
+                }),
+            ],
+        );
+
+        let summaries = store_at(&root).list_sessions().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, id);
+        assert_eq!(summaries[0].first_user.as_deref(), Some("首条用户消息"));
     }
 }

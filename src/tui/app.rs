@@ -504,13 +504,13 @@ pub struct PendingQuestion {
     pub supplement: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivePlan {
     pub title: String,
     pub steps: Vec<ActiveStep>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveStep {
     pub description: String,
     pub validation: String,

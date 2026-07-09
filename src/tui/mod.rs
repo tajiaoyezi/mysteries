@@ -86,6 +86,13 @@ struct SessionStartup {
     history: Vec<Message>,
     transcript: Vec<app::TranscriptBlock>,
     resume_provider: Option<(String, String)>,
+    plan: Option<app::ActivePlan>,
+}
+
+/// 把 `load` 回传的 plan 落进 `current_plan`（纯视觉恢复 seam）。
+/// 函数体仅此一句——async history / input_tx / session_meta / transcript 不进 seam。
+pub(crate) fn apply_loaded_plan(state: &mut app::AppState, plan: Option<app::ActivePlan>) {
+    state.current_plan = plan;
 }
 
 pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError> {
@@ -166,6 +173,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
     state.permission_mode = permission_mode;
     state.thinking_depth = thinking_depth;
     state.transcript = session_startup.transcript;
+    apply_loaded_plan(&mut state, session_startup.plan);
     if state.thinking_cannot_disable_active() {
         state.transcript.push(app::TranscriptBlock::Notice(
             "该模型思考无法关闭".to_string(),
@@ -334,7 +342,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
 
         if let Some(id) = state.take_pending_session_switch() {
             match store.load(&id) {
-                Ok((meta, mut history, transcript)) => {
+                Ok((meta, mut history, transcript, plan)) => {
                     replace_system_head(&mut history, DEFAULT_SYSTEM_PROMPT);
                     let mut h = state.agent_history.lock().await;
                     *h = history;
@@ -349,6 +357,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
                     state.session.provider = provider;
                     state.session.model = model;
                     session_meta = meta;
+                    apply_loaded_plan(&mut state, plan);
                 }
                 Err(_) => state
                     .transcript
@@ -376,7 +385,7 @@ fn prepare_session_startup(
 ) -> Result<SessionStartup, CliError> {
     if mode == StartupMode::Continue {
         if let Some(id) = store.latest().map_err(cli_io_error)? {
-            let (meta, mut history, transcript) = store.load(&id).map_err(cli_io_error)?;
+            let (meta, mut history, transcript, plan) = store.load(&id).map_err(cli_io_error)?;
             replace_system_head(&mut history, DEFAULT_SYSTEM_PROMPT);
             let resume_provider = Some((meta.provider.clone(), meta.model.clone()));
             return Ok(SessionStartup {
@@ -384,6 +393,7 @@ fn prepare_session_startup(
                 history,
                 transcript,
                 resume_provider,
+                plan,
             });
         }
     }
@@ -401,6 +411,7 @@ fn prepare_session_startup(
         history: vec![Message::System(DEFAULT_SYSTEM_PROMPT.to_string())],
         transcript: Vec::new(),
         resume_provider: None,
+        plan: None,
     })
 }
 
@@ -421,7 +432,12 @@ fn write_session_snapshot(
     let mut meta = base_meta.clone();
     meta.provider = state.session.provider.clone();
     meta.model = state.session.model.clone();
-    store.write(&meta, history, &state.transcript)
+    store.write(
+        &meta,
+        history,
+        &state.transcript,
+        state.current_plan.as_ref(),
+    )
 }
 
 fn push_session_save_notice_if_error(state: &mut app::AppState, save_result: std::io::Result<()>) {
@@ -1490,13 +1506,13 @@ fn error_message(err: AgentError) -> String {
 mod tests {
     use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
     use super::{
-        apply_mouse_wheel_scroll_to_state, arrows_route_to_completion, cancel_action,
-        handle_mouse_selection_event, handle_queue_cancel_key, handle_resize, handle_selection_key,
-        prepare_session_startup, push_session_save_notice_if_error, run_agent_task,
-        scroll_action_for_key, selection_key_action, should_exit, terminal_session_event,
-        write_session_snapshot, CancelAction, ExitIntent, MouseWheelScrollAction,
-        RunAgentTaskConfig, SelectionKeyAction, StartupMode, DEFAULT_SYSTEM_PROMPT,
-        EXIT_DOUBLE_TAP,
+        apply_loaded_plan, apply_mouse_wheel_scroll_to_state, arrows_route_to_completion,
+        cancel_action, handle_mouse_selection_event, handle_queue_cancel_key, handle_resize,
+        handle_selection_key, prepare_session_startup, push_session_save_notice_if_error,
+        run_agent_task, scroll_action_for_key, selection_key_action, should_exit,
+        terminal_session_event, write_session_snapshot, CancelAction, ExitIntent,
+        MouseWheelScrollAction, RunAgentTaskConfig, SelectionKeyAction, StartupMode,
+        DEFAULT_SYSTEM_PROMPT, EXIT_DOUBLE_TAP,
     };
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
@@ -1513,8 +1529,9 @@ mod tests {
         DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, ToolCall,
     };
     use crate::session::{SessionMeta, SessionStore};
+    use crate::tool::plan::StepStatus;
     use crate::tool::ToolContext;
-    use crate::tui::app::{CommandCompletion, TranscriptBlock};
+    use crate::tui::app::{ActivePlan, ActiveStep, CommandCompletion, TranscriptBlock};
     use crate::tui::clipboard::Clipboard;
     use crate::tui::command::command_metadata;
     use crate::tui::selection::{Point, SelectionAction};
@@ -1673,7 +1690,7 @@ mod tests {
             Message::User("keep user".to_string()),
         ];
         let transcript = vec![TranscriptBlock::Notice("restored".to_string())];
-        store.write(&meta, &history, &transcript).unwrap();
+        store.write(&meta, &history, &transcript, None).unwrap();
 
         let startup =
             prepare_session_startup(&store, &paths, &config(), StartupMode::Continue).unwrap();
@@ -1691,6 +1708,71 @@ mod tests {
             startup.resume_provider,
             Some(("alt".to_string(), "alt-model".to_string()))
         );
+        assert_eq!(startup.plan, None);
+    }
+
+    #[test]
+    fn prepare_session_startup_continue_returns_persisted_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = cli_paths(&temp);
+        let store = SessionStore::new(paths.config_dir.join("sessions"));
+        let meta = session_meta("resume-with-plan");
+        let plan = ActivePlan {
+            title: "持久化计划".to_string(),
+            steps: vec![ActiveStep {
+                description: "一步".to_string(),
+                validation: "ok".to_string(),
+                status: StepStatus::Done,
+                validation_result: Some("passed".to_string()),
+            }],
+        };
+        store
+            .write(
+                &meta,
+                &[
+                    Message::System("old system".to_string()),
+                    Message::User("keep user".to_string()),
+                ],
+                &[TranscriptBlock::Notice("restored".to_string())],
+                Some(&plan),
+            )
+            .unwrap();
+
+        let startup =
+            prepare_session_startup(&store, &paths, &config(), StartupMode::Continue).unwrap();
+
+        assert_eq!(startup.plan, Some(plan));
+    }
+
+    #[test]
+    fn apply_loaded_plan_sets_current_plan_from_some() {
+        let mut state = crate::tui::app::AppState::new();
+        let plan = ActivePlan {
+            title: "还原计划".to_string(),
+            steps: vec![ActiveStep {
+                description: "步".to_string(),
+                validation: "v".to_string(),
+                status: StepStatus::Pending,
+                validation_result: None,
+            }],
+        };
+
+        apply_loaded_plan(&mut state, Some(plan.clone()));
+
+        assert_eq!(state.current_plan, Some(plan));
+    }
+
+    #[test]
+    fn apply_loaded_plan_none_leaves_current_plan_none() {
+        let mut state = crate::tui::app::AppState::new();
+        state.current_plan = Some(ActivePlan {
+            title: "应被清空".to_string(),
+            steps: vec![],
+        });
+
+        apply_loaded_plan(&mut state, None);
+
+        assert!(state.current_plan.is_none());
     }
 
     #[test]
@@ -1703,6 +1785,7 @@ mod tests {
                 &session_meta("stored-session"),
                 &[Message::System("old system".to_string())],
                 &[TranscriptBlock::Notice("stored".to_string())],
+                None,
             )
             .unwrap();
 

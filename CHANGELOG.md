@@ -6,6 +6,7 @@
 ## [Unreleased]
 
 ### 新增
+- **Plan 进度持久化**:`SessionLine::Plan` 把 `current_plan` 随会话 jsonl 落盘;`--resume` / `--continue` 经 plan-only seam `apply_loaded_plan` 做**纯视觉恢复**(不执行续接)。**降级不兼容**:升级后写出的含 `Plan` 行会话,回退到旧 v1.1.0 二进制读取会 `Err`。
 - **CLI `--help` / `-h` / `--version`**:输出用法 / 版本号后退出;此前这些及任意未知 flag 都会静默进入 TUI。
 
 ### 变更
