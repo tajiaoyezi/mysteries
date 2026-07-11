@@ -1,0 +1,29 @@
+---
+source: src/tui/render.rs
+assertion_line: 4456
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=f1.rs‹/›‹text.secondary›  只读 · 自动运行 · 运行中…‹/›‹text.muted› · ctrl+o 展开‹/›
+‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=f2.rs‹/›‹text.secondary›  只读 · 自动运行 · 运行中…‹/›
+‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=f3.rs‹/›‹text.secondary›  只读 · 自动运行 · 运行中…‹/›
+‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=f4.rs‹/›‹text.secondary›  只读 · 自动运行 · 运行中…‹/›
+‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=f5.rs‹/›‹text.secondary›  只读 · 自动运行 · 运行中…‹/›
+
+
+
+
+
+
+
+
+
+
+‹accent.primary›⠸ 处理 5 个工具（最多并行 4）…‹/›‹text.muted› · esc 中断‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.title›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换 · think low‹/›

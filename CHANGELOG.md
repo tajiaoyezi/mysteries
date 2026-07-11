@@ -6,12 +6,15 @@
 ## [Unreleased]
 
 ### 新增
+- **有界并行安全工具**:同一模型回复中连续的 `list_dir` / `read_file` / `glob` / `grep` 以 per-Agent 上限 4 并行执行;独立 `ToolConcurrency` 元数据(默认 `Exclusive`),不从 `PermissionLevel` 推断。结果仍按模型 occurrence 顺序写入 history / TUI;Network / Edit / Execute / Plan / 交互工具保持串行屏障。
+- **并行批次 TUI**:多张 Running C5 工具卡 + 活动状态行 `并行执行 N 个工具…` / `处理 N 个工具（最多并行 4）…`;Interrupt 收口 Running 卡与未配对 tool result;旧 session 激活前规范化残留 Running / dangling call。
 - **Network 权限级**:`web_fetch` / `web_search` 从 `ReadOnly` 拆为 `Network`;TUI 与 `--headless` 展示 terminal-safe 完整参数、canonical target 和 redirect/SSRF scope。有效 preview 默认逐次询问,Yolo 仅自动放行可授权 preview;未知/畸形调用 fail-closed,SSRF 仍逐跳强制。Provider transport 不属于 Tool gate。
 - **Plan 进度持久化**:`SessionLine::Plan` 把 `current_plan` 随会话 jsonl 落盘;`--resume` / `--continue` 经 plan-only seam `apply_loaded_plan` 做**纯视觉恢复**(不执行续接)。**降级不兼容**:升级后写出的含 `Plan` 行会话,回退到旧 v1.1.0 二进制读取会 `Err`。
 - **CLI `--help` / `-h` / `--version`**:输出用法 / 版本号后退出;此前这些及任意未知 flag 都会静默进入 TUI。
 
 ### 变更
 - README tests badge 去数字化(`800+`),不再硬编码具体数,避免与实际测试数漂移。
+- 四个本地读取工具的同步文件工作经 `spawn_blocking` + 进程级 Semaphore(4) offload,避免占满 Tokio worker。
 
 ### 测试
 - 新增 CLI flag 解析 5 组单测(`wants_help` / `wants_version` / `help_text` / `version_text`);`tui::width` CJK 显示宽度补 8 组 characterization 测试(全 / 半角边界、零宽标记、截断),经 mutation check 防假绿。

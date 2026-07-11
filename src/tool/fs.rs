@@ -1,4 +1,7 @@
-use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
+use crate::tool::{
+    process_blocking_limiter, run_blocking_tool, PermissionLevel, Tool, ToolConcurrency,
+    ToolContext, ToolOutcome,
+};
 use async_trait::async_trait;
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -37,51 +40,63 @@ impl Tool for GrepTool {
         PermissionLevel::ReadOnly
     }
 
-    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
-        let Some(pattern) = string_arg(&args, "pattern") else {
-            return error_outcome("missing or invalid pattern");
-        };
-        let path = string_arg(&args, "path").unwrap_or(".");
-        let path = resolve_path(&ctx.cwd, path);
-        if !path.is_dir() {
-            return error_outcome(format!("directory not found: {}", path.display()));
-        }
-
-        let regex = match Regex::new(pattern) {
-            Ok(regex) => regex,
-            Err(err) => return error_outcome(format!("invalid regex: {err}")),
-        };
-
-        let mut matches = Vec::new();
-        for item in walker(&path).build() {
-            let item = match item {
-                Ok(item) => item,
-                Err(_) => continue,
-            };
-            if !item
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-            {
-                continue;
-            }
-            let entry_path = item.path();
-            let Ok(relative) = entry_path.strip_prefix(&path) else {
-                continue;
-            };
-            let relative = normalize_relative_path(relative);
-            let content = match fs::read_to_string(entry_path) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-            for (line_index, line) in content.lines().enumerate() {
-                if regex.is_match(line) {
-                    matches.push(format!("{}:{}:{}", relative, line_index + 1, line));
-                }
-            }
-        }
-
-        success_with_truncation(matches.join("\n"), ctx.max_output_bytes)
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
     }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
+        let ctx = ctx.clone();
+        run_blocking_tool(&process_blocking_limiter(), move || {
+            execute_grep(args, &ctx)
+        })
+        .await
+    }
+}
+
+fn execute_grep(args: Value, ctx: &ToolContext) -> ToolOutcome {
+    let Some(pattern) = string_arg(&args, "pattern") else {
+        return error_outcome("missing or invalid pattern");
+    };
+    let path = string_arg(&args, "path").unwrap_or(".");
+    let path = resolve_path(&ctx.cwd, path);
+    if !path.is_dir() {
+        return error_outcome(format!("directory not found: {}", path.display()));
+    }
+
+    let regex = match Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(err) => return error_outcome(format!("invalid regex: {err}")),
+    };
+
+    let mut matches = Vec::new();
+    for item in walker(&path).build() {
+        let item = match item {
+            Ok(item) => item,
+            Err(_) => continue,
+        };
+        if !item
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let entry_path = item.path();
+        let Ok(relative) = entry_path.strip_prefix(&path) else {
+            continue;
+        };
+        let relative = normalize_relative_path(relative);
+        let content = match fs::read_to_string(entry_path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        for (line_index, line) in content.lines().enumerate() {
+            if regex.is_match(line) {
+                matches.push(format!("{}:{}:{}", relative, line_index + 1, line));
+            }
+        }
+    }
+
+    success_with_truncation(matches.join("\n"), ctx.max_output_bytes)
 }
 
 #[async_trait]
@@ -109,56 +124,68 @@ impl Tool for GlobTool {
         PermissionLevel::ReadOnly
     }
 
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
+    }
+
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
-        let Some(pattern) = string_arg(&args, "pattern") else {
-            return error_outcome("missing or invalid pattern");
-        };
-        let path = string_arg(&args, "path").unwrap_or(".");
-        let path = resolve_path(&ctx.cwd, path);
-        if !path.is_dir() {
-            return error_outcome(format!("directory not found: {}", path.display()));
-        }
+        let ctx = ctx.clone();
+        run_blocking_tool(&process_blocking_limiter(), move || {
+            execute_glob(args, &ctx)
+        })
+        .await
+    }
+}
 
-        let glob = match Glob::new(pattern) {
-            Ok(glob) => glob,
-            Err(err) => return error_outcome(format!("invalid glob pattern: {err}")),
-        };
-        let mut builder = GlobSetBuilder::new();
-        builder.add(glob);
-        let matcher = match builder.build() {
-            Ok(matcher) => matcher,
-            Err(err) => return error_outcome(format!("invalid glob pattern: {err}")),
-        };
+fn execute_glob(args: Value, ctx: &ToolContext) -> ToolOutcome {
+    let Some(pattern) = string_arg(&args, "pattern") else {
+        return error_outcome("missing or invalid pattern");
+    };
+    let path = string_arg(&args, "path").unwrap_or(".");
+    let path = resolve_path(&ctx.cwd, path);
+    if !path.is_dir() {
+        return error_outcome(format!("directory not found: {}", path.display()));
+    }
 
-        let mut entries = Vec::new();
-        for item in walker(&path).build() {
-            let item = match item {
-                Ok(item) => item,
-                Err(_) => continue,
-            };
-            if !item
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-            {
-                continue;
-            }
-            let entry_path = item.path();
-            let Ok(relative) = entry_path.strip_prefix(&path) else {
-                continue;
-            };
-            let relative = normalize_relative_path(relative);
-            if matcher.is_match(&relative) {
-                entries.push(relative);
-            }
-        }
-        entries.sort();
+    let glob = match Glob::new(pattern) {
+        Ok(glob) => glob,
+        Err(err) => return error_outcome(format!("invalid glob pattern: {err}")),
+    };
+    let mut builder = GlobSetBuilder::new();
+    builder.add(glob);
+    let matcher = match builder.build() {
+        Ok(matcher) => matcher,
+        Err(err) => return error_outcome(format!("invalid glob pattern: {err}")),
+    };
 
-        ToolOutcome {
-            content: entries.join("\n"),
-            is_error: false,
-            truncated: false,
-            exit: None,
+    let mut entries = Vec::new();
+    for item in walker(&path).build() {
+        let item = match item {
+            Ok(item) => item,
+            Err(_) => continue,
+        };
+        if !item
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
         }
+        let entry_path = item.path();
+        let Ok(relative) = entry_path.strip_prefix(&path) else {
+            continue;
+        };
+        let relative = normalize_relative_path(relative);
+        if matcher.is_match(&relative) {
+            entries.push(relative);
+        }
+    }
+    entries.sort();
+
+    ToolOutcome {
+        content: entries.join("\n"),
+        is_error: false,
+        truncated: false,
+        exit: None,
     }
 }
 
@@ -185,36 +212,48 @@ impl Tool for ListDirTool {
         PermissionLevel::ReadOnly
     }
 
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
+    }
+
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
-        let path = string_arg(&args, "path").unwrap_or(".");
-        let path = resolve_path(&ctx.cwd, path);
-        if !path.is_dir() {
-            return error_outcome(format!("directory not found: {}", path.display()));
-        }
+        let ctx = ctx.clone();
+        run_blocking_tool(&process_blocking_limiter(), move || {
+            execute_list_dir(args, &ctx)
+        })
+        .await
+    }
+}
 
-        let mut entries = Vec::new();
-        for item in walker(&path).max_depth(Some(1)).build() {
-            let item = match item {
-                Ok(item) => item,
-                Err(err) => return error_outcome(format!("failed to list directory: {err}")),
-            };
-            let entry_path = item.path();
-            if entry_path == path {
-                continue;
-            }
-            let Ok(relative) = entry_path.strip_prefix(&path) else {
-                continue;
-            };
-            entries.push(relative.display().to_string());
-        }
-        entries.sort();
+fn execute_list_dir(args: Value, ctx: &ToolContext) -> ToolOutcome {
+    let path = string_arg(&args, "path").unwrap_or(".");
+    let path = resolve_path(&ctx.cwd, path);
+    if !path.is_dir() {
+        return error_outcome(format!("directory not found: {}", path.display()));
+    }
 
-        ToolOutcome {
-            content: entries.join("\n"),
-            is_error: false,
-            truncated: false,
-            exit: None,
+    let mut entries = Vec::new();
+    for item in walker(&path).max_depth(Some(1)).build() {
+        let item = match item {
+            Ok(item) => item,
+            Err(err) => return error_outcome(format!("failed to list directory: {err}")),
+        };
+        let entry_path = item.path();
+        if entry_path == path {
+            continue;
         }
+        let Ok(relative) = entry_path.strip_prefix(&path) else {
+            continue;
+        };
+        entries.push(relative.display().to_string());
+    }
+    entries.sort();
+
+    ToolOutcome {
+        content: entries.join("\n"),
+        is_error: false,
+        truncated: false,
+        exit: None,
     }
 }
 
@@ -244,22 +283,34 @@ impl Tool for ReadFileTool {
         PermissionLevel::ReadOnly
     }
 
-    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
-        let Some(path) = string_arg(&args, "path") else {
-            return error_outcome("missing or invalid path");
-        };
-        let offset = usize_arg(&args, "offset").unwrap_or(0);
-        let limit = usize_arg(&args, "limit");
-        let path = resolve_path(&ctx.cwd, path);
-
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(err) => return error_outcome(format!("failed to read {}: {err}", path.display())),
-        };
-        let paged = page_lines(&content, offset, limit);
-
-        success_with_truncation(paged, ctx.max_output_bytes)
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::ParallelSafe
     }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
+        let ctx = ctx.clone();
+        run_blocking_tool(&process_blocking_limiter(), move || {
+            execute_read_file(args, &ctx)
+        })
+        .await
+    }
+}
+
+fn execute_read_file(args: Value, ctx: &ToolContext) -> ToolOutcome {
+    let Some(path) = string_arg(&args, "path") else {
+        return error_outcome("missing or invalid path");
+    };
+    let offset = usize_arg(&args, "offset").unwrap_or(0);
+    let limit = usize_arg(&args, "limit");
+    let path = resolve_path(&ctx.cwd, path);
+
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) => return error_outcome(format!("failed to read {}: {err}", path.display())),
+    };
+    let paged = page_lines(&content, offset, limit);
+
+    success_with_truncation(paged, ctx.max_output_bytes)
 }
 
 fn string_arg<'a>(args: &'a Value, field: &str) -> Option<&'a str> {

@@ -1,0 +1,29 @@
+---
+source: src/tui/render.rs
+assertion_line: 4474
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹error.fg›✗‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› {}‹/›‹text.secondary›  只读 · 自动运行 · 1 行 ⌄‹/›‹text.muted› · ctrl+o 展开‹/›
+‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› path=new.rs‹/›‹text.secondary›  只读 · 自动运行 · 1 行 ⌄‹/›
+
+
+
+
+
+
+
+
+
+
+
+
+
+‹text.muted›◇ 就绪‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换 · think low‹/›

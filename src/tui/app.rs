@@ -39,6 +39,8 @@ pub enum Phase {
     Busy,
     CallingModel,
     ExecutingTool(String),
+    /// 并行工具批次执行中（`ExecutingTools(total)`，total 为当前 batch 大小）。
+    ExecutingTools(usize),
     WaitingForPermission,
     /// 手动 /compact 进行中:activity line 显示压缩动画,提交入队,CompactDone 收场。
     Compacting,
@@ -660,6 +662,11 @@ impl AppState {
         self.pending_session_switch.take()
     }
 
+    /// 窥视 pending session switch（不消费）；供同批终止与测试使用。
+    pub fn pending_session_switch(&self) -> Option<&str> {
+        self.pending_session_switch.as_deref()
+    }
+
     pub(crate) fn last_cancel_at(&self) -> Option<Instant> {
         self.last_cancel_at
     }
@@ -1133,12 +1140,12 @@ impl AppState {
             KeyCode::Enter => {
                 if let Some(picker) = self.models_picker.as_ref() {
                     if let Some((id, model)) = picker.selected() {
+                        // 不乐观写 UI；等 AgentEvent::ProviderApplied 再提交。
                         let _ = input_tx.send(UserInput::SetProvider {
-                            id: id.clone(),
-                            model: model.clone(),
+                            id,
+                            model,
+                            kind: crate::tui::channel::ProviderSwitchKind::Interactive,
                         });
-                        self.session.provider = id;
-                        self.session.model = model;
                     }
                 }
                 self.close_models_picker();
@@ -1271,8 +1278,13 @@ impl AppState {
                     ToolCardStatus::Done
                 };
 
+                // 按 occurrence：只收口最早「同 id 且仍 Running」的卡，避免改写历史 Done。
                 if let Some(card) = self.transcript.iter_mut().find_map(|block| match block {
-                    TranscriptBlock::Tool(card) if card.id == id => Some(card),
+                    TranscriptBlock::Tool(card)
+                        if card.id == id && card.status == ToolCardStatus::Running =>
+                    {
+                        Some(card)
+                    }
                     _ => None,
                 }) {
                     card.status = status;
@@ -1289,6 +1301,7 @@ impl AppState {
                     AgentStatus::Idle => { /* phase→Ready 仅由三终止事件驱动 */ }
                     AgentStatus::CallingModel => self.phase = Phase::CallingModel,
                     AgentStatus::ExecutingTool(name) => self.phase = Phase::ExecutingTool(name),
+                    AgentStatus::ExecutingTools(count) => self.phase = Phase::ExecutingTools(count),
                     AgentStatus::WaitingForPermission => self.phase = Phase::WaitingForPermission,
                 }
             }
@@ -1329,6 +1342,10 @@ impl AppState {
             AgentEvent::Notice(message) => {
                 self.transcript.push(TranscriptBlock::Notice(message));
             }
+            AgentEvent::ProviderApplied { id, model } => {
+                self.session.provider = id;
+                self.session.model = model;
+            }
             AgentEvent::CompactDone => {
                 self.phase = Phase::Ready;
             }
@@ -1339,6 +1356,14 @@ impl AppState {
                 self.pending_question = None;
                 self.iteration = 0;
                 self.phase = Phase::Ready;
+                for block in self.transcript.iter_mut() {
+                    if let TranscriptBlock::Tool(card) = block {
+                        if card.status == ToolCardStatus::Running {
+                            card.status = ToolCardStatus::Error;
+                            card.output = Some("工具调用已中断".to_string());
+                        }
+                    }
+                }
                 self.transcript
                     .push(TranscriptBlock::Notice("⊘ 已中断本轮".to_string()));
                 if was_busy {
@@ -1777,6 +1802,7 @@ impl AppState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyBatchKeyResult {
     Continue,
     BreakBatch,
@@ -2328,6 +2354,88 @@ mod tests {
         assert!(state.session_picker.is_some());
         assert_eq!(state.input(), "keep");
         assert_eq!(state.take_pending_session_switch(), None);
+    }
+
+    /// 审查问题 #1：直接复用 `process_event_batch` 的 session-picker production seam。
+    /// `[Enter 选中, Char, Enter]` 同批：选中后必须立即终止 batch，
+    /// 不得在 activation 前发送 Prompt，也不得把尾随键写入 input。
+    #[test]
+    fn session_picker_enter_char_enter_same_batch_must_not_submit_prompt() {
+        use crate::tui::app::{
+            apply_batch_input_key, flush_merged_input_chars, ApplyBatchKeyResult, BatchInputContext,
+        };
+        use crate::tui::handle_session_picker_batch_key;
+        use crate::tui::input_batch::classify_key_batch;
+
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let mut state = AppState::new();
+        state.open_session_picker(vec![
+            session_summary("session-a", "created-a", Some("first a")),
+            session_summary("session-b", "created-b", Some("first b")),
+        ]);
+        state.session_picker.as_mut().unwrap().highlighted = 0;
+
+        // 整批事件（与用户场景一致）
+        let keys = [
+            key(KeyCode::Enter),
+            key(KeyCode::Char('h')),
+            key(KeyCode::Enter),
+        ];
+        let intents = classify_key_batch(&keys);
+        let mut pending_str = String::new();
+        let mut modal_closed_in_batch = false;
+
+        for (ev, intent) in keys.iter().zip(intents.iter()) {
+            if let Some(control) =
+                handle_session_picker_batch_key(&mut state, *ev, &mut pending_str)
+            {
+                if control == ApplyBatchKeyResult::BreakBatch {
+                    break;
+                }
+                continue;
+            }
+            match apply_batch_input_key(
+                &mut state,
+                *ev,
+                *intent,
+                &mut modal_closed_in_batch,
+                &mut pending_str,
+                BatchInputContext {
+                    input_tx: &input_tx,
+                    interrupt_tx: &interrupt_tx,
+                    terminal_area: Some(ratatui::layout::Rect::new(0, 0, 80, 24)),
+                },
+            ) {
+                ApplyBatchKeyResult::Continue => {}
+                ApplyBatchKeyResult::BreakBatch => break,
+            }
+        }
+        flush_merged_input_chars(&mut state, &mut pending_str);
+
+        assert_eq!(
+            state.take_pending_session_switch(),
+            Some("session-a".to_string()),
+            "Enter 必须选中 session"
+        );
+        assert!(state.session_picker.is_none());
+
+        let mut saw_prompt = false;
+        while let Ok(msg) = input_rx.try_recv() {
+            if matches!(msg, UserInput::Prompt(_)) {
+                saw_prompt = true;
+            }
+        }
+        assert!(
+            !saw_prompt,
+            "审查#1：同批尾随键不得在 activation 前发送 Prompt"
+        );
+        // 选中后终止 batch 的核心证据：input 不得被尾随 Char/Enter 污染。
+        assert_eq!(
+            state.input(),
+            "",
+            "审查#1：选中后必须终止 batch，尾随 Char/Enter 不得写入 input（当前 continue 会污染）"
+        );
     }
 
     // --- 消息排队 Task 2(提交分流) ---
@@ -3044,6 +3152,179 @@ mod tests {
     }
 
     #[test]
+    fn apply_interrupted_closes_running_cards_keeps_done() {
+        let mut state = AppState::new();
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "a".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({}),
+            readonly: true,
+        });
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "b".into(),
+            name: "grep".into(),
+            args: serde_json::json!({}),
+            readonly: true,
+        });
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "a".into(),
+            outcome: ToolOutcome {
+                content: "done".into(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            },
+        });
+        // b still Running
+        state.apply(AgentEvent::Interrupted);
+
+        let cards: Vec<_> = state
+            .transcript
+            .iter()
+            .filter_map(|b| match b {
+                TranscriptBlock::Tool(c) => {
+                    Some((c.id.as_str(), c.status.clone(), c.output.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cards,
+            vec![
+                ("a", ToolCardStatus::Done, Some("done".into())),
+                ("b", ToolCardStatus::Error, Some("工具调用已中断".into())),
+            ]
+        );
+        assert!(state
+            .transcript
+            .iter()
+            .any(|b| matches!(b, TranscriptBlock::Notice(n) if n.contains("已中断本轮"))));
+    }
+
+    #[test]
+    fn apply_status_changed_executing_tools_keeps_batch_total() {
+        let mut state = AppState::new();
+
+        state.apply(AgentEvent::StatusChanged(AgentStatus::ExecutingTools(2)));
+        assert_eq!(state.phase, Phase::ExecutingTools(2));
+
+        state.apply(AgentEvent::StatusChanged(AgentStatus::ExecutingTools(5)));
+        assert_eq!(state.phase, Phase::ExecutingTools(5));
+    }
+
+    #[test]
+    fn apply_multiple_started_creates_running_cards_in_arrival_order() {
+        let mut state = AppState::new();
+        for (id, name) in [
+            ("c1", "read_file"),
+            ("c2", "grep"),
+            ("c3", "glob"),
+            ("c4", "list_dir"),
+            ("c5", "read_file"),
+        ] {
+            state.apply(AgentEvent::ToolCallStarted {
+                id: id.into(),
+                name: name.into(),
+                args: serde_json::json!({}),
+                readonly: true,
+            });
+        }
+        state.apply(AgentEvent::StatusChanged(AgentStatus::ExecutingTools(5)));
+
+        let ids: Vec<_> = state
+            .transcript
+            .iter()
+            .filter_map(|b| match b {
+                TranscriptBlock::Tool(card) => Some((card.id.as_str(), card.status.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("c1", ToolCardStatus::Running),
+                ("c2", ToolCardStatus::Running),
+                ("c3", ToolCardStatus::Running),
+                ("c4", ToolCardStatus::Running),
+                ("c5", ToolCardStatus::Running),
+            ]
+        );
+        assert_eq!(state.phase, Phase::ExecutingTools(5));
+    }
+
+    #[test]
+    fn apply_finished_updates_earliest_running_card_with_same_id() {
+        let mut state = AppState::new();
+        // 历史 Done 卡
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({}),
+            readonly: true,
+        });
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "call-1".into(),
+            outcome: crate::tool::ToolOutcome {
+                content: "old".into(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            },
+        });
+        // 同 id 两张新 Running
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({"k": "a"}),
+            readonly: true,
+        });
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({"k": "b"}),
+            readonly: true,
+        });
+
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "call-1".into(),
+            outcome: crate::tool::ToolOutcome {
+                content: "first-new".into(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            },
+        });
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "call-1".into(),
+            outcome: crate::tool::ToolOutcome {
+                content: "second-new".into(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            },
+        });
+
+        let cards: Vec<_> = state
+            .transcript
+            .iter()
+            .filter_map(|b| match b {
+                TranscriptBlock::Tool(card) => {
+                    Some((card.status.clone(), card.output.as_deref().unwrap_or("")))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cards,
+            vec![
+                (ToolCardStatus::Done, "old"),
+                (ToolCardStatus::Done, "first-new"),
+                (ToolCardStatus::Done, "second-new"),
+            ]
+        );
+    }
+
+    #[test]
     fn apply_text_delta_accumulates_current_assistant_block() {
         let mut state = AppState::new();
 
@@ -3569,9 +3850,10 @@ mod tests {
         assert_eq!(state.session.provider, "wps");
         assert_eq!(state.session.model, "zhipu/glm-5.2");
         match rx.try_recv() {
-            Ok(UserInput::SetProvider { id, model }) => {
+            Ok(UserInput::SetProvider { id, model, kind }) => {
                 assert_eq!(id, "wps");
                 assert_eq!(model, "zhipu/glm-5.2");
+                assert_eq!(kind, crate::tui::channel::ProviderSwitchKind::Interactive);
             }
             other => panic!("expected SetProvider, got {other:?}"),
         }

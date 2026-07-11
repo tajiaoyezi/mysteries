@@ -11,13 +11,15 @@ use crate::error::{AgentError, ProviderError};
 use crate::permission::{
     gate, PermissionDecider, PermissionDenial, PermissionGateOutcome, PermissionMode,
 };
-use crate::provider::{DeltaSink, Depth, ModelRequest, Provider, ThinkingConfig, Usage};
-use crate::tool::{PermissionLevel, ToolContext, ToolOutcome, ToolRegistry};
+use crate::provider::{DeltaSink, Depth, ModelRequest, Provider, ThinkingConfig, ToolCall, Usage};
+use crate::tool::{PermissionLevel, ToolConcurrency, ToolContext, ToolOutcome, ToolRegistry};
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant. Do not claim to be Claude, ChatGPT, OpenAI, Anthropic, or any specific upstream model. If asked about your model identity, say you are running inside Mysteries and the configured model name is shown in the status line.";
 pub const PLAN_MODE_INSTRUCTION: &str = "你在 plan 模式。可使用 ReadOnly 与 Network 工具调研；每次 Network 调用仍须用户授权。禁止 Edit 与 Execute 工具。用户只是问 → 直接答;撞到岔路/歧义 → ask_user 弹选项让用户定;用户要执行任务 → 调研够了 submit_plan 交结构化 plan、每步带可验收 validation。每步 description 一句话简述(尽量 ≤30 字),不写长段落、不堆细节;细节留到执行时或放进 validation";
 const DEFAULT_MODEL: &str = "mock-model";
+/// 同一 Agent 并行安全批次的最大同时 in-flight execute 数。
+pub const MAX_PARALLEL_TOOL_CALLS: usize = 4;
 
 pub async fn run_single_turn(
     provider: &dyn Provider,
@@ -48,6 +50,8 @@ pub enum AgentStatus {
     Idle,
     CallingModel,
     ExecutingTool(String),
+    /// 并行安全批次（段长 >1）的聚合状态；count 为整段已调度 occurrence 总数。
+    ExecutingTools(usize),
     WaitingForPermission,
 }
 
@@ -111,12 +115,18 @@ impl Agent {
         self.permission_mode = mode;
     }
 
+    /// 交互式模型切换：清空 history 中全部 Assistant.thinking。
     pub fn set_model(&mut self, model: String, history: &mut [Message]) {
         for message in history.iter_mut() {
             if let Message::Assistant { thinking, .. } = message {
                 thinking.clear();
             }
         }
+        self.restore_model(model);
+    }
+
+    /// Session 恢复等路径：只更新 model / ContextStrategy，不碰 thinking。
+    pub fn restore_model(&mut self, model: String) {
         self.model = model.clone();
         self.strategy.set_model(model);
     }
@@ -194,99 +204,8 @@ impl Agent {
                 return Ok(text);
             }
 
-            for call in tool_calls {
-                let Some(tool) = self.registry.get(&call.name) else {
-                    let outcome = ToolOutcome {
-                        content: format!("unknown tool: {}", call.name),
-                        is_error: true,
-                        truncated: false,
-                        exit: None,
-                    };
-                    history.push(Message::ToolResult {
-                        call_id: call.id.clone(),
-                        content: outcome.content.clone(),
-                        is_error: outcome.is_error,
-                    });
-                    observer.on_tool_call_finished(&call.id, &outcome);
-                    continue;
-                };
-
-                let readonly = tool.permission_level() == PermissionLevel::ReadOnly;
-                observer.on_tool_call_started(&call.id, &call.name, &call.arguments, readonly);
-
-                if mode == PermissionMode::Plan
-                    && matches!(
-                        tool.permission_level(),
-                        PermissionLevel::Edit | PermissionLevel::Execute
-                    )
-                {
-                    let outcome = ToolOutcome {
-                        content: "plan mode forbids non-readonly tools".to_string(),
-                        is_error: true,
-                        truncated: false,
-                        exit: None,
-                    };
-                    history.push(Message::ToolResult {
-                        call_id: call.id.clone(),
-                        content: outcome.content.clone(),
-                        is_error: outcome.is_error,
-                    });
-                    observer.on_tool_call_finished(&call.id, &outcome);
-                    continue;
-                }
-
-                if mode != PermissionMode::Plan && tool.plan_only() {
-                    let outcome = ToolOutcome {
-                        content: "submit_plan is only available in plan mode".to_string(),
-                        is_error: true,
-                        truncated: false,
-                        exit: None,
-                    };
-                    history.push(Message::ToolResult {
-                        call_id: call.id.clone(),
-                        content: outcome.content.clone(),
-                        is_error: outcome.is_error,
-                    });
-                    observer.on_tool_call_finished(&call.id, &outcome);
-                    continue;
-                }
-
-                if !readonly {
-                    observer.on_status(AgentStatus::WaitingForPermission);
-                }
-
-                let gate_outcome = gate(&call, tool, self.decider.as_ref()).await;
-                if let PermissionGateOutcome::Deny(denial) = gate_outcome {
-                    let outcome = ToolOutcome {
-                        content: match denial {
-                            PermissionDenial::UserDenied => {
-                                "user denied tool execution".to_string()
-                            }
-                            PermissionDenial::NetworkUnauthorizable(reason) => reason,
-                        },
-                        is_error: true,
-                        truncated: false,
-                        exit: None,
-                    };
-                    history.push(Message::ToolResult {
-                        call_id: call.id.clone(),
-                        content: outcome.content.clone(),
-                        is_error: outcome.is_error,
-                    });
-                    observer.on_tool_call_finished(&call.id, &outcome);
-                    continue;
-                }
-
-                observer.on_status(AgentStatus::ExecutingTool(call.name.clone()));
-                let outcome = tool.execute(call.arguments.clone(), ctx).await;
-
-                history.push(Message::ToolResult {
-                    call_id: call.id.clone(),
-                    content: outcome.content.clone(),
-                    is_error: outcome.is_error,
-                });
-                observer.on_tool_call_finished(&call.id, &outcome);
-            }
+            self.dispatch_tool_calls(&tool_calls, mode, history, ctx, observer)
+                .await;
         }
 
         let depth = *self
@@ -325,6 +244,203 @@ impl Agent {
 
         Ok(text)
     }
+
+    /// 工具存在 + ParallelSafe + ReadOnly + !plan_only 才可进入并行段（host clamp）。
+    fn is_parallel_eligible(&self, call: &ToolCall) -> bool {
+        let Some(tool) = self.registry.get(&call.name) else {
+            return false;
+        };
+        tool.concurrency() == ToolConcurrency::ParallelSafe
+            && tool.permission_level() == PermissionLevel::ReadOnly
+            && !tool.plan_only()
+    }
+
+    async fn dispatch_tool_calls(
+        &self,
+        tool_calls: &[ToolCall],
+        mode: PermissionMode,
+        history: &mut Vec<Message>,
+        ctx: &ToolContext,
+        observer: &dyn AgentObserver,
+    ) {
+        let mut index = 0;
+        while index < tool_calls.len() {
+            if self.is_parallel_eligible(&tool_calls[index]) {
+                let mut end = index + 1;
+                while end < tool_calls.len() && self.is_parallel_eligible(&tool_calls[end]) {
+                    end += 1;
+                }
+                let batch = &tool_calls[index..end];
+                if batch.len() == 1 {
+                    self.execute_tool_call_serial(&batch[0], mode, history, ctx, observer)
+                        .await;
+                } else {
+                    self.execute_parallel_safe_batch(batch, history, ctx, observer)
+                        .await;
+                }
+                index = end;
+            } else {
+                self.execute_tool_call_serial(&tool_calls[index], mode, history, ctx, observer)
+                    .await;
+                index += 1;
+            }
+        }
+    }
+
+    fn publish_tool_outcome(
+        history: &mut Vec<Message>,
+        observer: &dyn AgentObserver,
+        call_id: &str,
+        outcome: ToolOutcome,
+    ) {
+        history.push(Message::ToolResult {
+            call_id: call_id.to_string(),
+            content: outcome.content.clone(),
+            is_error: outcome.is_error,
+        });
+        observer.on_tool_call_finished(call_id, &outcome);
+    }
+
+    async fn execute_tool_call_serial(
+        &self,
+        call: &ToolCall,
+        mode: PermissionMode,
+        history: &mut Vec<Message>,
+        ctx: &ToolContext,
+        observer: &dyn AgentObserver,
+    ) {
+        let Some(tool) = self.registry.get(&call.name) else {
+            let outcome = ToolOutcome {
+                content: format!("unknown tool: {}", call.name),
+                is_error: true,
+                truncated: false,
+                exit: None,
+            };
+            Self::publish_tool_outcome(history, observer, &call.id, outcome);
+            return;
+        };
+
+        let readonly = tool.permission_level() == PermissionLevel::ReadOnly;
+        observer.on_tool_call_started(&call.id, &call.name, &call.arguments, readonly);
+
+        if mode == PermissionMode::Plan
+            && matches!(
+                tool.permission_level(),
+                PermissionLevel::Edit | PermissionLevel::Execute
+            )
+        {
+            let outcome = ToolOutcome {
+                content: "plan mode forbids non-readonly tools".to_string(),
+                is_error: true,
+                truncated: false,
+                exit: None,
+            };
+            Self::publish_tool_outcome(history, observer, &call.id, outcome);
+            return;
+        }
+
+        if mode != PermissionMode::Plan && tool.plan_only() {
+            let outcome = ToolOutcome {
+                content: "submit_plan is only available in plan mode".to_string(),
+                is_error: true,
+                truncated: false,
+                exit: None,
+            };
+            Self::publish_tool_outcome(history, observer, &call.id, outcome);
+            return;
+        }
+
+        if !readonly {
+            observer.on_status(AgentStatus::WaitingForPermission);
+        }
+
+        let gate_outcome = gate(call, tool, self.decider.as_ref()).await;
+        if let PermissionGateOutcome::Deny(denial) = gate_outcome {
+            let outcome = ToolOutcome {
+                content: match denial {
+                    PermissionDenial::UserDenied => "user denied tool execution".to_string(),
+                    PermissionDenial::NetworkUnauthorizable(reason) => reason,
+                },
+                is_error: true,
+                truncated: false,
+                exit: None,
+            };
+            Self::publish_tool_outcome(history, observer, &call.id, outcome);
+            return;
+        }
+
+        observer.on_status(AgentStatus::ExecutingTool(call.name.clone()));
+        let outcome = tool.execute(call.arguments.clone(), ctx).await;
+        Self::publish_tool_outcome(history, observer, &call.id, outcome);
+    }
+
+    /// 连续 ParallelSafe 段：先按模型顺序发全部 started + ExecutingTools(total)，
+    /// 再以 indexed stream + `buffer_unordered(MAX_PARALLEL_TOOL_CALLS)` 执行；
+    /// ready buffer 只发布连续 ready 前缀（模型公开 occurrence 顺序）。
+    async fn execute_parallel_safe_batch(
+        &self,
+        batch: &[ToolCall],
+        history: &mut Vec<Message>,
+        ctx: &ToolContext,
+        observer: &dyn AgentObserver,
+    ) {
+        use futures_util::stream::{self, StreamExt as _};
+
+        for call in batch {
+            // eligible 保证 ReadOnly
+            observer.on_tool_call_started(&call.id, &call.name, &call.arguments, true);
+        }
+        observer.on_status(AgentStatus::ExecutingTools(batch.len()));
+
+        // ReadOnly gate 恒 Allow；启动前串行过 gate 保持契约，不并发授权。
+        for call in batch {
+            let tool = self
+                .registry
+                .get(&call.name)
+                .expect("parallel eligible implies tool exists");
+            let _ = gate(call, tool, self.decider.as_ref()).await;
+        }
+
+        let call_ids: Vec<String> = batch.iter().map(|c| c.id.clone()).collect();
+        let n = batch.len();
+        let mut ready: Vec<Option<ToolOutcome>> = (0..n).map(|_| None).collect();
+        let mut next_publish = 0usize;
+
+        // 每个 future 返回 (original_index, ToolOutcome)；不要求 registry Arc。
+        let execs = (0..n).map(|idx| {
+            let call = &batch[idx];
+            let tool = self
+                .registry
+                .get(&call.name)
+                .expect("parallel eligible implies tool exists");
+            let args = call.arguments.clone();
+            async move { (idx, tool.execute(args, ctx).await) }
+        });
+
+        let mut completed = stream::iter(execs).buffer_unordered(MAX_PARALLEL_TOOL_CALLS);
+        while let Some((idx, outcome)) = completed.next().await {
+            ready[idx] = Some(outcome);
+            while next_publish < n {
+                match ready[next_publish].take() {
+                    Some(outcome) => {
+                        Self::publish_tool_outcome(
+                            history,
+                            observer,
+                            &call_ids[next_publish],
+                            outcome,
+                        );
+                        next_publish += 1;
+                    }
+                    // 非连续 ready 前缀：等更早 index 完成（非 dangling 退出）。
+                    None => break,
+                }
+            }
+        }
+        debug_assert_eq!(
+            next_publish, n,
+            "buffer_unordered drain must publish every occurrence"
+        );
+    }
 }
 
 impl From<ContextError> for AgentError {
@@ -353,14 +469,16 @@ mod tests {
     use crate::tool::plan::{MockPlanApprover, Plan, PlanApprover, PlanDecision, SubmitPlanTool};
     use crate::tool::web::{WebError, WebFetchTool, WebFetcher, WebSearchTool};
     use crate::tool::{
-        NetworkPermissionPreview, NetworkPermissionScope, PermissionLevel, Tool, ToolContext,
-        ToolOutcome, ToolRegistry,
+        NetworkPermissionPreview, NetworkPermissionScope, PermissionLevel, Tool, ToolConcurrency,
+        ToolContext, ToolOutcome, ToolRegistry,
     };
     use async_trait::async_trait;
     use serde_json::{json, Value};
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
 
     #[derive(Debug, PartialEq)]
     enum ObservedEvent {
@@ -1168,6 +1286,114 @@ mod tests {
                 ObservedEvent::Status(AgentStatus::Idle),
             ]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_observed_parallel_batch_observer_sequence_and_provider_wait() {
+        // Echo 是 ReadOnly 但默认 Exclusive；用 LatchTool ParallelSafe 验证整段观测顺序。
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut watches = vec![install_latch(&latches, "a"), install_latch(&latches, "b")];
+        let mut e0 = watches[0].take_entered();
+        let mut e1 = watches[1].take_entered();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe", latches, active, max_active,
+            )))
+            .unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                tool_call("call-1", "safe", "a"),
+                tool_call("call-2", "safe", "b"),
+            ]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider.clone(),
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let tool_ctx = ctx();
+        let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+        tokio::pin!(run);
+        let mut got0 = false;
+        let mut got1 = false;
+        while !got0 || !got1 {
+            tokio::select! {
+                result = &mut run => {
+                    release_all_shared(&release_slots);
+                    cancel_wd.store(true, Ordering::SeqCst);
+                    panic!("early: {result:?}");
+                }
+                r = &mut e0, if !got0 => { r.unwrap(); got0 = true; }
+                r = &mut e1, if !got1 => { r.unwrap(); got1 = true; }
+            }
+        }
+        release_all_shared(&release_slots);
+        assert_eq!(run.await.unwrap(), "done");
+        cancel_wd.store(true, Ordering::SeqCst);
+
+        let events = observer.events();
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ObservedEvent::ToolCallStarted { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec!["call-1", "call-2"]);
+        let tools_status_pos = events
+            .iter()
+            .position(|e| matches!(e, ObservedEvent::Status(AgentStatus::ExecutingTools(2))))
+            .expect("ExecutingTools(2)");
+        let first_started = events
+            .iter()
+            .position(|e| matches!(e, ObservedEvent::ToolCallStarted { id, .. } if id == "call-1"))
+            .unwrap();
+        let second_started = events
+            .iter()
+            .position(|e| matches!(e, ObservedEvent::ToolCallStarted { id, .. } if id == "call-2"))
+            .unwrap();
+        assert!(first_started < second_started && second_started < tools_status_pos);
+        let finished: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ObservedEvent::ToolCallFinished { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished, vec!["call-1", "call-2"]);
+        assert!(
+            tools_status_pos
+                < events
+                    .iter()
+                    .position(|e| matches!(e, ObservedEvent::ToolCallFinished { .. }))
+                    .unwrap()
+        );
+
+        // 第二次 provider.complete 仅在全部 ToolResult 入 history 后
+        let recorded = provider.recorded_requests();
+        assert_eq!(recorded.len(), 2);
+        let tool_results: Vec<_> = recorded[1]
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results, vec!["call-1", "call-2"]);
     }
 
     #[tokio::test]
@@ -2086,5 +2312,1243 @@ mod tests {
                 thinking: Vec::new(),
             }]
         );
+    }
+    // --- Parallel batch scheduling (§3.2–3.3 RED) ---
+
+    struct LatchWatch {
+        entered_rx: Option<oneshot::Receiver<()>>,
+        release_tx: Option<oneshot::Sender<()>>,
+        completed_rx: Option<oneshot::Receiver<()>>,
+    }
+
+    impl LatchWatch {
+        fn take_entered(&mut self) -> oneshot::Receiver<()> {
+            self.entered_rx.take().expect("entered_rx")
+        }
+
+        fn take_completed(&mut self) -> oneshot::Receiver<()> {
+            self.completed_rx.take().expect("completed_rx")
+        }
+    }
+
+    struct LatchSlot {
+        entered_tx: Option<oneshot::Sender<()>>,
+        release_rx: Option<oneshot::Receiver<()>>,
+        completed_tx: Option<oneshot::Sender<()>>,
+    }
+
+    fn install_latch(map: &Arc<Mutex<HashMap<String, LatchSlot>>>, key: &str) -> LatchWatch {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (completed_tx, completed_rx) = oneshot::channel();
+        map.lock().unwrap().insert(
+            key.to_string(),
+            LatchSlot {
+                entered_tx: Some(entered_tx),
+                release_rx: Some(release_rx),
+                completed_tx: Some(completed_tx),
+            },
+        );
+        LatchWatch {
+            entered_rx: Some(entered_rx),
+            release_tx: Some(release_tx),
+            completed_rx: Some(completed_rx),
+        }
+    }
+
+    struct LatchTool {
+        name: &'static str,
+        latches: Arc<Mutex<HashMap<String, LatchSlot>>>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        concurrency: ToolConcurrency,
+        permission: PermissionLevel,
+        plan_only: bool,
+        error_keys: Arc<Mutex<HashSet<String>>>,
+    }
+
+    impl LatchTool {
+        fn new(
+            name: &'static str,
+            latches: Arc<Mutex<HashMap<String, LatchSlot>>>,
+            active: Arc<AtomicUsize>,
+            max_active: Arc<AtomicUsize>,
+            concurrency: ToolConcurrency,
+            permission: PermissionLevel,
+            plan_only: bool,
+        ) -> Self {
+            Self {
+                name,
+                latches,
+                active,
+                max_active,
+                concurrency,
+                permission,
+                plan_only,
+                error_keys: Arc::new(Mutex::new(HashSet::new())),
+            }
+        }
+
+        fn parallel_safe(
+            name: &'static str,
+            latches: Arc<Mutex<HashMap<String, LatchSlot>>>,
+            active: Arc<AtomicUsize>,
+            max_active: Arc<AtomicUsize>,
+        ) -> Self {
+            Self::new(
+                name,
+                latches,
+                active,
+                max_active,
+                ToolConcurrency::ParallelSafe,
+                PermissionLevel::ReadOnly,
+                false,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Tool for LatchTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Controlled latch tool for concurrency tests"
+        }
+
+        fn schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": { "key": { "type": "string" } },
+                "required": ["key"]
+            })
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            self.permission.clone()
+        }
+
+        fn concurrency(&self) -> ToolConcurrency {
+            self.concurrency
+        }
+
+        fn plan_only(&self) -> bool {
+            self.plan_only
+        }
+
+        async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolOutcome {
+            let key = args["key"].as_str().unwrap_or("missing").to_string();
+            let (entered_tx, release_rx, completed_tx) = {
+                let mut map = self.latches.lock().unwrap();
+                let slot = map
+                    .remove(&key)
+                    .unwrap_or_else(|| panic!("latch not installed for key={key}"));
+                (
+                    slot.entered_tx.expect("entered_tx"),
+                    slot.release_rx.expect("release_rx"),
+                    slot.completed_tx.expect("completed_tx"),
+                )
+            };
+
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            let _ = completed_tx.send(());
+
+            let is_error = self.error_keys.lock().unwrap().contains(&key);
+            ToolOutcome {
+                content: if is_error {
+                    format!("error:{key}")
+                } else {
+                    format!("ok:{key}")
+                },
+                is_error,
+                truncated: false,
+                exit: None,
+            }
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, key: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: json!({ "key": key }),
+        }
+    }
+
+    fn share_releases(watches: &mut [LatchWatch]) -> Arc<Mutex<Vec<Option<oneshot::Sender<()>>>>> {
+        Arc::new(Mutex::new(
+            watches.iter_mut().map(|w| w.release_tx.take()).collect(),
+        ))
+    }
+
+    fn release_shared(slots: &Arc<Mutex<Vec<Option<oneshot::Sender<()>>>>>, index: usize) {
+        if let Some(tx) = slots.lock().unwrap().get_mut(index).and_then(|s| s.take()) {
+            let _ = tx.send(());
+        }
+    }
+
+    fn release_all_shared(slots: &Arc<Mutex<Vec<Option<oneshot::Sender<()>>>>>) {
+        for slot in slots.lock().unwrap().iter_mut() {
+            if let Some(tx) = slot.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn arm_os_watchdog(
+        release_slots: Arc<Mutex<Vec<Option<oneshot::Sender<()>>>>>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_for_thread = fired.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            fired_for_thread.store(true, Ordering::SeqCst);
+            release_all_shared(&release_slots);
+        });
+        (handle, fired)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_safe_batch_two_tools_overlap_before_release() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut watches = vec![install_latch(&latches, "a"), install_latch(&latches, "b")];
+        let e0 = watches[0].take_entered();
+        let e1 = watches[1].take_entered();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe",
+                latches,
+                active.clone(),
+                max_active,
+            )))
+            .unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                tool_call("call-1", "safe", "a"),
+                tool_call("call-2", "safe", "b"),
+            ]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let tool_ctx = ctx();
+        let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+        tokio::pin!(run);
+
+        // 先等 call-1 entered；在不 release 的窗口内 call-2 也应 entered（真重叠）。
+        let mut e1 = e1;
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("agent finished before first entered: {result:?}");
+            }
+            r = e0 => { r.unwrap(); }
+        }
+        let mut saw_second = false;
+        for _ in 0..200 {
+            if e1.try_recv().is_ok() {
+                saw_second = true;
+                break;
+            }
+            if active.load(Ordering::SeqCst) >= 2 {
+                saw_second = true;
+                break;
+            }
+            tokio::select! {
+                result = &mut run => {
+                    release_all_shared(&release_slots);
+                    cancel_wd.store(true, Ordering::SeqCst);
+                    panic!("agent finished before overlap window: {result:?}");
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        assert!(
+            saw_second && active.load(Ordering::SeqCst) >= 2,
+            "both ParallelSafe tools must be active before either release; active={}",
+            active.load(Ordering::SeqCst)
+        );
+
+        release_all_shared(&release_slots);
+        let text = run.await.unwrap();
+        cancel_wd.store(true, Ordering::SeqCst);
+        assert_eq!(text, "done");
+
+        let events = observer.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ObservedEvent::Status(AgentStatus::ExecutingTools(2)))),
+            "batch of 2 must emit ExecutingTools(2), events={events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_safe_batch_five_calls_max_active_four() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let keys = ["k1", "k2", "k3", "k4", "k5"];
+        let mut watches: Vec<_> = keys.iter().map(|k| install_latch(&latches, k)).collect();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe",
+                latches,
+                active.clone(),
+                max_active.clone(),
+            )))
+            .unwrap();
+
+        let calls: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| tool_call(&format!("call-{}", i + 1), "safe", k))
+            .collect();
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(calls),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let tool_ctx = ctx();
+        let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+        tokio::pin!(run);
+
+        // 审查问题 #6.7：per-call entered ack，不得用固定次数 yield 猜时序。
+        let mut e0 = watches[0].take_entered();
+        let mut e1 = watches[1].take_entered();
+        let mut e2 = watches[2].take_entered();
+        let mut e3 = watches[3].take_entered();
+        let mut e4 = watches[4].take_entered();
+        let mut got = [false; 5];
+        while got.iter().take(4).filter(|g| **g).count() < 4 {
+            tokio::select! {
+                result = &mut run => {
+                    release_all_shared(&release_slots);
+                    cancel_wd.store(true, Ordering::SeqCst);
+                    panic!("agent finished before 4 entered: {result:?}");
+                }
+                r = &mut e0, if !got[0] => { r.unwrap(); got[0] = true; }
+                r = &mut e1, if !got[1] => { r.unwrap(); got[1] = true; }
+                r = &mut e2, if !got[2] => { r.unwrap(); got[2] = true; }
+                r = &mut e3, if !got[3] => { r.unwrap(); got[3] = true; }
+                r = &mut e4, if !got[4] => {
+                    r.unwrap();
+                    release_all_shared(&release_slots);
+                    cancel_wd.store(true, Ordering::SeqCst);
+                    panic!("fifth call entered while window full");
+                }
+            }
+        }
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            4,
+            "max-active must be 4 after four entered acks"
+        );
+        assert!(!got[4], "fifth must not have entered");
+        // 短暂轮询仍不得收到 k5 entered
+        for _ in 0..20 {
+            if e4.try_recv().is_ok() {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("fifth entered while first four held");
+            }
+            tokio::select! {
+                result = &mut run => {
+                    release_all_shared(&release_slots);
+                    cancel_wd.store(true, Ordering::SeqCst);
+                    panic!("agent finished while holding first four: {result:?}");
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+
+        release_all_shared(&release_slots);
+        let text = run.await.unwrap();
+        cancel_wd.store(true, Ordering::SeqCst);
+        assert_eq!(text, "done");
+
+        let events = observer.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ObservedEvent::Status(AgentStatus::ExecutingTools(5)))),
+            "batch of 5 must emit ExecutingTools(5), events={events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exclusive_forms_barrier_between_safe_batches() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut watches = vec![
+            install_latch(&latches, "s1"),
+            install_latch(&latches, "s2"),
+            install_latch(&latches, "ex"),
+            install_latch(&latches, "s4"),
+        ];
+        let e0 = watches[0].take_entered();
+        let e1 = watches[1].take_entered();
+        let mut e2 = watches[2].take_entered();
+        let mut e3 = watches[3].take_entered();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe",
+                latches.clone(),
+                active.clone(),
+                max_active.clone(),
+            )))
+            .unwrap();
+        registry
+            .register(Box::new(LatchTool::new(
+                "exclusive",
+                latches,
+                active.clone(),
+                max_active,
+                ToolConcurrency::Exclusive,
+                PermissionLevel::ReadOnly,
+                false,
+            )))
+            .unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                tool_call("call-1", "safe", "s1"),
+                tool_call("call-2", "safe", "s2"),
+                tool_call("call-3", "exclusive", "ex"),
+                tool_call("call-4", "safe", "s4"),
+            ]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let tool_ctx = ctx();
+        let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+        tokio::pin!(run);
+
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("early finish: {result:?}");
+            }
+            _ = async {
+                e0.await.unwrap();
+                e1.await.unwrap();
+            } => {}
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+
+        for _ in 0..30 {
+            if e2.try_recv().is_ok() || e3.try_recv().is_ok() {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("barrier crossed before safe batch finished");
+            }
+            tokio::task::yield_now().await;
+        }
+
+        release_shared(&release_slots, 0);
+        release_shared(&release_slots, 1);
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("early finish waiting exclusive: {result:?}");
+            }
+            r = &mut e2 => { r.unwrap(); }
+        }
+        for _ in 0..30 {
+            if e3.try_recv().is_ok() {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("safe-4 crossed exclusive barrier");
+            }
+            tokio::task::yield_now().await;
+        }
+        release_shared(&release_slots, 2);
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("early finish waiting s4: {result:?}");
+            }
+            r = &mut e3 => { r.unwrap(); }
+        }
+        release_shared(&release_slots, 3);
+        assert_eq!(run.await.unwrap(), "done");
+        cancel_wd.store(true, Ordering::SeqCst);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_parallel_safe_keeps_executing_tool_status() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut watches = vec![install_latch(&latches, "only")];
+        let mut entered = watches[0].take_entered();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe", latches, active, max_active,
+            )))
+            .unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![tool_call("call-1", "safe", "only")]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let tool_ctx = ctx();
+        let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("early: {result:?}");
+            }
+            r = &mut entered => { r.unwrap(); }
+        }
+        release_all_shared(&release_slots);
+        assert_eq!(run.await.unwrap(), "done");
+        cancel_wd.store(true, Ordering::SeqCst);
+        let events = observer.events();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, ObservedEvent::Status(AgentStatus::ExecutingTool(n)) if n == "safe")
+            ),
+            "single safe call must use ExecutingTool(name), events={events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ObservedEvent::Status(AgentStatus::ExecutingTools(_)))),
+            "single call must not emit ExecutingTools"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mislabeled_network_parallel_safe_is_clamped_exclusive() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::new(
+                "net_tool",
+                latches.clone(),
+                active.clone(),
+                max_active.clone(),
+                ToolConcurrency::ParallelSafe,
+                PermissionLevel::Network,
+                false,
+            )))
+            .unwrap();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe",
+                latches.clone(),
+                active,
+                max_active,
+            )))
+            .unwrap();
+        let mut watches = vec![install_latch(&latches, "s")];
+        let release_slots = share_releases(&mut watches);
+        release_all_shared(&release_slots);
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                tool_call("call-1", "net_tool", "net"),
+                tool_call("call-2", "safe", "s"),
+            ]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let text = agent
+            .run_observed(&mut history, &ctx(), &sink, &observer)
+            .await
+            .unwrap();
+        assert_eq!(text, "done");
+        let events = observer.events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ObservedEvent::Status(AgentStatus::ExecutingTools(_)))),
+            "Network tool must not join ParallelSafe batch, events={events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_conserving_refill_starts_fifth_while_first_held() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let keys = ["k1", "k2", "k3", "k4", "k5"];
+        let mut watches: Vec<_> = keys.iter().map(|k| install_latch(&latches, k)).collect();
+        let mut e1 = watches[0].take_entered();
+        let mut e2 = watches[1].take_entered();
+        let mut e3 = watches[2].take_entered();
+        let mut e4 = watches[3].take_entered();
+        let mut e5 = watches[4].take_entered();
+        let mut c1 = watches[0].take_completed();
+        let mut c2 = watches[1].take_completed();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_wd, watchdog_fired) = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe",
+                latches,
+                active.clone(),
+                max_active.clone(),
+            )))
+            .unwrap();
+        let calls: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| tool_call(&format!("c{}", i + 1), "safe", k))
+            .collect();
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(calls),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let done_text = {
+            let tool_ctx = ctx();
+            let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+            tokio::pin!(run);
+
+            // 等前四个均 entered（无序，用 select 轮询）。
+            let mut got = [false; 4];
+            while got.iter().any(|g| !*g) {
+                tokio::select! {
+                    result = &mut run => {
+                        release_all_shared(&release_slots);
+                        cancel_wd.store(true, Ordering::SeqCst);
+                        panic!("early before window full: {result:?}");
+                    }
+                    r = &mut e1, if !got[0] => { r.unwrap(); got[0] = true; }
+                    r = &mut e2, if !got[1] => { r.unwrap(); got[1] = true; }
+                    r = &mut e3, if !got[2] => { r.unwrap(); got[2] = true; }
+                    r = &mut e4, if !got[3] => { r.unwrap(); got[3] = true; }
+                }
+            }
+            assert_eq!(max_active.load(Ordering::SeqCst), 4);
+
+            // 释放 k2，保持 k1；work-conserving 应启动 k5。
+            release_shared(&release_slots, 1);
+            tokio::select! {
+                result = &mut run => {
+                    release_all_shared(&release_slots);
+                    cancel_wd.store(true, Ordering::SeqCst);
+                    panic!("early waiting c2: {result:?}");
+                }
+                r = &mut c2 => { r.unwrap(); }
+            }
+            tokio::select! {
+                result = &mut run => {
+                    release_all_shared(&release_slots);
+                    cancel_wd.store(true, Ordering::SeqCst);
+                    panic!("finished before k5 entered: {result:?}");
+                }
+                r = &mut e5 => { r.unwrap(); }
+            }
+            assert!(
+                !watchdog_fired.load(Ordering::SeqCst),
+                "call-5 entered only after failure watchdog released call-1"
+            );
+            assert!(
+                matches!(c1.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "call-1 must still be pending when work-conserving refill starts call-5"
+            );
+            assert!(
+                active.load(Ordering::SeqCst) <= 4,
+                "active still capped while k1 held and k5 running"
+            );
+
+            release_all_shared(&release_slots);
+            run.await.unwrap()
+        };
+        assert_eq!(done_text, "done");
+        cancel_wd.store(true, Ordering::SeqCst);
+
+        let results: Vec<_> = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult {
+                    call_id, content, ..
+                } => Some((call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("c1", "ok:k1"),
+                ("c2", "ok:k2"),
+                ("c3", "ok:k3"),
+                ("c4", "ok:k4"),
+                ("c5", "ok:k5"),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reverse_physical_completion_still_publishes_model_order() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut watches = vec![install_latch(&latches, "a"), install_latch(&latches, "b")];
+        let mut e0 = watches[0].take_entered();
+        let mut e1 = watches[1].take_entered();
+        let mut c1 = watches[1].take_completed();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe", latches, active, max_active,
+            )))
+            .unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                tool_call("call-1", "safe", "a"),
+                tool_call("call-2", "safe", "b"),
+            ]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider.clone(),
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let done_text = {
+            let tool_ctx = ctx();
+            let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+            tokio::pin!(run);
+
+            let mut got0 = false;
+            let mut got1 = false;
+            while !got0 || !got1 {
+                tokio::select! {
+                    result = &mut run => {
+                        release_all_shared(&release_slots);
+                        cancel_wd.store(true, Ordering::SeqCst);
+                        panic!("early: {result:?}");
+                    }
+                    r = &mut e0, if !got0 => { r.unwrap(); got0 = true; }
+                    r = &mut e1, if !got1 => { r.unwrap(); got1 = true; }
+                }
+            }
+            // 物理逆序：先完成 call-2，再 call-1
+            release_shared(&release_slots, 1);
+            tokio::select! {
+                result = &mut run => {
+                    release_all_shared(&release_slots);
+                    cancel_wd.store(true, Ordering::SeqCst);
+                    panic!("early after release-2: {result:?}");
+                }
+                r = &mut c1 => { r.unwrap(); }
+            }
+            release_shared(&release_slots, 0);
+            run.await.unwrap()
+        };
+        assert_eq!(done_text, "done");
+        cancel_wd.store(true, Ordering::SeqCst);
+
+        let tool_results: Vec<_> = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult {
+                    call_id, content, ..
+                } => Some((call_id.clone(), content.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_results,
+            vec![
+                ("call-1".into(), "ok:a".into()),
+                ("call-2".into(), "ok:b".into()),
+            ]
+        );
+
+        let finished_ids: Vec<_> = observer
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                ObservedEvent::ToolCallFinished { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finished_ids,
+            vec!["call-1".to_string(), "call-2".to_string()]
+        );
+
+        let recorded = provider.recorded_requests();
+        assert_eq!(recorded.len(), 2);
+        let second_tool_ids: Vec<_> = recorded[1]
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(second_tool_ids, vec!["call-1", "call-2"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_error_does_not_cancel_sibling_calls() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut watches = vec![
+            install_latch(&latches, "a"),
+            install_latch(&latches, "b"),
+            install_latch(&latches, "c"),
+        ];
+        let mut e0 = watches[0].take_entered();
+        let mut e1 = watches[1].take_entered();
+        let mut e2 = watches[2].take_entered();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        let tool = LatchTool::parallel_safe("safe", latches, active.clone(), max_active);
+        tool.error_keys.lock().unwrap().insert("b".into());
+        registry.register(Box::new(tool)).unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                tool_call("c1", "safe", "a"),
+                tool_call("c2", "safe", "b"),
+                tool_call("c3", "safe", "c"),
+            ]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let mut c_err = watches[1].take_completed();
+        let done_text = {
+            let tool_ctx = ctx();
+            let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+            tokio::pin!(run);
+            let mut got = [false; 3];
+            while got.iter().any(|g| !*g) {
+                tokio::select! {
+                    result = &mut run => {
+                        release_all_shared(&release_slots);
+                        cancel_wd.store(true, Ordering::SeqCst);
+                        panic!("early: {result:?}");
+                    }
+                    r = &mut e0, if !got[0] => { r.unwrap(); got[0] = true; }
+                    r = &mut e1, if !got[1] => { r.unwrap(); got[1] = true; }
+                    r = &mut e2, if !got[2] => { r.unwrap(); got[2] = true; }
+                }
+            }
+            // 审查问题 #6.6：先只 release error occurrence，确认兄弟仍 pending。
+            release_shared(&release_slots, 1);
+            tokio::select! {
+                result = &mut run => {
+                    release_all_shared(&release_slots);
+                    cancel_wd.store(true, Ordering::SeqCst);
+                    panic!("agent finished after only error released: {result:?}");
+                }
+                r = &mut c_err => { r.unwrap(); }
+            }
+            // error 完成后，a/c 仍应 active（未 release）
+            assert!(
+                active.load(Ordering::SeqCst) >= 2,
+                "siblings must still be pending after error completes; active={}",
+                active.load(Ordering::SeqCst)
+            );
+            release_shared(&release_slots, 0);
+            release_shared(&release_slots, 2);
+            run.await.unwrap()
+        };
+        assert_eq!(done_text, "done");
+        cancel_wd.store(true, Ordering::SeqCst);
+
+        let results: Vec<_> = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } => Some((call_id.as_str(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("c1", "ok:a", false),
+                ("c2", "error:b", true),
+                ("c3", "ok:c", false),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_tool_forms_barrier() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut watches = vec![install_latch(&latches, "a"), install_latch(&latches, "c")];
+        let mut e0 = watches[0].take_entered();
+        let mut e1 = watches[1].take_entered();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe", latches, active, max_active,
+            )))
+            .unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                tool_call("c1", "safe", "a"),
+                ToolCall {
+                    id: "c2".into(),
+                    name: "missing_tool".into(),
+                    arguments: json!({}),
+                },
+                tool_call("c3", "safe", "c"),
+            ]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let tool_ctx = ctx();
+        let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+        tokio::pin!(run);
+
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("early: {result:?}");
+            }
+            r = &mut e0 => { r.unwrap(); }
+        }
+        for _ in 0..30 {
+            if e1.try_recv().is_ok() {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("safe-c overlapped across unknown barrier");
+            }
+            tokio::task::yield_now().await;
+        }
+        release_shared(&release_slots, 0);
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("early waiting c: {result:?}");
+            }
+            r = &mut e1 => { r.unwrap(); }
+        }
+        release_shared(&release_slots, 1);
+        assert_eq!(run.await.unwrap(), "done");
+        cancel_wd.store(true, Ordering::SeqCst);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_only_parallel_safe_still_forms_barrier_in_plan_mode() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut watches = vec![
+            install_latch(&latches, "a"),
+            install_latch(&latches, "plan"),
+            install_latch(&latches, "c"),
+        ];
+        let mut e0 = watches[0].take_entered();
+        let mut e1 = watches[1].take_entered();
+        let mut e2 = watches[2].take_entered();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe",
+                latches.clone(),
+                active.clone(),
+                max_active.clone(),
+            )))
+            .unwrap();
+        registry
+            .register(Box::new(LatchTool::new(
+                "plan_tool",
+                latches,
+                active,
+                max_active,
+                ToolConcurrency::ParallelSafe,
+                PermissionLevel::ReadOnly,
+                true,
+            )))
+            .unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                tool_call("c1", "safe", "a"),
+                tool_call("c2", "plan_tool", "plan"),
+                tool_call("c3", "safe", "c"),
+            ]),
+            response("done"),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        agent.set_permission_mode(Arc::new(Mutex::new(PermissionMode::Plan)));
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let tool_ctx = ctx();
+        let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+        tokio::pin!(run);
+
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("early: {result:?}");
+            }
+            r = &mut e0 => { r.unwrap(); }
+        }
+        for _ in 0..30 {
+            if e2.try_recv().is_ok() {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("safe-c crossed plan_only barrier");
+            }
+            tokio::task::yield_now().await;
+        }
+        release_shared(&release_slots, 0);
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("early plan: {result:?}");
+            }
+            r = &mut e1 => { r.unwrap(); }
+        }
+        release_shared(&release_slots, 1);
+        tokio::select! {
+            result = &mut run => {
+                release_all_shared(&release_slots);
+                cancel_wd.store(true, Ordering::SeqCst);
+                panic!("early c: {result:?}");
+            }
+            r = &mut e2 => { r.unwrap(); }
+        }
+        release_shared(&release_slots, 2);
+        assert_eq!(run.await.unwrap(), "done");
+        cancel_wd.store(true, Ordering::SeqCst);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn duplicate_call_ids_produce_two_results_by_occurrence() {
+        let latches = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut watches = vec![install_latch(&latches, "a"), install_latch(&latches, "b")];
+        let mut e0 = watches[0].take_entered();
+        let mut e1 = watches[1].take_entered();
+        let release_slots = share_releases(&mut watches);
+        let cancel_wd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _wd = arm_os_watchdog(release_slots.clone(), cancel_wd.clone());
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(LatchTool::parallel_safe(
+                "safe", latches, active, max_active,
+            )))
+            .unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![
+                tool_call("call-1", "safe", "a"),
+                tool_call("call-1", "safe", "b"),
+            ]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry,
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let mut history = vec![Message::User("go".into())];
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let done_text = {
+            let tool_ctx = ctx();
+            let run = agent.run_observed(&mut history, &tool_ctx, &sink, &observer);
+            tokio::pin!(run);
+            let mut got0 = false;
+            let mut got1 = false;
+            while !got0 || !got1 {
+                tokio::select! {
+                    result = &mut run => {
+                        release_all_shared(&release_slots);
+                        cancel_wd.store(true, Ordering::SeqCst);
+                        panic!("early: {result:?}");
+                    }
+                    r = &mut e0, if !got0 => { r.unwrap(); got0 = true; }
+                    r = &mut e1, if !got1 => { r.unwrap(); got1 = true; }
+                }
+            }
+            release_all_shared(&release_slots);
+            run.await.unwrap()
+        };
+        assert_eq!(done_text, "done");
+        cancel_wd.store(true, Ordering::SeqCst);
+
+        let results: Vec<_> = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult {
+                    call_id, content, ..
+                } => Some((call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![("call-1", "ok:a"), ("call-1", "ok:b")],
+            "duplicate ids must yield one ToolResult per occurrence"
+        );
+        let finished = observer
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, ObservedEvent::ToolCallFinished { .. }))
+            .count();
+        assert_eq!(finished, 2);
     }
 }

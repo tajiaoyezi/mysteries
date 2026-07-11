@@ -90,10 +90,125 @@ struct SessionStartup {
     plan: Option<app::ActivePlan>,
 }
 
+fn initial_session_snapshot(config: &Config, cwd: PathBuf) -> app::SessionSnapshot {
+    app::SessionSnapshot {
+        // restore 未确认前，UI 与后续 snapshot 必须反映 Agent 实际使用的 startup provider。
+        provider: config.provider.id.clone(),
+        model: config.model.clone(),
+        max_iterations: config.max_iterations,
+        cwd,
+        tools: crate::app::default_registry().schemas().len() + 3,
+    }
+}
+
+fn send_session_provider_restore(
+    input_tx: &mpsc::UnboundedSender<channel::UserInput>,
+    id: String,
+    model: String,
+) {
+    let _ = input_tx.send(channel::UserInput::SetProvider {
+        id,
+        model,
+        kind: channel::ProviderSwitchKind::SessionRestore,
+    });
+}
+
 /// 把 `load` 回传的 plan 落进 `current_plan`（纯视觉恢复 seam）。
 /// 函数体仅此一句——async history / input_tx / session_meta / transcript 不进 seam。
 pub(crate) fn apply_loaded_plan(state: &mut app::AppState, plan: Option<app::ActivePlan>) {
     state.current_plan = plan;
+}
+
+const INTERRUPTED_TOOL_CONTENT: &str = "tool call interrupted before completion";
+const PREV_SESSION_INTERRUPTED_OUTPUT: &str = "上次会话已中断";
+
+/// 激活前收口旧中断残留：history 按 Assistant 结果组 / occurrence 补 interrupted；
+/// transcript 全部 Running → Error /「上次会话已中断」。
+pub(crate) fn normalize_loaded_session(
+    history: &mut Vec<Message>,
+    transcript: &mut [app::TranscriptBlock],
+) {
+    fill_dangling_tool_results(history, 0);
+    for block in transcript.iter_mut() {
+        if let app::TranscriptBlock::Tool(card) = block {
+            if card.status == app::ToolCardStatus::Running {
+                card.status = app::ToolCardStatus::Error;
+                card.output = Some(PREV_SESSION_INTERRUPTED_OUTPUT.to_string());
+                card.truncated = false;
+                card.exit = None;
+            }
+        }
+    }
+}
+
+/// 当前 turn 中断后按 occurrence / FIFO 补齐未配对 ToolResult。
+pub(crate) fn complete_interrupted_tool_results(
+    history: &mut Vec<Message>,
+    turn_history_start: usize,
+) {
+    fill_dangling_tool_results(history, turn_history_start);
+}
+
+/// 从 `start` 起扫描：每个 Assistant.tool_calls 为 occurrence 列表，
+/// 其后连续 ToolResult 按 id 消费最早未配对项；剩余按原顺序插入结果组末尾。
+fn fill_dangling_tool_results(history: &mut Vec<Message>, start: usize) {
+    let start = start.min(history.len());
+    let mut i = start;
+    while i < history.len() {
+        let occurrences: Option<Vec<String>> = match &history[i] {
+            Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                Some(tool_calls.iter().map(|c| c.id.clone()).collect())
+            }
+            _ => None,
+        };
+        let Some(mut unpaired) = occurrences else {
+            i += 1;
+            continue;
+        };
+
+        let mut j = i + 1;
+        while j < history.len() {
+            match &history[j] {
+                Message::ToolResult { call_id, .. } => {
+                    if let Some(pos) = unpaired.iter().position(|id| id == call_id) {
+                        unpaired.remove(pos);
+                    }
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+
+        for id in unpaired {
+            history.insert(
+                j,
+                Message::ToolResult {
+                    call_id: id,
+                    content: INTERRUPTED_TOOL_CONTENT.to_string(),
+                    is_error: true,
+                },
+            );
+            j += 1;
+        }
+        i = j;
+    }
+}
+
+/// 两处 activation load site（`--continue` / picker `--resume` hot-swap）共用的 seam。
+/// raw `SessionStore::load` 仍保持磁盘 round-trip；normalization 只在此处发生。
+#[allow(clippy::type_complexity)]
+pub(crate) fn load_session_for_activation(
+    store: &SessionStore,
+    id: &str,
+) -> std::io::Result<(
+    SessionMeta,
+    Vec<Message>,
+    Vec<app::TranscriptBlock>,
+    Option<app::ActivePlan>,
+)> {
+    let (meta, mut history, mut transcript, plan) = store.load(id)?;
+    normalize_loaded_session(&mut history, &mut transcript);
+    Ok((meta, history, transcript, plan))
 }
 
 pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError> {
@@ -138,8 +253,9 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
     assembled.agent.set_thinking_depth(thinking_depth.clone());
     let compacting = assembled.compacting;
     let agent = assembled.agent;
-    let agent_history = Arc::new(Mutex::new(session_startup.history));
     let cwd = session_startup.meta.cwd.clone();
+    let initial_session = initial_session_snapshot(&config, cwd.clone());
+    let agent_history = Arc::new(Mutex::new(session_startup.history));
     let ctx = ToolContext {
         cwd: cwd.clone(),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -160,16 +276,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
         ui_tx,
     ));
     let mut terminal = terminal::TerminalGuard::new()?;
-    let mut state = app::AppState::with_session_and_history(
-        app::SessionSnapshot {
-            provider: session_startup.meta.provider.clone(),
-            model: session_startup.meta.model.clone(),
-            max_iterations: config.max_iterations,
-            cwd,
-            tools: crate::app::default_registry().schemas().len() + 3,
-        },
-        agent_history,
-    );
+    let mut state = app::AppState::with_session_and_history(initial_session, agent_history);
     state.provider_profiles = profiles;
     state.permission_mode = permission_mode;
     state.thinking_depth = thinking_depth;
@@ -187,7 +294,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
         }
     }
     if let Some((id, model)) = resume_provider {
-        let _ = input_tx.send(channel::UserInput::SetProvider { id, model });
+        send_session_provider_restore(&input_tx, id, model);
     }
     let mut events = EventStream::new();
     let theme = theme::Theme::midnight();
@@ -342,28 +449,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
         }
 
         if let Some(id) = state.take_pending_session_switch() {
-            match store.load(&id) {
-                Ok((meta, mut history, transcript, plan)) => {
-                    replace_system_head(&mut history, DEFAULT_SYSTEM_PROMPT);
-                    let mut h = state.agent_history.lock().await;
-                    *h = history;
-                    drop(h);
-                    state.transcript = transcript;
-                    let provider = meta.provider.clone();
-                    let model = meta.model.clone();
-                    let _ = input_tx.send(channel::UserInput::SetProvider {
-                        id: provider.clone(),
-                        model: model.clone(),
-                    });
-                    state.session.provider = provider;
-                    state.session.model = model;
-                    session_meta = meta;
-                    apply_loaded_plan(&mut state, plan);
-                }
-                Err(_) => state
-                    .transcript
-                    .push(app::TranscriptBlock::Notice("会话切换失败".to_string())),
-            }
+            activate_session_switch(&store, &id, &mut state, &mut session_meta, &input_tx).await;
         }
 
         if !skip_frame {
@@ -378,6 +464,33 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
     Ok(())
 }
 
+async fn activate_session_switch(
+    store: &SessionStore,
+    id: &str,
+    state: &mut app::AppState,
+    session_meta: &mut SessionMeta,
+    input_tx: &mpsc::UnboundedSender<channel::UserInput>,
+) {
+    match load_session_for_activation(store, id) {
+        Ok((meta, mut history, transcript, plan)) => {
+            replace_system_head(&mut history, DEFAULT_SYSTEM_PROMPT);
+            let mut h = state.agent_history.lock().await;
+            *h = history;
+            drop(h);
+            state.transcript = transcript;
+            // 保留选中 session 文件 id；provider/model 仅在 ProviderApplied 后提交。
+            let provider = meta.provider.clone();
+            let model = meta.model.clone();
+            *session_meta = meta;
+            apply_loaded_plan(state, plan);
+            send_session_provider_restore(input_tx, provider, model);
+        }
+        Err(_) => state
+            .transcript
+            .push(app::TranscriptBlock::Notice("会话切换失败".to_string())),
+    }
+}
+
 fn prepare_session_startup(
     store: &SessionStore,
     paths: &CliPaths,
@@ -386,7 +499,8 @@ fn prepare_session_startup(
 ) -> Result<SessionStartup, CliError> {
     if mode == StartupMode::Continue {
         if let Some(id) = store.latest().map_err(cli_io_error)? {
-            let (meta, mut history, transcript, plan) = store.load(&id).map_err(cli_io_error)?;
+            let (meta, mut history, transcript, plan) =
+                load_session_for_activation(store, &id).map_err(cli_io_error)?;
             replace_system_head(&mut history, DEFAULT_SYSTEM_PROMPT);
             let resume_provider = Some((meta.provider.clone(), meta.model.clone()));
             return Ok(SessionStartup {
@@ -1286,9 +1400,11 @@ fn process_event_batch(batch: Vec<Event>, ctx: EventBatchContext<'_>) -> Result<
                 let intent = intents[press_index];
                 press_index += 1;
 
-                if state.session_picker.is_some() {
-                    app::flush_merged_input_chars(state, &mut pending_str);
-                    state.handle_session_picker_key(key);
+                if let Some(control) = handle_session_picker_batch_key(state, key, &mut pending_str)
+                {
+                    if control == app::ApplyBatchKeyResult::BreakBatch {
+                        break;
+                    }
                     continue;
                 }
                 if let Some(action) = handle_idle_exit_intent_key(state, key, Instant::now()) {
@@ -1375,6 +1491,23 @@ fn process_event_batch(batch: Vec<Event>, ctx: EventBatchContext<'_>) -> Result<
     Ok(break_loop)
 }
 
+pub(crate) fn handle_session_picker_batch_key(
+    state: &mut app::AppState,
+    key: KeyEvent,
+    pending_str: &mut String,
+) -> Option<app::ApplyBatchKeyResult> {
+    state.session_picker.as_ref()?;
+
+    app::flush_merged_input_chars(state, pending_str);
+    state.handle_session_picker_key(key);
+    Some(if state.pending_session_switch().is_some() {
+        // 选中 session 后立即终止本批，避免尾随键在 activation 前污染 input / 提交 Prompt。
+        app::ApplyBatchKeyResult::BreakBatch
+    } else {
+        app::ApplyBatchKeyResult::Continue
+    })
+}
+
 fn isolate_network_approval_events(batch: Vec<Event>) -> Vec<Event> {
     batch
         .into_iter()
@@ -1414,9 +1547,9 @@ pub async fn run_agent_task(
                 let mut history = agent_history.lock().await;
                 agent.set_model(model, &mut history);
             }
-            channel::UserInput::SetProvider { id, model } => {
+            channel::UserInput::SetProvider { id, model, kind } => {
                 let mut history = agent_history.lock().await;
-                if let Err(notice) = apply_set_provider(
+                match apply_set_provider(
                     &profiles,
                     &startup_config,
                     &credentials_path,
@@ -1425,8 +1558,14 @@ pub async fn run_agent_task(
                     &mut agent,
                     &mut compacting,
                     &mut history,
+                    kind,
                 ) {
-                    let _ = ui_tx.send(channel::AgentEvent::Notice(notice));
+                    Ok(()) => {
+                        let _ = ui_tx.send(channel::AgentEvent::ProviderApplied { id, model });
+                    }
+                    Err(notice) => {
+                        let _ = ui_tx.send(channel::AgentEvent::Notice(notice));
+                    }
                 }
             }
             channel::UserInput::Interrupt => {}
@@ -1440,10 +1579,11 @@ pub async fn run_agent_task(
             channel::UserInput::Prompt(prompt) => {
                 while interrupt_rx.try_recv().is_ok() {}
 
-                let mut working = {
+                let (mut working, turn_history_start) = {
                     let mut history = agent_history.lock().await;
                     history.push(Message::User(prompt));
-                    history.clone()
+                    let turn_history_start = history.len() - 1;
+                    (history.clone(), turn_history_start)
                 };
                 let sink = channel::ChannelSink::new(ui_tx.clone());
                 let observer = channel::ChannelObserver::new(ui_tx.clone());
@@ -1461,6 +1601,8 @@ pub async fn run_agent_task(
                         }
                     }
                     _ = wait_for_interrupt(&mut interrupt_rx) => {
+                        // drop run future 后补齐本 turn 未配对 occurrence，再只发 Interrupted。
+                        complete_interrupted_tool_results(&mut working, turn_history_start);
                         *agent_history.lock().await = working;
                         let _ = ui_tx.send(channel::AgentEvent::Interrupted);
                     }
@@ -1487,6 +1629,7 @@ fn apply_set_provider(
     agent: &mut Agent,
     compacting: &mut Compacting,
     history: &mut [Message],
+    kind: channel::ProviderSwitchKind,
 ) -> Result<(), String> {
     let Some(profile) = profiles.get(id) else {
         return Err(format!("未知 provider: {id}"));
@@ -1516,7 +1659,10 @@ fn apply_set_provider(
 
     let provider = select_provider(&transient, credentials).map_err(|err| err.to_string())?;
     agent.set_provider(provider.clone());
-    agent.set_model(model.to_string(), history);
+    match kind {
+        channel::ProviderSwitchKind::SessionRestore => agent.restore_model(model.to_string()),
+        channel::ProviderSwitchKind::Interactive => agent.set_model(model.to_string(), history),
+    }
     compacting.set_provider(provider);
     compacting.set_model(model.to_string());
 
@@ -1539,18 +1685,23 @@ fn error_message(err: AgentError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::channel::{AgentEvent, ChannelDecider, PermissionRequest, UserInput};
+    use super::channel::{
+        AgentEvent, ChannelDecider, PermissionRequest, ProviderSwitchKind, UserInput,
+    };
     use super::{
-        apply_loaded_plan, apply_mouse_wheel_scroll_to_state, arrows_route_to_completion,
-        cancel_action, handle_mouse_selection_event, handle_queue_cancel_key, handle_resize,
-        handle_selection_key, isolate_network_approval_events, prepare_session_startup,
+        activate_session_switch, apply_loaded_plan, apply_mouse_wheel_scroll_to_state,
+        arrows_route_to_completion, cancel_action, complete_interrupted_tool_results,
+        handle_mouse_selection_event, handle_queue_cancel_key, handle_resize, handle_selection_key,
+        handle_session_picker_batch_key, initial_session_snapshot, isolate_network_approval_events,
+        load_session_for_activation, normalize_loaded_session, prepare_session_startup,
         push_session_save_notice_if_error, run_agent_task, scroll_action_for_key,
-        selection_key_action, should_exit, terminal_session_event, write_session_snapshot,
-        CancelAction, ExitIntent, MouseWheelScrollAction, RunAgentTaskConfig, SelectionKeyAction,
-        StartupMode, DEFAULT_SYSTEM_PROMPT, EXIT_DOUBLE_TAP,
+        selection_key_action, send_session_provider_restore, should_exit, terminal_session_event,
+        write_session_snapshot, CancelAction, ExitIntent, MouseWheelScrollAction,
+        RunAgentTaskConfig, SelectionKeyAction, StartupMode, DEFAULT_SYSTEM_PROMPT,
+        EXIT_DOUBLE_TAP,
     };
     use crate::agent::message::Message;
-    use crate::agent::AgentStatus;
+    use crate::agent::{Agent, AgentStatus, Compacting};
     use crate::app::assemble_agent;
     use crate::cli::CliPaths;
     use crate::config::{
@@ -1561,11 +1712,14 @@ mod tests {
     use crate::permission::{PermissionMode, PermissionReply, PolicyEngine};
     use crate::provider::mock::MockProvider;
     use crate::provider::{
-        DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, ToolCall,
+        DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, ThinkingBlock, ToolCall,
     };
-    use crate::session::{SessionMeta, SessionStore};
+    use crate::session::{SessionMeta, SessionStore, SessionSummary};
     use crate::tool::plan::StepStatus;
-    use crate::tool::ToolContext;
+    use crate::tool::{
+        run_blocking_tool, BlockingToolLimiter, PermissionLevel, Tool, ToolConcurrency,
+        ToolContext, ToolOutcome, ToolRegistry,
+    };
     use crate::tui::app::{ActivePlan, ActiveStep, CommandCompletion, TranscriptBlock};
     use crate::tui::clipboard::Clipboard;
     use crate::tui::command::command_metadata;
@@ -1794,6 +1948,43 @@ mod tests {
             prepare_session_startup(&store, &paths, &config(), StartupMode::Continue).unwrap();
 
         assert_eq!(startup.plan, Some(plan));
+    }
+
+    #[test]
+    fn continue_fallback_snapshot_uses_startup_provider_and_rewrites_selected_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().join("sessions"));
+        let startup_config = config();
+        let selected_meta = SessionMeta {
+            id: "selected-session".to_string(),
+            provider: "missing-provider".to_string(),
+            model: "missing-model".to_string(),
+            created_at: "1".to_string(),
+            cwd: temp.path().join("cwd"),
+            app_version: "1.1.0".to_string(),
+        };
+        let session_startup = super::SessionStartup {
+            meta: selected_meta.clone(),
+            history: vec![Message::System(DEFAULT_SYSTEM_PROMPT.to_string())],
+            transcript: Vec::new(),
+            resume_provider: Some((selected_meta.provider.clone(), selected_meta.model.clone())),
+            plan: None,
+        };
+
+        let snapshot = initial_session_snapshot(&startup_config, selected_meta.cwd.clone());
+        assert_eq!(snapshot.provider, startup_config.provider.id);
+        assert_eq!(snapshot.model, startup_config.model);
+
+        let state = super::app::AppState::with_session_and_history(
+            snapshot,
+            Arc::new(Mutex::new(session_startup.history.clone())),
+        );
+        write_session_snapshot(&store, &selected_meta, &state, &session_startup.history)
+            .expect("rewrite selected session with active fallback provider");
+        let (rewritten, ..) = store.load("selected-session").expect("selected session");
+        assert_eq!(rewritten.id, "selected-session");
+        assert_eq!(rewritten.provider, startup_config.provider.id);
+        assert_eq!(rewritten.model, startup_config.model);
     }
 
     #[test]
@@ -3299,6 +3490,7 @@ mod tests {
             .send(UserInput::SetProvider {
                 id: "alt".to_string(),
                 model: "alt-model".to_string(),
+                kind: ProviderSwitchKind::Interactive,
             })
             .unwrap();
         input_tx
@@ -3357,6 +3549,7 @@ mod tests {
             .send(UserInput::SetProvider {
                 id: "missing".to_string(),
                 model: "m1".to_string(),
+                kind: ProviderSwitchKind::Interactive,
             })
             .unwrap();
         input_tx
@@ -3429,6 +3622,7 @@ mod tests {
             .send(UserInput::SetProvider {
                 id: "wps".to_string(),
                 model: "zhipu/glm-5.2".to_string(),
+                kind: ProviderSwitchKind::Interactive,
             })
             .unwrap();
         input_tx
@@ -3525,6 +3719,7 @@ model = "zhipu/glm-5.2"
             .send(UserInput::SetProvider {
                 id: "wps".to_string(),
                 model: "zhipu/glm-5.2".to_string(),
+                kind: ProviderSwitchKind::Interactive,
             })
             .unwrap();
         input_tx
@@ -3548,5 +3743,1507 @@ model = "zhipu/glm-5.2"
         assert!(locked.iter().any(|msg| {
             matches!(msg, Message::Assistant { text, .. } if text == "mock response")
         }));
+    }
+
+    // --- §6.2 RED: interrupt history + loaded session normalization ---
+
+    const INTERRUPTED_TOOL_CONTENT: &str = "tool call interrupted before completion";
+    const PREV_SESSION_INTERRUPTED_OUTPUT: &str = "上次会话已中断";
+
+    #[test]
+    fn complete_interrupted_tool_results_fills_unpaired_occurrences() {
+        use crate::provider::ToolCall;
+        use serde_json::json;
+
+        let mut history = vec![
+            Message::System("sys".into()),
+            Message::User("old turn".into()),
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "old-1".into(),
+                    name: "echo".into(),
+                    arguments: json!({}),
+                }],
+                thinking: Vec::new(),
+            },
+            Message::ToolResult {
+                call_id: "old-1".into(),
+                content: "old ok".into(),
+                is_error: false,
+            },
+            // turn start
+            Message::User("new turn".into()),
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "safe".into(),
+                        arguments: json!({"key": "a"}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "safe".into(),
+                        arguments: json!({"key": "b"}),
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        name: "safe".into(),
+                        arguments: json!({"key": "c"}),
+                    },
+                ],
+                thinking: Vec::new(),
+            },
+            Message::ToolResult {
+                call_id: "c1".into(),
+                content: "ok:a".into(),
+                is_error: false,
+            },
+        ];
+        let turn_start = 4; // index of User("new turn")
+        complete_interrupted_tool_results(&mut history, turn_start);
+
+        let results: Vec<_> = history[turn_start..]
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } => Some((call_id.as_str(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("c1", "ok:a", false),
+                ("c2", INTERRUPTED_TOOL_CONTENT, true),
+                ("c3", INTERRUPTED_TOOL_CONTENT, true),
+            ]
+        );
+        // 更早 turn 不变
+        assert!(matches!(
+            &history[3],
+            Message::ToolResult {
+                call_id,
+                content,
+                is_error: false
+            } if call_id == "old-1" && content == "old ok"
+        ));
+    }
+
+    #[test]
+    fn complete_interrupted_respects_duplicate_ids_across_assistants() {
+        use crate::provider::ToolCall;
+        use serde_json::json;
+
+        let mut history = vec![
+            Message::User("turn".into()),
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "safe".into(),
+                    arguments: json!({"key": "a"}),
+                }],
+                thinking: Vec::new(),
+            },
+            Message::ToolResult {
+                call_id: "call-1".into(),
+                content: "ok:a".into(),
+                is_error: false,
+            },
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "safe".into(),
+                    arguments: json!({"key": "b"}),
+                }],
+                thinking: Vec::new(),
+            },
+        ];
+        complete_interrupted_tool_results(&mut history, 0);
+        let results: Vec<_> = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } => Some((call_id.as_str(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("call-1", "ok:a", false),
+                ("call-1", INTERRUPTED_TOOL_CONTENT, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_loaded_session_closes_running_cards_and_fills_history() {
+        use crate::provider::ToolCall;
+        use crate::tui::app::{ToolCard, ToolCardStatus};
+        use serde_json::json;
+
+        let mut history = vec![
+            Message::System("sys".into()),
+            Message::User("u".into()),
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                thinking: Vec::new(),
+            },
+            Message::ToolResult {
+                call_id: "call-1".into(),
+                content: "first".into(),
+                is_error: false,
+            },
+            Message::User("later".into()),
+        ];
+        let mut transcript = vec![
+            TranscriptBlock::User("u".into()),
+            TranscriptBlock::Tool(ToolCard {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                args: json!({}),
+                readonly: true,
+                status: ToolCardStatus::Done,
+                output: Some("first".into()),
+                truncated: false,
+                exit: None,
+            }),
+            TranscriptBlock::Tool(ToolCard {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                args: json!({}),
+                readonly: true,
+                status: ToolCardStatus::Running,
+                output: None,
+                truncated: true,
+                exit: Some(1),
+            }),
+            TranscriptBlock::Notice("keep".into()),
+            TranscriptBlock::Tool(ToolCard {
+                id: "other".into(),
+                name: "grep".into(),
+                args: json!({}),
+                readonly: true,
+                status: ToolCardStatus::Error,
+                output: Some("err".into()),
+                truncated: false,
+                exit: None,
+            }),
+        ];
+
+        normalize_loaded_session(&mut history, &mut transcript);
+        // 第二 occurrence 应在结果组末尾、later User 之前
+        assert!(matches!(
+            &history[4],
+            Message::ToolResult {
+                call_id,
+                content,
+                is_error: true
+            } if call_id == "call-1" && content == INTERRUPTED_TOOL_CONTENT
+        ));
+        assert!(matches!(&history[5], Message::User(t) if t == "later"));
+
+        match &transcript[2] {
+            TranscriptBlock::Tool(card) => {
+                assert_eq!(card.status, ToolCardStatus::Error);
+                assert_eq!(
+                    card.output.as_deref(),
+                    Some(PREV_SESSION_INTERRUPTED_OUTPUT)
+                );
+                assert!(!card.truncated);
+                assert_eq!(card.exit, None);
+            }
+            other => panic!("expected tool card, got {other:?}"),
+        }
+        // Done / Notice / Error 不变
+        match &transcript[1] {
+            TranscriptBlock::Tool(card) => {
+                assert_eq!(card.status, ToolCardStatus::Done);
+                assert_eq!(card.output.as_deref(), Some("first"));
+            }
+            _ => panic!("done card"),
+        }
+        assert!(matches!(&transcript[3], TranscriptBlock::Notice(t) if t == "keep"));
+
+        // 幂等
+        let history_once = history.clone();
+        let transcript_once = transcript.clone();
+        normalize_loaded_session(&mut history, &mut transcript);
+        assert_eq!(history, history_once);
+        assert_eq!(transcript, transcript_once);
+    }
+
+    #[test]
+    fn load_session_for_activation_normalizes_while_raw_load_unchanged() {
+        use crate::provider::ToolCall;
+        use crate::tui::app::{ToolCard, ToolCardStatus};
+        use serde_json::json;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().to_path_buf());
+        let meta = SessionMeta {
+            id: "sess-norm".into(),
+            provider: "mock".into(),
+            model: "m".into(),
+            created_at: "1".into(),
+            cwd: temp.path().to_path_buf(),
+            app_version: "1".into(),
+        };
+        let history = vec![
+            Message::System("old sys".into()),
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                thinking: Vec::new(),
+            },
+            Message::ToolResult {
+                call_id: "call-1".into(),
+                content: "first".into(),
+                is_error: false,
+            },
+        ];
+        let transcript = vec![TranscriptBlock::Tool(ToolCard {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            args: json!({}),
+            readonly: true,
+            status: ToolCardStatus::Running,
+            output: None,
+            truncated: false,
+            exit: None,
+        })];
+        store
+            .write(&meta, &history, &transcript, None)
+            .expect("write");
+
+        let raw = store.load("sess-norm").expect("raw load");
+        assert_eq!(raw.1, history);
+        assert!(matches!(
+            &raw.2[0],
+            TranscriptBlock::Tool(card) if card.status == ToolCardStatus::Running
+        ));
+
+        let activated = load_session_for_activation(&store, "sess-norm").expect("activate");
+        assert!(
+            activated.1.iter().any(|m| matches!(
+                m,
+                Message::ToolResult {
+                    call_id,
+                    content,
+                    is_error: true
+                } if call_id == "call-1" && content == INTERRUPTED_TOOL_CONTENT
+            )),
+            "activation must fill second occurrence interrupted result"
+        );
+        assert!(matches!(
+            &activated.2[0],
+            TranscriptBlock::Tool(card)
+                if card.status == ToolCardStatus::Error
+                    && card.output.as_deref() == Some(PREV_SESSION_INTERRUPTED_OUTPUT)
+        ));
+        // 磁盘未改
+        let raw_again = store.load("sess-norm").expect("raw again");
+        assert_eq!(raw_again.1, history);
+    }
+
+    // --- provider 事务 / thinking 保留 / 双工具 Interrupt / session→Provider 回归 ---
+
+    use std::sync::Mutex as StdMutex;
+
+    /// 审查 #3：恢复路径 `apply_set_provider` → `set_model` 不得清空 loaded thinking。
+    #[test]
+    fn apply_set_provider_restore_preserves_assistant_thinking() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "mock".to_string(),
+            ProviderProfile {
+                id: "mock".to_string(),
+                kind: ProviderKind::Mock,
+                base_url: None,
+                model: "restored-model".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut assembled = assemble_agent(
+            provider,
+            &config(),
+            Box::new(normal_channel_decider(mpsc::unbounded_channel().0)),
+            None,
+            None,
+            None,
+        );
+        let thinking = vec![ThinkingBlock {
+            text: "keep-me".to_string(),
+            signature: Some("sig-restore".to_string()),
+            redacted: false,
+        }];
+        let mut history = vec![
+            Message::System(DEFAULT_SYSTEM_PROMPT.to_string()),
+            Message::User("hi".into()),
+            Message::Assistant {
+                text: "prior".into(),
+                tool_calls: Vec::new(),
+                thinking: thinking.clone(),
+            },
+        ];
+
+        super::apply_set_provider(
+            &profiles,
+            &config(),
+            &temp.path().join("credentials"),
+            "mock",
+            "restored-model",
+            &mut assembled.agent,
+            &mut assembled.compacting,
+            &mut history,
+            ProviderSwitchKind::SessionRestore,
+        )
+        .expect("mock provider restore should succeed");
+
+        match &history[2] {
+            Message::Assistant {
+                thinking: blocks, ..
+            } => assert_eq!(
+                blocks, &thinking,
+                "审查#3：session 恢复成功时必须保留 Assistant.thinking"
+            ),
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+    }
+
+    /// 审查 #2：unknown provider — Agent 保持 startup、仅一次 Notice、无 ProviderApplied。
+    #[tokio::test]
+    async fn set_provider_unknown_keeps_agent_and_single_notice_no_ui_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "still-startup".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+            thinking: Vec::new(),
+        }]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let task_config = task_hotswap(&temp, BTreeMap::new());
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            assembled.compacting,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        let mut state = super::app::AppState::new();
+        state.session.provider = "mock".to_string();
+        state.session.model = "tui-test-model".to_string();
+
+        input_tx
+            .send(UserInput::SetProvider {
+                id: "ghost-provider".to_string(),
+                model: "ghost-model".to_string(),
+                kind: ProviderSwitchKind::SessionRestore,
+            })
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt("ping".to_string()))
+            .unwrap();
+
+        let mut notices = Vec::new();
+        let mut applied = 0usize;
+        loop {
+            match ui_rx.recv().await.expect("ui") {
+                AgentEvent::Notice(t) => {
+                    notices.push(t.clone());
+                    state.apply(AgentEvent::Notice(t));
+                }
+                AgentEvent::ProviderApplied { id, model } => {
+                    applied += 1;
+                    state.apply(AgentEvent::ProviderApplied { id, model });
+                }
+                AgentEvent::TurnComplete => break,
+                other => state.apply(other),
+            }
+        }
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert_eq!(
+            notices.len(),
+            1,
+            "审查#2：失败只产生一次 Notice, got {notices:?}"
+        );
+        assert!(
+            notices[0].contains("未知 provider") || notices[0].contains("ghost"),
+            "notice={:?}",
+            notices[0]
+        );
+        assert_eq!(applied, 0, "失败不得发 ProviderApplied");
+        assert_eq!(provider.recorded_requests().len(), 1);
+        assert_eq!(provider.recorded_requests()[0].model, "tui-test-model");
+        assert_eq!(
+            state.session.provider, "mock",
+            "审查#2：unknown provider 失败后 UI 不得保留无效 provider"
+        );
+        assert_eq!(state.session.model, "tui-test-model");
+    }
+
+    /// 审查 #2：缺凭据 — Agent 保持 startup；UI 不得停在无效 provider。
+    #[tokio::test]
+    async fn set_provider_missing_creds_keeps_ui_on_startup_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "still-startup".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+            thinking: Vec::new(),
+        }]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "wps".to_string(),
+            ProviderProfile {
+                id: "wps".to_string(),
+                kind: ProviderKind::OpenAi,
+                base_url: Some("https://example.invalid/v1".to_string()),
+                model: "remote-model".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let task_config = task_hotswap(&temp, profiles);
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            assembled.compacting,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        let mut state = super::app::AppState::new();
+        state.session.provider = "mock".to_string();
+        state.session.model = "tui-test-model".to_string();
+
+        input_tx
+            .send(UserInput::SetProvider {
+                id: "wps".to_string(),
+                model: "remote-model".to_string(),
+                kind: ProviderSwitchKind::SessionRestore,
+            })
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt("ping".to_string()))
+            .unwrap();
+
+        let mut notices = 0usize;
+        let mut applied = 0usize;
+        loop {
+            match ui_rx.recv().await.expect("ui") {
+                AgentEvent::Notice(t) if t.contains("凭据") => {
+                    notices += 1;
+                    state.apply(AgentEvent::Notice(t));
+                }
+                AgentEvent::ProviderApplied { id, model } => {
+                    applied += 1;
+                    state.apply(AgentEvent::ProviderApplied { id, model });
+                }
+                AgentEvent::TurnComplete => break,
+                other => state.apply(other),
+            }
+        }
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert_eq!(notices, 1);
+        assert_eq!(applied, 0);
+        assert_eq!(provider.recorded_requests().len(), 1);
+        assert_eq!(
+            state.session.provider, "mock",
+            "审查#2：缺凭据失败后 UI 保持 startup provider"
+        );
+        assert_eq!(state.session.model, "tui-test-model");
+    }
+
+    /// 审查 #2：成功恢复 — 仅 ProviderApplied 后 UI 提交，与 Agent 一致。
+    #[tokio::test]
+    async fn set_provider_success_allows_ui_commit_to_restored_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "old".into(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+            thinking: Vec::new(),
+        }]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "alt".to_string(),
+            ProviderProfile {
+                id: "alt".to_string(),
+                kind: ProviderKind::Mock,
+                base_url: None,
+                model: "alt-model".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        let assembled = assemble_agent(
+            old.clone(),
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let task_config = task_hotswap(&temp, profiles);
+        let history = agent_history();
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            assembled.compacting,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        let mut state = super::app::AppState::new();
+        state.session.provider = "mock".to_string();
+        state.session.model = "tui-test-model".to_string();
+
+        input_tx
+            .send(UserInput::SetProvider {
+                id: "alt".to_string(),
+                model: "alt-model".to_string(),
+                kind: ProviderSwitchKind::SessionRestore,
+            })
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt("hello".to_string()))
+            .unwrap();
+        loop {
+            match ui_rx.recv().await.expect("ui") {
+                AgentEvent::ProviderApplied { id, model } => {
+                    state.apply(AgentEvent::ProviderApplied { id, model });
+                }
+                AgentEvent::TurnComplete => break,
+                other => state.apply(other),
+            }
+        }
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert!(old.recorded_requests().is_empty());
+        assert_eq!(state.session.provider, "alt");
+        assert_eq!(state.session.model, "alt-model");
+        let locked = history.lock().await;
+        assert!(locked
+            .iter()
+            .any(|m| matches!(m, Message::User(t) if t == "hello")));
+    }
+
+    /// 审查 #2 生产路径：models picker Enter 当前乐观写 session.provider；
+    /// 事务性修复后，在 Agent 确认前不得改 UI（与 session activation 同构）。
+    #[test]
+    fn models_picker_enter_must_not_commit_provider_before_agent_confirms() {
+        use crate::tui::command::Command;
+
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut state = super::app::AppState::new();
+        state.session.provider = "mock".to_string();
+        state.session.model = "tui-test-model".to_string();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "mock".to_string(),
+            ProviderProfile {
+                id: "mock".to_string(),
+                kind: ProviderKind::Mock,
+                base_url: None,
+                model: "tui-test-model".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        profiles.insert(
+            "alt".to_string(),
+            ProviderProfile {
+                id: "alt".to_string(),
+                kind: ProviderKind::Mock,
+                base_url: None,
+                model: "alt-model".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        state.provider_profiles = profiles;
+        state.execute_command(Command::Models, &input_tx);
+        // 移到 alt
+        if let Some(picker) = state.models_picker.as_mut() {
+            for _ in 0..8 {
+                if picker.selected().map(|(id, _)| id) == Some("alt".to_string()) {
+                    break;
+                }
+                picker.move_highlight(1);
+            }
+        }
+        state.on_key(key(KeyCode::Enter), &input_tx);
+
+        match input_rx.try_recv() {
+            Ok(UserInput::SetProvider { id, model, .. }) => {
+                assert_eq!(id, "alt");
+                assert_eq!(model, "alt-model");
+            }
+            other => panic!("expected SetProvider, got {other:?}"),
+        }
+        // Agent 尚未确认前，UI 必须仍保留当前 provider/model。
+        assert_eq!(
+            state.session.provider, "mock",
+            "审查#2：不得在 Agent 确认前乐观写入 provider"
+        );
+        assert_eq!(state.session.model, "tui-test-model");
+    }
+
+    /// 审查 #6.1–6.2：双 ParallelSafe 工具均 entered 后 Interrupt。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_agent_task_interrupts_two_parallel_tools_without_late_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let limiter = BlockingToolLimiter::new(4);
+        let (e1_tx, mut e1_rx) = oneshot::channel::<()>();
+        let (e2_tx, mut e2_rx) = oneshot::channel::<()>();
+        let (r1_tx, r1_rx) = std::sync::mpsc::channel::<()>();
+        let (r2_tx, r2_rx) = std::sync::mpsc::channel::<()>();
+        let (done1_tx, mut done1_rx) = oneshot::channel::<()>();
+        let (done2_tx, mut done2_rx) = oneshot::channel::<()>();
+        let (watchdog_cancel_tx, watchdog_cancel_rx) = std::sync::mpsc::channel::<()>();
+        let (watchdog_failed_tx, mut watchdog_failed_rx) = mpsc::unbounded_channel::<()>();
+        let watchdog = {
+            let r1 = r1_tx.clone();
+            let r2 = r2_tx.clone();
+            std::thread::spawn(move || {
+                if watchdog_cancel_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_err()
+                {
+                    let _ = r1.send(());
+                    let _ = r2.send(());
+                    let _ = watchdog_failed_tx.send(());
+                }
+            })
+        };
+
+        struct BlockingHoldTool {
+            name: &'static str,
+            limiter: BlockingToolLimiter,
+            entered: StdMutex<Option<oneshot::Sender<()>>>,
+            release: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
+            completed: StdMutex<Option<oneshot::Sender<()>>>,
+        }
+
+        #[async_trait]
+        impl Tool for BlockingHoldTool {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn description(&self) -> &str {
+                "hold"
+            }
+            fn schema(&self) -> serde_json::Value {
+                json!({"type": "object", "properties": {}})
+            }
+            fn permission_level(&self) -> PermissionLevel {
+                PermissionLevel::ReadOnly
+            }
+            fn concurrency(&self) -> ToolConcurrency {
+                ToolConcurrency::ParallelSafe
+            }
+            async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> ToolOutcome {
+                let entered = self.entered.lock().unwrap().take().expect("entered once");
+                let release = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("release rx once");
+                let completed = self
+                    .completed
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("completed once");
+                let name = self.name;
+                run_blocking_tool(&self.limiter, move || {
+                    let _ = entered.send(());
+                    let _ = release.recv();
+                    let _ = completed.send(());
+                    ToolOutcome {
+                        content: format!("done:{name}"),
+                        is_error: false,
+                        truncated: false,
+                        exit: None,
+                    }
+                })
+                .await
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(BlockingHoldTool {
+                name: "hold_a",
+                limiter: limiter.clone(),
+                entered: StdMutex::new(Some(e1_tx)),
+                release: StdMutex::new(Some(r1_rx)),
+                completed: StdMutex::new(Some(done1_tx)),
+            }))
+            .unwrap();
+        registry
+            .register(Box::new(BlockingHoldTool {
+                name: "hold_b",
+                limiter,
+                entered: StdMutex::new(Some(e2_tx)),
+                release: StdMutex::new(Some(r2_rx)),
+                completed: StdMutex::new(Some(done2_tx)),
+            }))
+            .unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "hold_a".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "hold_b".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+                thinking: Vec::new(),
+            },
+            // 中断后下一 Prompt 使用
+            ModelResponse {
+                text: "next-ok".into(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            },
+        ]));
+
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let history = agent_history();
+        let mut agent = Agent::new(
+            provider,
+            registry,
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            "tui-test-model".to_string(),
+            4,
+        );
+        agent.set_permission_mode(Arc::new(std::sync::Mutex::new(PermissionMode::Normal)));
+        let compacting = Compacting::new(
+            Arc::new(MockProvider::new(vec![])),
+            "tui-test-model".to_string(),
+            crate::agent::CompactionSettings {
+                model_context_window: None,
+                compact_trigger_ratio: DEFAULT_COMPACT_TRIGGER_RATIO,
+                keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
+            },
+        );
+        let handle = tokio::spawn(run_agent_task(
+            agent,
+            history.clone(),
+            compacting,
+            task_hotswap(&temp, BTreeMap::new()),
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx.send(UserInput::Prompt("run both".into())).unwrap();
+
+        // 等待两个真实 spawn_blocking closure 均 entered；OS watchdog 仅负责失败清理。
+        tokio::select! {
+            result = &mut e1_rx => result.expect("hold_a entered"),
+            _ = watchdog_failed_rx.recv() => panic!("watchdog fired before hold_a entered"),
+        }
+        tokio::select! {
+            result = &mut e2_rx => result.expect("hold_b entered"),
+            _ = watchdog_failed_rx.recv() => panic!("watchdog fired before hold_b entered"),
+        }
+
+        interrupt_tx.send(UserInput::Interrupt).unwrap();
+
+        let mut interrupted = 0usize;
+        let mut finished = 0usize;
+        let mut idle = 0usize;
+        loop {
+            tokio::select! {
+                event = ui_rx.recv() => match event.expect("ui") {
+                    AgentEvent::Interrupted => {
+                        interrupted += 1;
+                        break;
+                    }
+                    AgentEvent::ToolCallFinished { .. } => finished += 1,
+                    AgentEvent::StatusChanged(AgentStatus::Idle) => idle += 1,
+                    _ => {}
+                },
+                _ = watchdog_failed_rx.recv() => {
+                    panic!("watchdog fired before Interrupted");
+                }
+            }
+        }
+        assert_eq!(interrupted, 1, "exactly one Interrupted");
+        assert_eq!(finished, 0, "no ToolCallFinished after interrupt path");
+        assert_eq!(idle, 0, "no Idle after interrupt");
+        assert!(matches!(
+            ui_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!handle.is_finished(), "Agent task 仍存活");
+
+        // history：每个 occurrence 恰有一个 interrupted ToolResult
+        {
+            let h = history.lock().await;
+            let results: Vec<_> = h
+                .iter()
+                .filter_map(|m| match m {
+                    Message::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } => Some((call_id.as_str(), content.as_str(), *is_error)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                results,
+                vec![
+                    ("c1", INTERRUPTED_TOOL_CONTENT, true),
+                    ("c2", INTERRUPTED_TOOL_CONTENT, true),
+                ]
+            );
+        }
+
+        // 释放 detached blocking closures，并以 completed ack 代替固定 sleep。
+        let _ = r1_tx.send(());
+        let _ = r2_tx.send(());
+        tokio::select! {
+            result = &mut done1_rx => result.expect("hold_a completed"),
+            _ = watchdog_failed_rx.recv() => panic!("watchdog fired before hold_a completed"),
+        }
+        tokio::select! {
+            result = &mut done2_rx => result.expect("hold_b completed"),
+            _ = watchdog_failed_rx.recv() => panic!("watchdog fired before hold_b completed"),
+        }
+        let _ = watchdog_cancel_tx.send(());
+        let _ = watchdog.join();
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(ui_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "detached blocking outcomes must not emit late events"
+        );
+        {
+            let h = history.lock().await;
+            let results: Vec<_> = h
+                .iter()
+                .filter_map(|m| match m {
+                    Message::ToolResult {
+                        call_id, content, ..
+                    } => Some((call_id.as_str(), content.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                results,
+                vec![
+                    ("c1", INTERRUPTED_TOOL_CONTENT),
+                    ("c2", INTERRUPTED_TOOL_CONTENT),
+                ],
+                "释放后台 closure 后 history 不被污染"
+            );
+        }
+
+        // 立即下一 Prompt 可正常完成
+        input_tx.send(UserInput::Prompt("after".into())).unwrap();
+        loop {
+            match ui_rx.recv().await.expect("next prompt event") {
+                AgentEvent::TurnComplete => break,
+                AgentEvent::ToolCallFinished { .. } => {
+                    panic!("detached prior tool emitted finished during next prompt")
+                }
+                _ => {}
+            }
+        }
+
+        drop(input_tx);
+        drop(interrupt_tx);
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// 审查 #6.3–6.5：`--continue` / picker 激活 fixture → 首次 Provider 请求形状。
+    #[tokio::test]
+    async fn continue_activation_first_provider_sees_normalized_history_with_thinking() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().join("sessions"));
+        let meta = SessionMeta {
+            id: "sess-continue".into(),
+            provider: "mock".into(),
+            model: "restored-model".into(),
+            created_at: "1".into(),
+            cwd: temp.path().to_path_buf(),
+            app_version: "1".into(),
+        };
+        let thinking = vec![ThinkingBlock {
+            text: "session-thought".into(),
+            signature: Some("sig-s".into()),
+            redacted: false,
+        }];
+        let history = vec![
+            Message::System("old-system-should-replace".into()),
+            Message::User("u".into()),
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                thinking: thinking.clone(),
+            },
+            Message::ToolResult {
+                call_id: "call-1".into(),
+                content: "first-only".into(),
+                is_error: false,
+            },
+        ];
+        let transcript = vec![
+            TranscriptBlock::User("u".into()),
+            TranscriptBlock::Tool(super::app::ToolCard {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                args: json!({}),
+                readonly: true,
+                status: super::app::ToolCardStatus::Done,
+                output: Some("first-only".into()),
+                truncated: false,
+                exit: None,
+            }),
+            TranscriptBlock::Tool(super::app::ToolCard {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                args: json!({}),
+                readonly: true,
+                status: super::app::ToolCardStatus::Running,
+                output: None,
+                truncated: false,
+                exit: None,
+            }),
+            TranscriptBlock::Tool(super::app::ToolCard {
+                id: "other".into(),
+                name: "grep".into(),
+                args: json!({}),
+                readonly: true,
+                status: super::app::ToolCardStatus::Error,
+                output: Some("err".into()),
+                truncated: false,
+                exit: None,
+            }),
+        ];
+        store.write(&meta, &history, &transcript, None).unwrap();
+
+        let startup =
+            prepare_session_startup(&store, &cli_paths(&temp), &config(), StartupMode::Continue)
+                .expect("continue startup");
+        assert_eq!(startup.meta.id, "sess-continue");
+        let loaded_history = startup.history;
+        let loaded_transcript = startup.transcript;
+        let restore_provider = startup.resume_provider.expect("restore provider");
+
+        // 历史 Error/Done 卡：Running 已收口
+        assert!(matches!(
+            &loaded_transcript[1],
+            TranscriptBlock::Tool(c) if c.status == super::app::ToolCardStatus::Done
+        ));
+        assert!(matches!(
+            &loaded_transcript[2],
+            TranscriptBlock::Tool(c)
+                if c.status == super::app::ToolCardStatus::Error
+                    && c.output.as_deref() == Some(PREV_SESSION_INTERRUPTED_OUTPUT)
+        ));
+        assert!(matches!(
+            &loaded_transcript[3],
+            TranscriptBlock::Tool(c) if c.status == super::app::ToolCardStatus::Error
+        ));
+
+        let recording = Arc::new(MockProvider::new(vec![ModelResponse {
+            text: "new-turn".into(),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+            thinking: Vec::new(),
+        }]));
+        let assembled = assemble_agent(
+            recording.clone(),
+            &config(),
+            Box::new(normal_channel_decider(mpsc::unbounded_channel().0)),
+            None,
+            None,
+            None,
+        );
+        // thinking 必须仍在 history（审查#3 + #6.4）
+        match loaded_history.iter().find(|m| {
+            matches!(
+                m,
+                Message::Assistant {
+                    thinking: t,
+                    ..
+                } if !t.is_empty()
+            )
+        }) {
+            Some(Message::Assistant {
+                thinking: blocks, ..
+            }) => assert_eq!(blocks, &thinking, "thinking must survive restore"),
+            _ => panic!("thinking stripped during restore"),
+        }
+
+        // 每个 occurrence 均已配对
+        let tool_results: Vec<_> = loaded_history
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results, vec!["call-1", "call-1"]);
+
+        let history = Arc::new(Mutex::new(loaded_history));
+        let (restore_tx, mut restore_rx) = mpsc::unbounded_channel();
+        send_session_provider_restore(&restore_tx, restore_provider.0, restore_provider.1);
+        let restore_input = restore_rx.try_recv().expect("continue restore command");
+        assert!(matches!(
+            &restore_input,
+            UserInput::SetProvider {
+                kind: ProviderSwitchKind::SessionRestore,
+                ..
+            }
+        ));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let task_config = RunAgentTaskConfig {
+            // 故意不注册 persisted provider：真实 SetProvider 失败后回退 RecordingProvider。
+            profiles: BTreeMap::new(),
+            startup_config: config(),
+            credentials_path: temp.path().join("credentials"),
+            tool_ctx: ToolContext {
+                cwd: temp.path().to_path_buf(),
+                max_output_bytes: 4096,
+            },
+        };
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            assembled.compacting,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+        input_tx.send(restore_input).unwrap();
+        input_tx.send(UserInput::Prompt("next".into())).unwrap();
+        let mut fallback_notices = 0usize;
+        loop {
+            match ui_rx.recv().await {
+                Some(AgentEvent::Notice(message)) if message.contains("未知 provider") => {
+                    fallback_notices += 1;
+                }
+                Some(AgentEvent::TurnComplete) => break,
+                Some(_) => {}
+                None => panic!("ui channel closed before TurnComplete"),
+            }
+        }
+        drop(input_tx);
+        handle.await.unwrap();
+        assert_eq!(fallback_notices, 1, "continue fallback emits one Notice");
+
+        let recorded = recording.recorded_requests();
+        assert_eq!(recorded.len(), 1, "first prompt after restore");
+        let msgs = &recorded[0].messages;
+        assert!(
+            matches!(&msgs[0], Message::System(s) if s == DEFAULT_SYSTEM_PROMPT),
+            "System 已替换"
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                Message::Assistant { thinking: t, .. } if t == &thinking
+            )),
+            "thinking 保留于首次 Provider 请求"
+        );
+        let call_count = msgs
+            .iter()
+            .filter(|m| matches!(m, Message::ToolResult { call_id, .. } if call_id == "call-1"))
+            .count();
+        assert_eq!(call_count, 2, "每个 occurrence 均配对，无 dangling");
+    }
+
+    /// 审查 #6.3 picker hot-swap 路径：与 continue 共用 load_session_for_activation。
+    #[tokio::test]
+    async fn picker_hotswap_activation_first_provider_matches_continue_contract() {
+        // 与 continue 相同 fixture 契约；激活 seam 已是 load_session_for_activation。
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().join("sessions"));
+        let meta = SessionMeta {
+            id: "sess-picker".into(),
+            provider: "mock".into(),
+            model: "restored-model".into(),
+            created_at: "1".into(),
+            cwd: temp.path().to_path_buf(),
+            app_version: "1".into(),
+        };
+        let thinking = vec![ThinkingBlock {
+            text: "picker-thought".into(),
+            signature: None,
+            redacted: false,
+        }];
+        let history = vec![
+            Message::System("old".into()),
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "dup".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "dup".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                thinking: thinking.clone(),
+            },
+            Message::ToolResult {
+                call_id: "dup".into(),
+                content: "one".into(),
+                is_error: false,
+            },
+        ];
+        let transcript = vec![
+            TranscriptBlock::Tool(super::app::ToolCard {
+                id: "dup".into(),
+                name: "read_file".into(),
+                args: json!({}),
+                readonly: true,
+                status: super::app::ToolCardStatus::Running,
+                output: None,
+                truncated: false,
+                exit: None,
+            }),
+            TranscriptBlock::Tool(super::app::ToolCard {
+                id: "dup".into(),
+                name: "read_file".into(),
+                args: json!({}),
+                readonly: true,
+                status: super::app::ToolCardStatus::Done,
+                output: Some("one".into()),
+                truncated: false,
+                exit: None,
+            }),
+        ];
+        store.write(&meta, &history, &transcript, None).unwrap();
+
+        let mut state = super::app::AppState::new();
+        state.open_session_picker(vec![SessionSummary {
+            id: "sess-picker".to_string(),
+            created_at: "1".to_string(),
+            first_user: None,
+        }]);
+        let mut pending_str = String::new();
+        assert_eq!(
+            handle_session_picker_batch_key(&mut state, key(KeyCode::Enter), &mut pending_str),
+            Some(super::app::ApplyBatchKeyResult::BreakBatch)
+        );
+        let selected = state
+            .take_pending_session_switch()
+            .expect("picker selected session");
+        let mut active_meta = session_meta("fresh-session");
+        let (activation_tx, mut activation_rx) = mpsc::unbounded_channel();
+        activate_session_switch(
+            &store,
+            &selected,
+            &mut state,
+            &mut active_meta,
+            &activation_tx,
+        )
+        .await;
+        assert_eq!(active_meta.id, "sess-picker");
+        let restore_input = activation_rx.try_recv().expect("picker restore command");
+        assert!(matches!(
+            &restore_input,
+            UserInput::SetProvider {
+                kind: ProviderSwitchKind::SessionRestore,
+                ..
+            }
+        ));
+        let h = state.agent_history.lock().await.clone();
+        let tr = state.transcript.clone();
+        assert!(
+            h.iter().any(|m| matches!(
+                m,
+                Message::ToolResult {
+                    content,
+                    is_error: true,
+                    ..
+                } if content == INTERRUPTED_TOOL_CONTENT
+            )),
+            "dangling occurrence filled"
+        );
+        // Running 卡 → Error；Done 不变
+        assert!(matches!(
+            &tr[0],
+            TranscriptBlock::Tool(c)
+                if c.status == super::app::ToolCardStatus::Error
+                    && c.output.as_deref() == Some(PREV_SESSION_INTERRUPTED_OUTPUT)
+        ));
+        assert!(matches!(
+            &tr[1],
+            TranscriptBlock::Tool(c) if c.status == super::app::ToolCardStatus::Done
+        ));
+
+        let recording = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "dup".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "missing-picker-file.txt"}),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+                thinking: Vec::new(),
+            },
+            ModelResponse {
+                text: "ok".into(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            },
+        ]));
+        let assembled = assemble_agent(
+            recording.clone(),
+            &config(),
+            Box::new(normal_channel_decider(mpsc::unbounded_channel().0)),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            h.iter().any(|m| matches!(
+                m,
+                Message::Assistant { thinking: t, .. } if t == &thinking
+            )),
+            "审查#3/#6：picker restore 保留 thinking"
+        );
+
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_i_tx, i_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            state.agent_history.clone(),
+            assembled.compacting,
+            RunAgentTaskConfig {
+                // persisted provider 未注册，真实恢复命令失败后继续用 RecordingProvider。
+                profiles: BTreeMap::new(),
+                startup_config: config(),
+                credentials_path: temp.path().join("credentials"),
+                tool_ctx: ToolContext {
+                    cwd: temp.path().to_path_buf(),
+                    max_output_bytes: 4096,
+                },
+            },
+            input_rx,
+            i_rx,
+            ui_tx,
+        ));
+        input_tx.send(restore_input).unwrap();
+        input_tx.send(UserInput::Prompt("go".into())).unwrap();
+        let mut fallback_notices = 0usize;
+        loop {
+            let event = ui_rx.recv().await.expect("ui event");
+            let done = matches!(event, AgentEvent::TurnComplete);
+            if matches!(&event, AgentEvent::Notice(message) if message.contains("未知 provider"))
+            {
+                fallback_notices += 1;
+            }
+            state.apply(event);
+            if done {
+                break;
+            }
+        }
+        drop(input_tx);
+        handle.await.unwrap();
+        assert_eq!(fallback_notices, 1);
+        let recorded = recording.recorded_requests();
+        assert_eq!(recorded.len(), 2);
+        let msgs = &recorded[0].messages;
+        assert!(matches!(&msgs[0], Message::System(s) if s == DEFAULT_SYSTEM_PROMPT));
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            Message::Assistant { thinking: t, .. } if t == &thinking
+        )));
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Message::ToolResult { call_id, .. } if call_id == "dup"))
+                .count(),
+            2,
+            "picker 首次 Provider 请求必须按 occurrence 补齐重复 id"
+        );
+
+        let cards: Vec<_> = state
+            .transcript
+            .iter()
+            .filter_map(|block| match block {
+                TranscriptBlock::Tool(card) if card.id == "dup" => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 3, "两张历史卡 + 一张新 turn 卡");
+        assert_eq!(cards[0].status, super::app::ToolCardStatus::Error);
+        assert_eq!(
+            cards[0].output.as_deref(),
+            Some(PREV_SESSION_INTERRUPTED_OUTPUT)
+        );
+        assert_eq!(cards[1].status, super::app::ToolCardStatus::Done);
+        assert_eq!(cards[1].output.as_deref(), Some("one"));
+        assert_ne!(cards[2].status, super::app::ToolCardStatus::Running);
+    }
+
+    /// 审查 #6.5：新 turn 复用 call id 只更新新 Running 卡，历史 Error/Done 不变。
+    #[test]
+    fn new_turn_same_call_id_updates_only_new_running_card() {
+        use super::app::{ToolCard, ToolCardStatus};
+
+        let mut state = super::app::AppState::new();
+        state.transcript = vec![
+            TranscriptBlock::Tool(ToolCard {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                args: json!({}),
+                readonly: true,
+                status: ToolCardStatus::Error,
+                output: Some(PREV_SESSION_INTERRUPTED_OUTPUT.into()),
+                truncated: false,
+                exit: None,
+            }),
+            TranscriptBlock::Tool(ToolCard {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                args: json!({}),
+                readonly: true,
+                status: ToolCardStatus::Done,
+                output: Some("old-done".into()),
+                truncated: false,
+                exit: None,
+            }),
+        ];
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            args: json!({}),
+            readonly: true,
+        });
+
+        assert_eq!(state.transcript.len(), 3);
+        assert!(matches!(
+            &state.transcript[0],
+            TranscriptBlock::Tool(c)
+                if c.status == ToolCardStatus::Error
+                    && c.output.as_deref() == Some(PREV_SESSION_INTERRUPTED_OUTPUT)
+        ));
+        assert!(matches!(
+            &state.transcript[1],
+            TranscriptBlock::Tool(c)
+                if c.status == ToolCardStatus::Done && c.output.as_deref() == Some("old-done")
+        ));
+        assert!(matches!(
+            &state.transcript[2],
+            TranscriptBlock::Tool(c) if c.status == ToolCardStatus::Running && c.id == "call-1"
+        ));
     }
 }

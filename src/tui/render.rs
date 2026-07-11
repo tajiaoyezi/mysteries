@@ -1949,6 +1949,17 @@ fn activity_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
             theme,
             format!("{} 执行 {name}…", state.spinner_glyph()),
         ),
+        Phase::ExecutingTools(count) => {
+            let label = if *count > 4 {
+                format!(
+                    "{} 处理 {count} 个工具（最多并行 4）…",
+                    state.spinner_glyph()
+                )
+            } else {
+                format!("{} 并行执行 {count} 个工具…", state.spinner_glyph())
+            };
+            running_activity_spans(state, theme, label)
+        }
         Phase::WaitingForPermission => {
             let mut spans = vec![Span::styled("▲ 等待授权…", base.fg(theme.warning_fg))];
             spans.extend(token_rate_spans(state, theme));
@@ -2563,12 +2574,14 @@ mod tests {
         transcript_line_count, user_question_other_cursor_position, DIFF_COLLAPSED_MAX_ROWS,
         DIFF_MAX_ROWS,
     };
+    use crate::agent::AgentStatus;
     use crate::config::{AuthType, ProviderKind, ProviderProfile};
     use crate::permission::PermissionMode;
     use crate::provider::Usage;
     use crate::session::SessionSummary;
     use crate::tool::ask::{Question, QuestionOption};
     use crate::tool::plan::{Plan, PlanStep, StepStatus};
+    use crate::tool::ToolOutcome;
     use crate::tui::app::{
         AppState, DiffKind, DiffLine, ModelsPicker, Phase, SessionSnapshot, ToolCard,
         ToolCardStatus, TranscriptBlock,
@@ -2765,6 +2778,8 @@ mod tests {
                 line.contains("◇ 就绪")
                     || line.contains("调用模型")
                     || line.contains("执行 ")
+                    || line.contains("并行执行 ")
+                    || line.contains("处理 ")
                     || line.contains("等待授权")
                     || line.contains("处理…")
                     || line.contains("压缩上下文")
@@ -4342,6 +4357,129 @@ mod tests {
         insta::assert_snapshot!("tui_interrupted_notice_daylight", text);
     }
 
+    fn state_two_running_parallel() -> AppState {
+        let mut state = AppState::new();
+        state.spinner_frame = 3;
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            args: json!({"path": "a.rs"}),
+            readonly: true,
+        });
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-2".into(),
+            name: "grep".into(),
+            args: json!({"pattern": "fn"}),
+            readonly: true,
+        });
+        state.apply(AgentEvent::StatusChanged(AgentStatus::ExecutingTools(2)));
+        state
+    }
+
+    fn state_five_running_parallel() -> AppState {
+        let mut state = AppState::new();
+        state.spinner_frame = 3;
+        for i in 1..=5 {
+            state.apply(AgentEvent::ToolCallStarted {
+                id: format!("call-{i}"),
+                name: "read_file".into(),
+                args: json!({"path": format!("f{i}.rs")}),
+                readonly: true,
+            });
+        }
+        state.apply(AgentEvent::StatusChanged(AgentStatus::ExecutingTools(5)));
+        state
+    }
+
+    fn state_interrupted_two_running() -> AppState {
+        let mut state = state_two_running_parallel();
+        state.apply(AgentEvent::Interrupted);
+        state
+    }
+
+    fn state_session_recovered_then_new_done() -> AppState {
+        use crate::tui::app::ToolCardStatus;
+        let mut state = AppState::new();
+        state.spinner_frame = 3;
+        // 旧 session Running 已规范化为 Error
+        state.transcript.push(TranscriptBlock::Tool(ToolCard {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            args: json!({}),
+            readonly: true,
+            status: ToolCardStatus::Error,
+            output: Some("上次会话已中断".into()),
+            truncated: false,
+            exit: None,
+        }));
+        // 新 turn 同 id 卡 Done
+        state.apply(AgentEvent::ToolCallStarted {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            args: json!({"path": "new.rs"}),
+            readonly: true,
+        });
+        state.apply(AgentEvent::ToolCallFinished {
+            id: "call-1".into(),
+            outcome: ToolOutcome {
+                content: "new content".into(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            },
+        });
+        state.phase = Phase::Ready;
+        state
+    }
+
+    #[test]
+    fn parallel_two_running_midnight_snapshot() {
+        let text = render_to_styled(&state_two_running_parallel(), &Theme::midnight());
+        insta::assert_snapshot!("tui_parallel_two_running_midnight", text);
+    }
+
+    #[test]
+    fn parallel_two_running_daylight_snapshot() {
+        let text = render_to_styled(&state_two_running_parallel(), &Theme::daylight());
+        insta::assert_snapshot!("tui_parallel_two_running_daylight", text);
+    }
+
+    #[test]
+    fn parallel_five_running_midnight_snapshot() {
+        let text = render_to_styled(&state_five_running_parallel(), &Theme::midnight());
+        insta::assert_snapshot!("tui_parallel_five_running_midnight", text);
+    }
+
+    #[test]
+    fn parallel_five_running_daylight_snapshot() {
+        let text = render_to_styled(&state_five_running_parallel(), &Theme::daylight());
+        insta::assert_snapshot!("tui_parallel_five_running_daylight", text);
+    }
+
+    #[test]
+    fn parallel_interrupted_two_cards_midnight_snapshot() {
+        let text = render_to_styled(&state_interrupted_two_running(), &Theme::midnight());
+        insta::assert_snapshot!("tui_parallel_interrupted_two_midnight", text);
+    }
+
+    #[test]
+    fn parallel_interrupted_two_cards_daylight_snapshot() {
+        let text = render_to_styled(&state_interrupted_two_running(), &Theme::daylight());
+        insta::assert_snapshot!("tui_parallel_interrupted_two_daylight", text);
+    }
+
+    #[test]
+    fn parallel_session_recovered_new_done_midnight_snapshot() {
+        let text = render_to_styled(&state_session_recovered_then_new_done(), &Theme::midnight());
+        insta::assert_snapshot!("tui_parallel_session_recovered_midnight", text);
+    }
+
+    #[test]
+    fn parallel_session_recovered_new_done_daylight_snapshot() {
+        let text = render_to_styled(&state_session_recovered_then_new_done(), &Theme::daylight());
+        insta::assert_snapshot!("tui_parallel_session_recovered_daylight", text);
+    }
+
     #[test]
     fn tool_args_preview_submit_plan_shows_step_count() {
         use super::tool_args_preview;
@@ -5451,6 +5589,33 @@ mod tests {
 
         println!("\n--- phase status lines ---\n{text}--- end phase status lines ---");
         insta::assert_snapshot!("tui_phase_status_lines", text);
+    }
+
+    #[test]
+    fn executing_tools_activity_labels_for_batch_totals() {
+        let theme = Theme::midnight();
+        let mut state = AppState::new();
+        state.spinner_frame = 3;
+
+        state.phase = Phase::ExecutingTools(2);
+        let line2 = activity_line(&render_to_styled(&state, &theme));
+        assert!(
+            line2.contains("并行执行 2 个工具…"),
+            "2≤N≤4 label, got: {line2}"
+        );
+        assert!(line2.contains("esc") || line2.contains("Esc") || line2.contains("中断"));
+
+        state.phase = Phase::ExecutingTools(4);
+        let line4 = activity_line(&render_to_styled(&state, &theme));
+        assert!(line4.contains("并行执行 4 个工具…"), "got: {line4}");
+
+        state.phase = Phase::ExecutingTools(5);
+        let line5 = activity_line(&render_to_styled(&state, &theme));
+        assert!(
+            line5.contains("处理 5 个工具（最多并行 4）…"),
+            "N>4 label, got: {line5}"
+        );
+        assert!(!line5.contains("并行执行 5"));
     }
 
     #[test]

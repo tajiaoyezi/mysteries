@@ -39,6 +39,11 @@ pub enum AgentEvent {
     /// 手动 /compact 完成(成功或失败均发):置回 Ready 并作为排队推进闸门事件。
     CompactDone,
     Notice(String),
+    /// Agent 已成功切换 provider/model；UI 仅在此事件后提交状态栏。
+    ProviderApplied {
+        id: String,
+        model: String,
+    },
     Usage {
         input_tokens: u32,
         output_tokens: u32,
@@ -51,9 +56,22 @@ pub enum AgentEvent {
 pub enum UserInput {
     Prompt(String),
     SetModel(String),
-    SetProvider { id: String, model: String },
+    /// provider/model 切换；history 处理由 `kind` 明确区分交互切换与 session 恢复。
+    SetProvider {
+        id: String,
+        model: String,
+        kind: ProviderSwitchKind,
+    },
     Compact,
     Interrupt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderSwitchKind {
+    /// 用户主动切换 model/provider：旧 thinking 与新模型不兼容，需清空。
+    Interactive,
+    /// session activation：历史属于被恢复的模型，必须逐字段保留 thinking。
+    SessionRestore,
 }
 
 #[derive(Debug)]

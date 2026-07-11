@@ -369,7 +369,7 @@ flowchart TD
 
 **终止条件**:① 模型返回无 `tool_calls` = 最终回复;② `iteration >= max_iterations`(config 读)= 超轮次终止;③ 不可恢复错误(见 §9)= 终止。可恢复错误(工具失败、权限拒绝、单次 provider 重试范围内的失败)不终止,作为结果入 history 继续。
 
-【决策】**1.0 同一轮的多个 tool_calls 顺序执行。** 并行留给 1.5——而 `PermissionLevel` 已把"只读 vs 变更"区分出来,正好是 1.5 并行的切分键(只读并发、变更串行),1.0 的权限设计已经把 1.5 需要的信息编码进去了。
+【决策】**1.0 同一轮的多个 tool_calls 顺序执行。** 并行留给 1.5。注意:**不得**仅按 `PermissionLevel::ReadOnly` 推断可并发——交互 / 计划工具也是 `ReadOnly` 却不能重叠。1.5 改为独立 `ToolConcurrency`(默认 `Exclusive`),仅显式 opt-in 的本地读取进入 work-conserving 有界安全段。
 
 ---
 
@@ -487,9 +487,9 @@ struct MockProvider { script: Vec<ModelResponse>, cursor: AtomicUsize }
 | **1.2 持久化** | `Session` 已 `derive(Serialize)`,是天然落盘单元 | 加 `SessionStore` trait(file/sqlite);1.0 无实现 |
 | **1.3 权限工效** | 权限门 `gate()` 已集中决策点 | 在 `ask` 前插 `PolicyEngine`(allowlist/风险分级/always-allow) |
 | **1.4 TUI 体验** | 渲染隔离在 `tui/` | 纯加法:markdown 渲染、diff 高亮、折叠 |
-| **1.5 并行工具** | `PermissionLevel` 已区分只读/变更 | 按只读切分并发,变更仍串行 |
+| **1.5 并行工具** | 独立 `ToolConcurrency` + 默认 Exclusive;连续 ParallelSafe 段 work-conserving 有界并行(上限 4);Exclusive / Network / Edit / Execute / 交互为屏障 | 不按 ReadOnly 推断;TUI Interrupt 收口仅是 turn 级 helper,不是通用 Agent / child cancellation API |
 | **2.0 MCP** | `ToolRegistry` 持 `Box<dyn Tool>` | MCP 工具作为另一种 `Tool` 实现,代理到 MCP server |
-| **2.0 subagent** | Agent Loop 即可构造的单元(Session+Registry+Provider) | child = 带独立 context 预算 + 受限 registry 的另一个 Loop;依赖 1.1 预算 + 1.5 并发 + 1.3 作用域 |
+| **2.0 subagent** | Agent Loop 即可构造的单元(Session+Registry+Provider) | child = 带独立 context 预算 + 受限 registry 的另一个 Loop;依赖 1.1 预算 + 1.5 有界调度先例 + 1.3 作用域;须另设计可复用 cancellation |
 | **OAuth 登录** | `CredentialChain` 已是可扩展链 | 加 `OAuthCredentialSource`,配合 1.2 存 token |
 
 ---
