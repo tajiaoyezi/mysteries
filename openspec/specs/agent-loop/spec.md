@@ -1,7 +1,7 @@
 # agent-loop Specification
 
 ## Purpose
-agent-loop 是内核的多轮编排中枢:每轮以完整 history 请求 Provider,经权限门与工具系统处理回复中的 tool_calls,并把全部事件(用户输入、模型文本、工具调用与结果、权限拒绝、错误)统一落为 history 中的 `Message`,直到模型产出无 tool_calls 的回复。设计立场是 history 为唯一事实源、错误按可恢复 / 致命分流(工具失败以 is_error 的 `ToolResult` 入 history 续跑,provider 错误致命上抛),`max_iterations` 触顶时先禁用工具追加一次强制收尾而非直接报错;观测(`AgentObserver`)与运行时 provider / model 切换均以 default no-op、不改 `run` 既有契约的方式增量提供。本域只负责编排次序、终止与错误分流:工具的定义与执行属 tool-system,放行决策属 permission-gate,每轮实际发送的 messages 由 context-strategy 产出。
+agent-loop 是内核的多轮编排中枢:每轮以完整 history 请求 Provider,在轮顶固定一次 `PermissionMode` 快照并据此装配 mode-aware schemas、注入 transient Plan 指令及执行纵深拒，再经权限门处理回复中的 tool_calls。`ReadOnly` / `Network` / `Edit` / `Execute` 的定义属 tool-system；Network 在 Plan 仍可见但逐次授权，不可授权 preview fail-closed。设计立场是 history 为唯一事实源、工具失败或权限拒绝以 is_error `ToolResult` 入 history 续跑、provider 错误致命上抛；`max_iterations` 触顶时禁用工具追加一次强制收尾。`AgentObserver` 的 `readonly` 仅等价于 `PermissionLevel::ReadOnly`，Network 不得误报自动运行；运行时 provider / model 切换及 no-op observer 均不改 `run` 既有契约。本域只负责编排次序、终止与错误分流,每轮实际发送的 messages 由 context-strategy 产出。
 ## Requirements
 ### Requirement: 多轮编排循环
 
@@ -52,9 +52,9 @@ agent-loop 是内核的多轮编排中枢:每轮以完整 history 请求 Provide
 
 ### Requirement: 结构化观测事件(observer 变体)
 
-系统 SHALL 提供 `AgentObserver`(`Send + Sync`,方法 `on_status` / `on_tool_call_started` / `on_tool_call_finished` / `on_usage`,**全部 default no-op**)与 `AgentStatus`(`Idle` / `CallingModel` / `ExecutingTool(String)` / `WaitingForPermission`),以及 `Agent::run_observed(history, ctx, sink, observer)`:在循环关键点经 observer 发结构化事件 —— 模型调用前 `StatusChanged(CallingModel)`;工具分发时 `StatusChanged(ExecutingTool(name))` 与 `on_tool_call_started{id, name, args, readonly}`(`readonly` 取自工具 `permission_level`);非 `ReadOnly`(`Edit` / `Execute`)工具询问前 `WaitingForPermission`;工具产出结果后 `on_tool_call_finished{id, outcome}`(执行结果 / 拒绝 / 未知工具均以 `ToolOutcome` 上报);循环自然终止前 `Idle`。每次 `provider.complete` 返回后,若 `ModelResponse.usage` 为 `Some`,MUST 经 `observer.on_usage(&usage)` 上送该轮真实 token 用量;`usage` 为 `None` 的轮 MUST NOT 上送。`on_usage` 取 `&Usage`(`provider-abstraction` 已定义),**default no-op**。
+系统 SHALL 提供 `AgentObserver`(`Send + Sync`,方法 `on_status` / `on_tool_call_started` / `on_tool_call_finished` / `on_usage`,**全部 default no-op**)与 `AgentStatus`(`Idle` / `CallingModel` / `ExecutingTool(String)` / `WaitingForPermission`),以及 `Agent::run_observed(history, ctx, sink, observer)`:在循环关键点经 observer 发结构化事件 —— 模型调用前 `StatusChanged(CallingModel)`;工具分发时 `StatusChanged(ExecutingTool(name))` 与 `on_tool_call_started{id, name, args, readonly}`,其中 `readonly` MUST 精确等价于 `permission_level == ReadOnly`(`Network` 为 false,不得标为“自动运行”);`Network` / `Edit` / `Execute` 工具询问前发 `WaitingForPermission`(命中 mode 自动放行时可无等待事件);工具产出结果后 `on_tool_call_finished{id, outcome}`(执行结果 / UserDenied / NetworkUnauthorizable / 未知工具均以 `ToolOutcome` 上报);循环自然终止前 `Idle`。每次 `provider.complete` 返回后,若 `ModelResponse.usage` 为 `Some`,MUST 经 `observer.on_usage(&usage)` 上送该轮真实 token 用量;`usage` 为 `None` 的轮 MUST NOT 上送。`on_usage` 取 `&Usage`(`provider-abstraction` 已定义),**default no-op**。
 
-既有 `Agent::run` 的契约(history 累积、终止条件、错误分流,见本能力既有 requirement)MUST 保持不变,且 `run` MUST 委托 `run_observed` 并传入 no-op observer —— `run` 的行为与本 change 前**逐字节一致**(`on_usage` default no-op 故不影响 `run`)。`AgentObserver` 方法的 default no-op MUST 使任何不关心观测的调用方零负担。
+既有 `Agent::run` 的契约(history 累积、终止条件、错误分流,见本能力既有 requirement)MUST 保持不变,且 `run` MUST 委托 `run_observed` 并传入 no-op observer。对不含 Network 工具的既有脚本,`run` 行为与本 change 前逐字节一致；Network 工具仅增加权限决策,其执行后 history / outcome 结构不变。`AgentObserver` 方法的 default no-op MUST 使任何不关心观测的调用方零负担。
 
 #### Scenario: 观测一轮工具调用的事件顺序
 
@@ -63,18 +63,23 @@ agent-loop 是内核的多轮编排中枢:每轮以完整 history 请求 Provide
 
 #### Scenario: run 委托后行为与原一致(零回归)
 
-- **WHEN** 调用既有 `Agent::run`(不带 observer)跑任意脚本
+- **WHEN** 调用既有 `Agent::run`(不带 observer)跑一个不含 Network 工具的既有脚本
 - **THEN** 其 history、返回值、终止 / 错误行为与本 change 前完全一致(`run` 委托 `run_observed` + no-op observer,既有 agent-loop 测试保持绿)
+
+#### Scenario: Network observer 不误报 ReadOnly
+
+- **WHEN** 模型发出一个 `PermissionLevel::Network` 的 tool_call
+- **THEN** `on_tool_call_started.readonly == false`;需要询问时 observer 收到 `WaitingForPermission`,不得产生“只读 · 自动运行”语义
 
 #### Scenario: 权限拒绝仍上报工具完成
 
-- **WHEN** 某非 `ReadOnly`(`Edit` / `Execute`)工具被 decider 拒绝
+- **WHEN** 某非 `ReadOnly`(`Network` / `Edit` / `Execute`)工具被 decider 拒绝
 - **THEN** observer 收到 `WaitingForPermission` 后,该工具以 is_error 的 `ToolOutcome`(user denied)触发 `on_tool_call_finished`,且既有「denial 入 history、循环继续」行为不变
 
 #### Scenario: 每轮 model 调用后上送 token 用量
 
 - **WHEN** 以 Mock 脚本(其 `ModelResponse` 带 `usage: Some(Usage{..})`)调用 `run_observed`,传入记录事件的 observer
-- **THEN** 该次 model 调用返回后 observer 收到 `on_usage` 携该轮 `Usage`;若某轮 `ModelResponse.usage` 为 `None` 则该轮不收到 `on_usage`;`run`(no-op observer)行为与本 change 前逐字节一致
+- **THEN** 该次 model 调用返回后 observer 收到 `on_usage` 携该轮 `Usage`;若某轮 `ModelResponse.usage` 为 `None` 则该轮不收到 `on_usage`;`run`(no-op observer)行为不受观测机制影响
 
 ### Requirement: 运行时模型切换
 
@@ -115,45 +120,61 @@ agent-loop 是内核的多轮编排中枢:每轮以完整 history 请求 Provide
 
 ### Requirement: Plan 模式编排(mode-aware schema + 系统指令 + 纵深拒)
 
-`Agent` SHALL 经 **setter** `set_permission_mode(Arc<Mutex<PermissionMode>>)`(仿 `set_strategy`,**不改 `Agent::new` 签名**;字段默认 `Arc::new(Mutex::new(Normal))`,故既有 `Agent::new` 调用与行为逐字节不变)接入一个**运行时可变的 `PermissionMode` 共享源**(克隆自 TUI 侧共享状态;headless 默认 `Normal`)。
+`Agent` SHALL 经 setter `set_permission_mode(Arc<Mutex<PermissionMode>>)`接入一个运行时可变的 `PermissionMode` 共享源(克隆自 TUI 侧共享状态)；字段默认 `Arc::new(Mutex::new(Normal))`,headless 默认 Normal，既有 `Agent::new` 签名与调用行为不变。
 
-每轮循环 **顶部读取一次 mode 快照**(`let mode = *lock` 单次、随即释锁),该轮的 schema 装配、指令注入、**及本轮 tool_call 循环里的每一次纵深拒 MUST 复用这同一个快照**,MUST NOT 在处理每个 tool_call 时重读 mutex:
-- **mode-aware schema**:`ModelRequest.tools` 用 `registry.schemas_for(mode)` 取代 `registry.schemas()` —— `Plan` 期只下发只读 + plan_only 工具(schema-omit,见 tool-system)。
-- **plan 系统指令**:`mode==Plan` 时 MUST 把一条 plan 模式 system 指令注入**该轮的 transient 请求 messages**(即 `strategy.prepare` 产出的 `Vec<Message>`、`ModelRequest` 之前;**MUST NOT** 入持久 `history`,否则逐轮累积并被存进 session 快照);语义三分支:**用户只是问 → 直接答;撞歧义/岔路 → 用 `ask_user` 弹选项让用户定;要执行任务 → 用 `submit_plan` 交带每步 `validation` 的结构化 plan**;只读、不改文件/不执行命令。非 Plan 不注入。
-- **纵深拒(用快照,双向)**:① `mode==Plan` 且某 tool_call 的工具**非 `ReadOnly`**(schema-omit 之外的越界)→ MUST 直接产出 is_error 的 `ToolResult`、**不执行、不弹权限 UI**;② `mode!=Plan` 且某 tool_call 的工具 `plan_only`(如凭记忆硬发 `submit_plan`)→ 亦 MUST is_error 拒(对称防御)。二者 schema-omit 为主控制、纵深拒为辅,循环续跑。
-- **快照封住中途翻转**:同一批 `[submit_plan, edit_file]` 中,`submit_plan` 批准会**在本轮 tool 循环中途**把共享 mode 翻 `Plan→AcceptEdits`;因纵深拒复用**轮顶快照(仍 Plan)**,`edit_file` 兄弟仍被拒;翻转只影响**下一轮**的新快照(届时全工具可用、执行已批准 plan)。
+每轮循环顶部 MUST 读取一次 mode 快照并随即释锁；该轮 schema 装配、指令注入及本轮 tool_call 循环里的每一次纵深拒 MUST 复用同一个快照,不得在处理每个 tool_call 时重读 mutex:
 
-既有 `run` / `run_observed` 在非 Plan(默认 `Normal`)下行为 MUST 与本 change 前**逐字节一致**(`schemas_for(Normal)` 对未注册 plan_only 工具的 registry 与 `schemas()` 保序逐字节相等)。mode 源、注入、纵深拒逻辑 headless 可测(setter 注固定 mode 源 + Mock provider)。
+- **mode-aware schema**:`ModelRequest.tools` 经 `registry.schemas_for(mode)` 取得。Plan 期下发 `ReadOnly + Network + plan_only`,摘掉 `Edit / Execute`。
+- **plan 系统指令**:`mode==Plan` 时 MUST 把一条 plan 模式指令注入该轮 transient 请求 messages(`strategy.prepare` 产出的 Vec、进入 ModelRequest 前),MUST NOT 入持久 history。指令语义为:用户只是问 → 直接答；撞歧义 / 岔路 → `ask_user`；要执行任务 → `submit_plan` 提交结构化 plan，且每一步 MUST 带可独立验收的 `validation`；本地研究只读,web 研究工具可用但每次会请求 Network 授权,不得编辑文件或执行命令。非 Plan 不注入。
+- **纵深拒(双向)**:① `mode==Plan` 且工具为 `Edit` / `Execute` → 直接产出 is_error ToolResult,不执行、不弹权限 UI；`Network` MUST NOT 命中该拒绝,而是进入 gate / decider。② `mode!=Plan` 且工具 `plan_only` → is_error 拒,循环继续。
+- **快照封住中途翻转**:同一批 `[submit_plan, edit_file]` 中,submit_plan 批准即使把共享 mode 翻为 `AcceptEdits`,edit_file 仍按轮顶 Plan 快照被拒；翻转只影响下一轮。
 
-#### Scenario: Plan 模式只下发只读 + plan_only
+对不含 Network tool_call 的非 Plan 既有脚本,run / run_observed 行为 MUST 与本 change 前一致。Network 在 Normal / AcceptEdits 下新增询问、在 Yolo 下自动放行,属于刻意的安全行为变化。mode 源、schema、指令、纵深拒与 Network gate 均须 headless Mock 可测。
 
-- **WHEN** mode 源置 `Plan`,registry 含只读 / 变更 / plan_only 工具,跑一轮(Mock provider)
-- **THEN** 该轮 `ModelRequest.tools` 仅含只读 + plan_only 项(变更类被摘)
+#### Scenario: Plan 模式只下发 ReadOnly + Network + plan_only
 
-#### Scenario: Plan 模式注入三分支系统指令
+- **WHEN** mode 源置 `Plan`,registry 含 ReadOnly / Network / Edit / Execute / plan_only 工具,跑一轮(Mock provider)
+- **THEN** 该轮 `ModelRequest.tools` 仅含 ReadOnly / Network / plan_only 项(Edit/Execute 被摘),顺序保持
+
+#### Scenario: Plan 指令保留 validation 并加入联网授权语义
 
 - **WHEN** mode==`Plan` 跑一轮
-- **THEN** 该轮 messages 含一条 plan 模式 system 指令(问答 / ask_user / submit_plan 三分支);mode==`Normal` 时该指令不出现
+- **THEN** 从 Mock provider 实收的首条 System message 直接断言其含问答 / ask_user / submit_plan 三分支、每步可验收 `validation`、web research 每次需 Network 授权及禁止 Edit / Execute；expected 不得引用 `PLAN_MODE_INSTRUCTION` 常量自身；该指令不入 history，Normal 不注入
+
+#### Scenario: Plan 期 Network Allow 后执行
+
+- **WHEN** mode==`Plan`,模型发出一个提供 `authorizable=true` 专用 preview 的 Network tool_call,decider 返回 Allow
+- **THEN** 该调用不被纵深拒,工具执行并把正常 ToolResult 入 history,循环续跑
+
+#### Scenario: Plan 期 Network Deny 零网络并续跑
+
+- **WHEN** mode==`Plan`,模型发出 Network tool_call,decider 返回 Deny
+- **THEN** 工具不执行、WebFetcher 零调用、is_error ToolResult 入 history,循环续跑
+
+#### Scenario: 未知 Network 工具在 Agent Loop 中 fail-closed
+
+- **WHEN** mode 为 Normal / Yolo / Plan 任一,模型调用未 override preview 的 Network tool,decider 返回 Allow
+- **THEN** gate 最终 `Deny(NetworkUnauthorizable(reason))`、工具不 execute、带 reason 的 is_error ToolResult 入 history供模型修正,循环进入下一轮；不得写成 user denied
 
 #### Scenario: Plan 期越界变更工具被纵深拒
 
 - **WHEN** mode==`Plan`,模型发出一个 `Edit` / `Execute` 工具的 tool_call
-- **THEN** 产出 is_error 的 `ToolResult`(plan 拒变更)入 history、工具不执行、不发权限 UI,循环续跑
+- **THEN** 产出 is_error ToolResult(plan 拒变更)入 history、工具不执行、不发权限 UI,循环续跑
 
 #### Scenario: 同批 submit_plan + 变更工具,快照封住中途翻转
 
 - **WHEN** mode==`Plan`,模型在**一条回复**里发 `[submit_plan, edit_file]` 两个 tool_call;submit_plan 批准在本轮 tool 循环中途把共享 mode 翻 `AcceptEdits`
-- **THEN** `edit_file` 兄弟仍按**轮顶快照(Plan)**被纵深拒(不执行、未静默放行);翻转仅令**下一轮**新快照为 `AcceptEdits`
+- **THEN** edit_file 仍按轮顶 Plan 快照被纵深拒；翻转仅令下一轮新快照为 AcceptEdits
 
 #### Scenario: 非 Plan 模式硬发 plan_only 工具被拒
 
 - **WHEN** mode!=`Plan`(如 `Normal`),模型硬发一个 `plan_only` 工具(如 `submit_plan`)的 tool_call
-- **THEN** 产出 is_error 的 `ToolResult`(对称防御)、工具不执行
+- **THEN** 产出 is_error ToolResult、工具不执行
 
-#### Scenario: 非 Plan 零回归
+#### Scenario: 非 Plan 的旧三类工具零回归
 
-- **WHEN** mode==`Normal`(默认)跑任意既有脚本
-- **THEN** history / 终止 / 错误 / 事件与本 change 前一致(`schemas_for(Normal)` 等价既有;无 plan_only 工具时逐字节一致)
+- **WHEN** mode==Normal 跑一个不含 Network tool_call 的既有脚本
+- **THEN** history / 终止 / 错误 / 事件与本 change 前一致；schema 仍含 ReadOnly / Edit / Execute 且顺序不变
 
 ### Requirement: 每轮注入思考深度并回传思考块
 
