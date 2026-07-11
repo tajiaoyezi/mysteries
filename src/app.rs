@@ -205,11 +205,11 @@ mod tests {
     };
     use crate::credential::{CredentialChain, FileCredentialSource};
     use crate::error::ProviderError;
-    use crate::permission::{PermissionDecider, PermissionDecision};
+    use crate::permission::{PermissionCheck, PermissionDecider, PermissionDecision};
     use crate::provider::mock::MockProvider;
     use crate::provider::{DeltaSink, ModelRequest};
     use crate::provider::{FinishReason, ModelResponse, ToolCall};
-    use crate::tool::{Tool, ToolContext};
+    use crate::tool::{PermissionLevel, ToolContext};
     use async_trait::async_trait;
     use serde_json::json;
     use std::fs;
@@ -466,7 +466,7 @@ kind = "mock"
 
     #[async_trait]
     impl PermissionDecider for AllowAll {
-        async fn decide(&self, _call: &ToolCall, _tool: &dyn Tool) -> PermissionDecision {
+        async fn decide(&self, _check: PermissionCheck<'_>) -> PermissionDecision {
             PermissionDecision::Allow
         }
     }
@@ -502,6 +502,37 @@ kind = "mock"
                 "write_file",
             ]
         );
+    }
+
+    #[test]
+    fn default_registry_keeps_non_web_levels_and_marks_web_tools_network() {
+        let registry = default_registry();
+
+        for name in ["list_dir", "read_file", "glob", "grep"] {
+            assert_eq!(
+                registry.get(name).unwrap().permission_level(),
+                PermissionLevel::ReadOnly,
+                "{name}"
+            );
+        }
+        for name in ["write_file", "edit_file"] {
+            assert_eq!(
+                registry.get(name).unwrap().permission_level(),
+                PermissionLevel::Edit,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            registry.get("run_shell").unwrap().permission_level(),
+            PermissionLevel::Execute
+        );
+        for name in ["web_fetch", "web_search"] {
+            assert_eq!(
+                registry.get(name).unwrap().permission_level(),
+                PermissionLevel::Network,
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

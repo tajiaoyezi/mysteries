@@ -20,7 +20,7 @@
 
 ## 理念:读只读,写必询
 
-只读工具自动跑;**每一次文件改动与命令执行,都先把 diff 摊给你,等你按下 `y` 才动手**。权限分三级、模式可切换,危险操作永远在你掌控内。
+本地只读工具自动跑;**每一次网络调用、文件改动与命令执行,都先展示完整授权信息,等你明确允许才动手**。权限分四级、模式可切换,危险操作永远在你掌控内。
 
 ---
 
@@ -41,7 +41,7 @@
 
 - **Agent Loop 自研**:模型决策 → tool_calls 逐个过权限门 → 执行回传 → 续推;`max_iterations` 上限、Esc 即时中断、全事件落 history。
 - **内置工具**:`list_dir` / `read_file` / `glob` / `grep` / `write_file` / `edit_file`(唯一匹配替换)/ `run_shell` + 联网 `web_fetch` / `web_search`(SSRF 护栏)+ Plan 三件 `submit_plan` / `update_plan` / `ask_user`。
-- **三级权限 × 四种模式**:工具按 `ReadOnly/Edit/Execute` 分级;`Normal / AcceptEdits / Yolo / Plan` 经 Shift+Tab 循环;写/执行类内联确认;命令白名单 + always-allow。
+- **四级权限 × 四种模式**:工具按 `ReadOnly/Network/Edit/Execute` 分级;`Normal / AcceptEdits / Yolo / Plan` 经 Shift+Tab 循环。有效 Network preview 在 Normal/AcceptEdits/Plan 下逐次确认,Yolo 仅自动放行可授权 preview;未知或畸形 Network 调用始终拒绝。命令白名单 + always-allow 仅适用于 Execute。
 - **Plan 模式**:先只读调研 → 交出带每步验收的结构化计划 → 你批准后逐步执行,常驻进度面板实时上报。
 - **思考模式**:`Depth`(off/low/medium/high/xhigh)统一抽象,映射到 Anthropic adaptive+effort 与 OpenAI `reasoning_effort`;`/think` 切换;思考过程 TUI 折叠展示。
 - **多 Provider**:OpenAI 兼容(含 WPS AI / DeepSeek 等)/ Anthropic / Mock,统一 `Provider` trait + registry,`/models` 运行时热切换,流式解析自实现,支持 socks5 代理。
@@ -124,7 +124,7 @@ mysteries --headless "解释一下 src/agent 的结构"   # 无头单轮模式
 | Agent Loop | `src/agent/` | 核心决策循环:模型调用 → 工具执行 → 结果回传 → 续推;Observer 事件外发;上下文压缩 |
 | Provider | `src/provider/` | `Provider` trait + OpenAI/Anthropic/Mock 接入、流式解析、registry 热切换、模型能力表 |
 | Tool 系统 | `src/tool/` | `Tool` trait + `ToolRegistry`,内置工具按 `PermissionLevel` 分级(fs / shell / web / plan / ask) |
-| Permission | `src/permission/` | 权限门:只读放行,写/执行经 `PermissionDecider` 确认;四种模式 + 命令白名单 |
+| Permission | `src/permission/` | 权限门:本地只读放行,Network/写/执行经 `PermissionDecider` 确认;Network preview fail-closed;四种模式 + Execute 命令白名单 |
 | Config | `src/config/` | 用户级 + 项目级合并(项目优先) |
 | Credential | `src/credential/` | API Key 凭据链(env → 文件),`secrecy` 包裹 |
 | Session | `src/session/` | jsonl 会话持久化 + resume |
@@ -133,6 +133,8 @@ mysteries --headless "解释一下 src/agent 的结构"   # 无头单轮模式
 | 装配 | `src/app.rs` | provider 选择与 agent 组装 |
 
 **TUI 运行时**:agent task 跑 `Agent::run`,UI task 渲染 + 事件;经 `UserInput` / `AgentEvent` 两条 channel 通信,中断走独立信号。事件循环对 crossterm 事件**批量 drain**(整批单次渲染),是粘贴防误提交与折叠的地基。
+
+`web_fetch` / `web_search` 在 TUI 和 `--headless` 中都会展示完整参数、canonical initial target 与本次调用的 redirect/SSRF scope。授权只覆盖当前 ToolCall;SSRF 对初始 URL 和每跳 redirect 始终强制,Yolo 也不能绕过。Provider 自身访问模型 API 的 transport 不属于 Tool permission gate。
 
 ## 🧪 工程方法与质量
 

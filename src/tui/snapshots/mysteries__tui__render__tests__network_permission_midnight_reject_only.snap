@@ -1,0 +1,28 @@
+---
+source: src/tui/render.rs
+expression: "render_to_styled_with_size(&network_permission_state(false),\n&Theme::midnight(), 80, 24)"
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.1.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔/status〕‹/›‹text.primary› 当前会话快照‹/›
+‹text.primary›                   ‹/›‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loop)‹/›
+‹warning.fg bg=warning.bg›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹warning.fg bg=warning.bg›│‹/›‹warning.fg bg=warning.bg +bold›▲ 需要网络授权‹/›‹text.primary bg=warning.bg›                                                                ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›tool: web_search                                                              ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›reject-only                                                                   ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›args: {"query":"Rust \u{202E}安全 & 网络权限"}                                ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›reason: invalid URL                                                           ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›第 1-3 / 3 行 · ↑↓/PgUp/PgDn 查看完整参数                                     ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›[n · 拒绝]                                                                    ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›此请求不可允许 · Esc = 拒绝                                                   ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›                                                                              ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›                                                                              ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹warning.fg›▲ 等待授权…‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换 · think low‹/›

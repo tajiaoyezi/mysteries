@@ -1,0 +1,28 @@
+---
+source: src/tui/render.rs
+expression: "render_to_styled_with_size(&last, &Theme::midnight(), 40, 24)"
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.1.0‹/›
+
+‹border.strong›────────────────────────────────────────‹/›
+‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›
+‹accent.primary›〔/status〕‹/›‹text.primary› 当前会话快照‹/›
+‹accent.primary›〔错误〕‹/›‹text.primary› 演示:鉴权失败(致命错误,终止 Loo‹/›
+‹warning.fg bg=warning.bg›┌──────────────────────────────────────┐‹/›
+‹warning.fg bg=warning.bg›│‹/›‹warning.fg bg=warning.bg +bold›▲ 需要网络授权‹/›‹text.primary bg=warning.bg›                        ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›tool: web_fetch                       ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›AST                                   ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›scope: max_redirects=3, may_cross_or  ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›igin=true, ssrf_each_hop=true         ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›授权:仅本次调用；最多 3 次、可能跨站  ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›的公网重定向；每跳仍过 SSRF           ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›第 9-13 / 13 行 · ↑↓/PgUp/PgDn 查看完 ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›[y · 允许本次]   [n · 拒绝]           ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›提示:Enter = 允许 · Esc = 拒绝        ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›└──────────────────────────────────────┘‹/›
+‹warning.fg›▲ 等待授权…‹/›
+‹border.subtle›┌──────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.primary›             ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs ·‹/›
+‹text.muted›▸ normal · shift+tab 切换 · think low‹/›

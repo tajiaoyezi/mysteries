@@ -7,14 +7,14 @@ use crate::credential::{
     CredentialChain, CredentialError, CredentialOrigin, EnvCredentialSource, FileCredentialSource,
 };
 use crate::error::AgentError;
-use crate::permission::{PermissionDecider, PermissionDecision};
-use crate::provider::{DeltaSink, ToolCall};
-use crate::tool::Tool;
+use crate::permission::preview::format_network_permission_preview;
+use crate::permission::{PermissionCheck, PermissionDecider, PermissionDecision};
+use crate::provider::DeltaSink;
 use crate::tool::ToolContext;
 use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use secrecy::SecretString;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::task;
@@ -502,9 +502,63 @@ pub fn parse_decision(input: &str) -> PermissionDecision {
     }
 }
 
+pub fn format_network_prompt(preview: &crate::tool::NetworkPermissionPreview) -> String {
+    let details = format_network_permission_preview(preview);
+    if preview.authorizable {
+        format!("network tool requires confirmation:\n{details}\nallow? [y/n] ")
+    } else {
+        format!("network tool cannot be authorized:\n{details}\n")
+    }
+}
+
+fn decide_network_with_io<W: Write, R: BufRead>(
+    preview: &crate::tool::NetworkPermissionPreview,
+    writer: &mut W,
+    reader: &mut R,
+) -> PermissionDecision {
+    let prompt = format_network_prompt(preview);
+    if writer
+        .write_all(prompt.as_bytes())
+        .and_then(|_| writer.flush())
+        .is_err()
+    {
+        return PermissionDecision::Deny;
+    }
+    if !preview.authorizable {
+        return PermissionDecision::Deny;
+    }
+
+    let mut input = String::new();
+    match reader.read_line(&mut input) {
+        Ok(0) | Err(_) => PermissionDecision::Deny,
+        Ok(_) => parse_decision(&input),
+    }
+}
+
 #[async_trait]
 impl PermissionDecider for StdinDecider {
-    async fn decide(&self, call: &ToolCall, tool: &dyn Tool) -> PermissionDecision {
+    async fn decide(&self, check: PermissionCheck<'_>) -> PermissionDecision {
+        let call = check.call;
+        let tool = check.tool;
+        if tool.permission_level() == crate::tool::PermissionLevel::Network {
+            let preview = check.network_preview.cloned().unwrap_or_else(|| {
+                crate::tool::NetworkPermissionPreview {
+                    authorizable: false,
+                    full_args: call.arguments.clone(),
+                    canonical_initial_target: None,
+                    scope: None,
+                    denial_reason: Some("network preview is missing".to_string()),
+                }
+            });
+            return task::spawn_blocking(move || {
+                let mut stderr = io::stderr();
+                let stdin = io::stdin();
+                let mut reader = io::BufReader::new(stdin.lock());
+                decide_network_with_io(&preview, &mut stderr, &mut reader)
+            })
+            .await
+            .unwrap_or(PermissionDecision::Deny);
+        }
         eprintln!("tool requires confirmation: {}", tool.name());
         eprintln!("arguments: {}", call.arguments);
         eprint!("allow? [y/n] ");
@@ -614,18 +668,22 @@ pub fn wants_version(args: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_secret_key, apply_select_key, help_text, initial_history, parse_decision,
-        preset_patch, run_auth_login, run_auth_logout, version_text, wants_help, wants_version,
-        AuthError, AuthPaths, AuthPrompter, ProviderPreset, SecretKeyAction, SelectAction,
+        apply_secret_key, apply_select_key, decide_network_with_io, format_network_prompt,
+        help_text, initial_history, parse_decision, preset_patch, run_auth_login, run_auth_logout,
+        version_text, wants_help, wants_version, AuthError, AuthPaths, AuthPrompter,
+        ProviderPreset, SecretKeyAction, SelectAction,
     };
     use crate::agent::message::Message;
     use crate::agent::DEFAULT_SYSTEM_PROMPT;
     use crate::config::{parse, write_config, ConfigError, ProviderKind};
     use crate::credential::{CredentialSource, FileCredentialSource};
     use crate::permission::PermissionDecision;
+    use crate::tool::{NetworkPermissionPreview, NetworkPermissionScope};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use secrecy::{ExposeSecret, SecretString};
     use std::fs;
+    use std::io::Cursor;
+    use std::io::{self, BufRead, Read, Write};
 
     struct ScriptedAuthPrompter {
         lines: Vec<Option<String>>,
@@ -697,6 +755,256 @@ mod tests {
         for input in ["n", "", "   ", "maybe", "no"] {
             assert_eq!(parse_decision(input), PermissionDecision::Deny);
         }
+    }
+
+    fn network_preview(authorizable: bool) -> NetworkPermissionPreview {
+        NetworkPermissionPreview {
+            authorizable,
+            full_args: serde_json::json!({ "url": "https://example.com/\u{202e}" }),
+            canonical_initial_target: authorizable.then(|| "https://example.com/".to_string()),
+            scope: authorizable.then_some(NetworkPermissionScope {
+                max_redirects: 3,
+                may_cross_origin: true,
+                ssrf_each_hop: true,
+            }),
+            denial_reason: (!authorizable).then(|| "invalid URL".to_string()),
+        }
+    }
+
+    #[test]
+    fn network_prompt_formats_preview_and_reads_only_after_successful_output() {
+        let preview = network_preview(true);
+        let prompt = format_network_prompt(&preview);
+        assert!(prompt.contains("max_redirects=3"));
+        assert!(prompt.contains(r"\u{202E}"));
+
+        let mut writer = Vec::new();
+        let mut reader = Cursor::new(b"yes\n".to_vec());
+        assert_eq!(
+            decide_network_with_io(&preview, &mut writer, &mut reader),
+            PermissionDecision::Allow
+        );
+        assert_eq!(String::from_utf8(writer).unwrap(), prompt);
+    }
+
+    #[test]
+    fn reject_only_network_prompt_does_not_read_and_denies() {
+        let preview = network_preview(false);
+        let mut writer = Vec::new();
+        let mut reader = Cursor::new(b"yes\n".to_vec());
+
+        assert_eq!(
+            decide_network_with_io(&preview, &mut writer, &mut reader),
+            PermissionDecision::Deny
+        );
+        assert_eq!(reader.position(), 0);
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("invalid URL"));
+        assert!(!output.contains("allow? [y/n]"));
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        reads: usize,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(buf)
+        }
+    }
+
+    impl BufRead for CountingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.reads += 1;
+            self.inner.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.inner.consume(amount);
+        }
+    }
+
+    #[test]
+    fn network_prompt_write_failure_denies_without_reading() {
+        let preview = network_preview(true);
+        let mut writer = FailingWriter;
+        let mut reader = CountingReader {
+            inner: Cursor::new(b"yes\n".to_vec()),
+            reads: 0,
+        };
+
+        assert_eq!(
+            decide_network_with_io(&preview, &mut writer, &mut reader),
+            PermissionDecision::Deny
+        );
+        assert_eq!(reader.reads, 0);
+    }
+
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        chunk: usize,
+        flushed: bool,
+    }
+
+    impl Write for ShortWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let count = buf.len().min(self.chunk);
+            self.bytes.extend_from_slice(&buf[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed = true;
+            Ok(())
+        }
+    }
+
+    enum PartialFailure {
+        Error,
+        WriteZero,
+    }
+
+    struct PartialFailWriter {
+        remaining: usize,
+        failure: PartialFailure,
+    }
+
+    impl Write for PartialFailWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return match self.failure {
+                    PartialFailure::Error => Err(io::Error::other("partial write failed")),
+                    PartialFailure::WriteZero => Ok(0),
+                };
+            }
+            let count = buf.len().min(self.remaining);
+            self.remaining -= count;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushFailWriter(Vec<u8>);
+
+    impl Write for FlushFailWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
+        }
+    }
+
+    struct ReadFailReader {
+        reads: usize,
+    }
+
+    impl Read for ReadFailReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            Err(io::Error::other("read failed"))
+        }
+    }
+
+    impl BufRead for ReadFailReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.reads += 1;
+            Err(io::Error::other("read failed"))
+        }
+
+        fn consume(&mut self, _amt: usize) {}
+    }
+
+    #[test]
+    fn network_prompt_short_writes_preserve_long_args_before_reading() {
+        let mut preview = network_preview(true);
+        let long_value = "参数".repeat(4096);
+        preview.full_args = serde_json::json!({ "query": long_value });
+        let expected = format_network_prompt(&preview);
+        let mut writer = ShortWriter {
+            bytes: Vec::new(),
+            chunk: 7,
+            flushed: false,
+        };
+        let mut reader = Cursor::new(b"y\n".to_vec());
+
+        assert_eq!(
+            decide_network_with_io(&preview, &mut writer, &mut reader),
+            PermissionDecision::Allow
+        );
+        assert!(writer.flushed);
+        assert_eq!(String::from_utf8(writer.bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn network_prompt_partial_write_zero_and_flush_fail_without_reading() {
+        let preview = network_preview(true);
+        for failure in [PartialFailure::Error, PartialFailure::WriteZero] {
+            let mut writer = PartialFailWriter {
+                remaining: 5,
+                failure,
+            };
+            let mut reader = CountingReader {
+                inner: Cursor::new(b"y\n".to_vec()),
+                reads: 0,
+            };
+            assert_eq!(
+                decide_network_with_io(&preview, &mut writer, &mut reader),
+                PermissionDecision::Deny
+            );
+            assert_eq!(reader.reads, 0);
+        }
+
+        let mut writer = FlushFailWriter(Vec::new());
+        let mut reader = CountingReader {
+            inner: Cursor::new(b"y\n".to_vec()),
+            reads: 0,
+        };
+        assert_eq!(
+            decide_network_with_io(&preview, &mut writer, &mut reader),
+            PermissionDecision::Deny
+        );
+        assert_eq!(reader.reads, 0);
+    }
+
+    #[test]
+    fn network_prompt_n_eof_and_read_failure_deny() {
+        let preview = network_preview(true);
+        for input in [b"n\n".to_vec(), Vec::new()] {
+            let mut writer = Vec::new();
+            let mut reader = Cursor::new(input);
+            assert_eq!(
+                decide_network_with_io(&preview, &mut writer, &mut reader),
+                PermissionDecision::Deny
+            );
+        }
+
+        let mut writer = Vec::new();
+        let mut reader = ReadFailReader { reads: 0 };
+        assert_eq!(
+            decide_network_with_io(&preview, &mut writer, &mut reader),
+            PermissionDecision::Deny
+        );
+        assert!(reader.reads > 0);
     }
 
     #[test]

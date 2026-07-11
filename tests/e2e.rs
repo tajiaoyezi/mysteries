@@ -7,14 +7,16 @@ use mysteries::config::{
     DEFAULT_KEEP_RECENT_TURNS, DEFAULT_THINKING,
 };
 use mysteries::error::AgentError;
-use mysteries::permission::{PermissionDecider, PermissionDecision, PermissionMode};
+use mysteries::permission::{
+    PermissionCheck, PermissionDecider, PermissionDecision, PermissionMode,
+};
 use mysteries::provider::mock::MockProvider;
 use mysteries::provider::{
     DeltaSink, Depth, FinishReason, ModelResponse, ThinkingBlock, ThinkingConfig, ToolCall,
 };
 use mysteries::tool::ask::{Answer, MockPrompter};
 use mysteries::tool::plan::{Plan, PlanApprover, PlanDecision};
-use mysteries::tool::{Tool, ToolContext};
+use mysteries::tool::ToolContext;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
@@ -53,7 +55,7 @@ struct AllowAll;
 
 #[async_trait]
 impl PermissionDecider for AllowAll {
-    async fn decide(&self, _call: &ToolCall, _tool: &dyn Tool) -> PermissionDecision {
+    async fn decide(&self, _check: PermissionCheck<'_>) -> PermissionDecision {
         PermissionDecision::Allow
     }
 }
@@ -62,8 +64,8 @@ struct DenyWriteFile;
 
 #[async_trait]
 impl PermissionDecider for DenyWriteFile {
-    async fn decide(&self, call: &ToolCall, _tool: &dyn Tool) -> PermissionDecision {
-        if call.name == "write_file" {
+    async fn decide(&self, check: PermissionCheck<'_>) -> PermissionDecision {
+        if check.call.name == "write_file" {
             PermissionDecision::Deny
         } else {
             PermissionDecision::Allow

@@ -1,15 +1,15 @@
 use crate::agent::{AgentObserver, AgentStatus};
 use crate::config::append_allowed_command;
 use crate::permission::{
-    auto_allows, PermissionDecider, PermissionDecision, PermissionMode, PermissionReply,
-    PolicyEngine,
+    auto_allows, PermissionCheck, PermissionDecider, PermissionDecision, PermissionMode,
+    PermissionReply, PolicyEngine,
 };
-use crate::provider::{DeltaSink, ToolCall};
+use crate::provider::DeltaSink;
 use crate::tool::ask::{Answer, Question, UserPrompter};
 use crate::tool::plan::{
     Plan, PlanApprover, PlanDecision, PlanProgressReporter, PlanProgressUpdate,
 };
-use crate::tool::{Tool, ToolOutcome};
+use crate::tool::{NetworkPermissionPreview, PermissionLevel, ToolOutcome};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -60,6 +60,8 @@ pub enum UserInput {
 pub struct PermissionRequest {
     pub tool_name: String,
     pub args: Value,
+    pub permission_level: PermissionLevel,
+    pub network_preview: Option<NetworkPermissionPreview>,
     pub allow_always_key: Option<String>,
     pub responder: oneshot::Sender<PermissionReply>,
 }
@@ -168,7 +170,40 @@ impl ChannelDecider {
 
 #[async_trait]
 impl PermissionDecider for ChannelDecider {
-    async fn decide(&self, call: &ToolCall, tool: &dyn Tool) -> PermissionDecision {
+    async fn decide(&self, check: PermissionCheck<'_>) -> PermissionDecision {
+        let call = check.call;
+        let tool = check.tool;
+        let permission_level = tool.permission_level();
+        let network_preview = check.network_preview.cloned();
+        let reject_only_network = permission_level == PermissionLevel::Network
+            && !network_preview_is_authorizable(network_preview.as_ref());
+
+        if reject_only_network {
+            let (tx, rx) = oneshot::channel();
+            let request = PermissionRequest {
+                tool_name: tool.name().to_string(),
+                args: call.arguments.clone(),
+                permission_level,
+                network_preview,
+                allow_always_key: None,
+                responder: tx,
+            };
+
+            if self
+                .tx
+                .send(AgentEvent::PermissionRequired(request))
+                .is_err()
+            {
+                return PermissionDecision::Deny;
+            }
+
+            return match rx.await.unwrap_or(PermissionReply::Deny) {
+                PermissionReply::Deny
+                | PermissionReply::AllowOnce
+                | PermissionReply::AllowAlways => PermissionDecision::Deny,
+            };
+        }
+
         {
             let policy = self.policy.lock().expect("policy mutex poisoned");
             if policy.is_allowed(call, tool) {
@@ -178,7 +213,7 @@ impl PermissionDecider for ChannelDecider {
 
         let allow_always_key = PolicyEngine::permission_key(call, tool);
         let mode = *self.mode.lock().expect("permission mode mutex poisoned");
-        if auto_allows(mode, tool.permission_level()) {
+        if auto_allows(mode, permission_level.clone()) {
             return PermissionDecision::Allow;
         }
 
@@ -186,6 +221,8 @@ impl PermissionDecider for ChannelDecider {
         let request = PermissionRequest {
             tool_name: tool.name().to_string(),
             args: call.arguments.clone(),
+            permission_level,
+            network_preview,
             allow_always_key: allow_always_key.clone(),
             responder: tx,
         };
@@ -217,6 +254,15 @@ impl PermissionDecider for ChannelDecider {
             PermissionReply::Deny => PermissionDecision::Deny,
         }
     }
+}
+
+fn network_preview_is_authorizable(preview: Option<&NetworkPermissionPreview>) -> bool {
+    preview.is_some_and(|preview| {
+        preview.authorizable
+            && preview.canonical_initial_target.is_some()
+            && preview.scope.is_some()
+            && preview.denial_reason.is_none()
+    })
 }
 
 pub struct ChannelPlanApprover {
@@ -322,20 +368,44 @@ mod tests {
     use crate::agent::{AgentObserver, AgentStatus};
     use crate::config::read_raw_config;
     use crate::permission::{
-        PermissionDecider, PermissionDecision, PermissionMode, PermissionReply, PolicyEngine,
+        PermissionCheck, PermissionDecider, PermissionDecision, PermissionMode, PermissionReply,
+        PolicyEngine,
     };
     use crate::provider::{DeltaSink, ToolCall};
     use crate::tool::ask::{Question, UserPrompter};
     use crate::tool::plan::{
         Plan, PlanApprover, PlanDecision, PlanProgressReporter, PlanProgressUpdate, StepStatus,
     };
-    use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
+    use crate::tool::{
+        NetworkPermissionPreview, NetworkPermissionScope, PermissionLevel, Tool, ToolContext,
+        ToolOutcome,
+    };
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout, Duration};
+
+    fn permission_check<'a>(call: &'a ToolCall, tool: &'a dyn Tool) -> PermissionCheck<'a> {
+        PermissionCheck {
+            call,
+            tool,
+            network_preview: None,
+        }
+    }
+
+    fn network_permission_check<'a>(
+        call: &'a ToolCall,
+        tool: &'a dyn Tool,
+        preview: &'a NetworkPermissionPreview,
+    ) -> PermissionCheck<'a> {
+        PermissionCheck {
+            call,
+            tool,
+            network_preview: Some(preview),
+        }
+    }
 
     #[test]
     fn channel_sink_sends_text_delta_on_text() {
@@ -471,6 +541,68 @@ mod tests {
         }
     }
 
+    struct NetworkTool;
+
+    #[async_trait]
+    impl Tool for NetworkTool {
+        fn name(&self) -> &str {
+            "network_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Requires network permission"
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Network
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
+            ToolOutcome {
+                content: "ok".to_string(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            }
+        }
+    }
+
+    fn authorizable_network_preview() -> NetworkPermissionPreview {
+        NetworkPermissionPreview {
+            authorizable: true,
+            full_args: json!({ "url": "https://example.com" }),
+            canonical_initial_target: Some("https://example.com/".to_string()),
+            scope: Some(NetworkPermissionScope {
+                max_redirects: 3,
+                may_cross_origin: true,
+                ssrf_each_hop: true,
+            }),
+            denial_reason: None,
+        }
+    }
+
+    fn reject_only_network_preview() -> NetworkPermissionPreview {
+        NetworkPermissionPreview {
+            authorizable: false,
+            full_args: json!({ "url": "bad" }),
+            canonical_initial_target: None,
+            scope: None,
+            denial_reason: Some("invalid network target".to_string()),
+        }
+    }
+
+    fn network_call() -> ToolCall {
+        ToolCall {
+            id: "call-network".to_string(),
+            name: "network_tool".to_string(),
+            arguments: json!({ "url": "https://example.com" }),
+        }
+    }
+
     fn execute_call() -> ToolCall {
         ToolCall {
             id: "call-exec".to_string(),
@@ -536,10 +668,12 @@ mod tests {
     #[tokio::test]
     async fn channel_decider_yolo_auto_allows_execute_without_channel() {
         let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::Yolo);
+        let call = execute_call();
+        let tool = ExecuteTool;
 
         let decision = timeout(
             Duration::from_millis(50),
-            decider.decide(&execute_call(), &ExecuteTool),
+            decider.decide(permission_check(&call, &tool)),
         )
         .await
         .expect("Yolo + Execute must return Allow immediately without channel round-trip");
@@ -551,10 +685,12 @@ mod tests {
     #[tokio::test]
     async fn channel_decider_accept_edits_auto_allows_edit_without_channel() {
         let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::AcceptEdits);
+        let call = edit_call();
+        let tool = EditTool;
 
         let decision = timeout(
             Duration::from_millis(50),
-            decider.decide(&edit_call(), &EditTool),
+            decider.decide(permission_check(&call, &tool)),
         )
         .await
         .expect("AcceptEdits + Edit must return Allow immediately without channel round-trip");
@@ -568,7 +704,7 @@ mod tests {
         let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::AcceptEdits);
         let call = execute_call();
         let tool = ExecuteTool;
-        let decision = decider.decide(&call, &tool);
+        let decision = decider.decide(permission_check(&call, &tool));
         tokio::pin!(decision);
 
         let request = tokio::select! {
@@ -590,12 +726,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_decider_sends_the_gate_network_preview_in_non_yolo_modes() {
+        for mode in [
+            PermissionMode::Normal,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+        ] {
+            let (decider, mut rx, _mode) = decider_with_mode(mode);
+            let call = network_call();
+            let tool = NetworkTool;
+            let preview = authorizable_network_preview();
+            let decision = decider.decide(network_permission_check(&call, &tool, &preview));
+            tokio::pin!(decision);
+
+            let event = tokio::select! {
+                event = rx.recv() => event.expect("network permission request"),
+                decision = &mut decision => panic!("decide returned before permission request: {decision:?}"),
+                _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for permission request"),
+            };
+            match event {
+                AgentEvent::PermissionRequired(request) => {
+                    assert_eq!(
+                        request.permission_level,
+                        PermissionLevel::Network,
+                        "{mode:?}"
+                    );
+                    assert_eq!(request.network_preview, Some(preview.clone()));
+                    assert_eq!(request.allow_always_key, None);
+                    request.responder.send(PermissionReply::AllowOnce).unwrap();
+                }
+                other => panic!("expected PermissionRequired, got {other:?}"),
+            }
+            assert_eq!(decision.await, PermissionDecision::Allow);
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_decider_network_allow_once_reprompts_same_target() {
+        let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::Normal);
+        let call = network_call();
+        let tool = NetworkTool;
+        let preview = authorizable_network_preview();
+
+        for attempt in 1..=2 {
+            let decision = decider.decide(network_permission_check(&call, &tool, &preview));
+            tokio::pin!(decision);
+            let event = tokio::select! {
+                event = rx.recv() => event.expect("network permission request"),
+                decision = &mut decision => panic!("attempt {attempt} returned before permission request: {decision:?}"),
+                _ = sleep(Duration::from_millis(50)) => panic!("attempt {attempt} did not request permission"),
+            };
+            match event {
+                AgentEvent::PermissionRequired(request) => {
+                    assert_eq!(request.permission_level, PermissionLevel::Network);
+                    assert_eq!(request.allow_always_key, None);
+                    request.responder.send(PermissionReply::AllowOnce).unwrap();
+                }
+                other => panic!("expected PermissionRequired, got {other:?}"),
+            }
+            assert_eq!(decision.await, PermissionDecision::Allow);
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_decider_reject_only_network_never_auto_allows_or_accepts_allow_reply() {
+        for mode in [
+            PermissionMode::Normal,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Yolo,
+            PermissionMode::Plan,
+        ] {
+            let (decider, mut rx, _mode) = decider_with_mode(mode);
+            let call = network_call();
+            let tool = NetworkTool;
+            let preview = reject_only_network_preview();
+            let decision = decider.decide(network_permission_check(&call, &tool, &preview));
+            tokio::pin!(decision);
+
+            let event = tokio::select! {
+                event = rx.recv() => event.expect("reject-only permission request"),
+                decision = &mut decision => panic!("decide returned before reject-only request: {decision:?}"),
+                _ = sleep(Duration::from_millis(50)) => panic!("timed out waiting for reject-only permission request"),
+            };
+            match event {
+                AgentEvent::PermissionRequired(request) => {
+                    assert_eq!(
+                        request.permission_level,
+                        PermissionLevel::Network,
+                        "{mode:?}"
+                    );
+                    assert_eq!(request.network_preview, Some(preview.clone()));
+                    request.responder.send(PermissionReply::AllowOnce).unwrap();
+                }
+                other => panic!("expected PermissionRequired, got {other:?}"),
+            }
+            assert_eq!(decision.await, PermissionDecision::Deny, "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn channel_decider_allowlist_hit_returns_allow_without_channel() {
         let (decider, mut rx, _mode) =
             decider_with_mode_and_policy(PermissionMode::Normal, ["echo hi"]);
         let call = execute_call();
         let tool = ExecuteTool;
-        let decision = decider.decide(&call, &tool);
+        let decision = decider.decide(permission_check(&call, &tool));
         tokio::pin!(decision);
 
         let decision = tokio::select! {
@@ -612,7 +847,7 @@ mod tests {
         let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::Normal);
         let call = execute_call();
         let tool = ExecuteTool;
-        let decision = decider.decide(&call, &tool);
+        let decision = decider.decide(permission_check(&call, &tool));
         tokio::pin!(decision);
 
         let request = tokio::select! {
@@ -641,7 +876,7 @@ mod tests {
             decider_with_mode_policy_and_path(PermissionMode::Normal, [], config_path.clone());
         let call = execute_call();
         let tool = ExecuteTool;
-        let decision = decider.decide(&call, &tool);
+        let decision = decider.decide(permission_check(&call, &tool));
         tokio::pin!(decision);
 
         let request = tokio::select! {
@@ -666,7 +901,7 @@ mod tests {
             Some(vec!["echo hi".to_string()])
         );
 
-        let second = decider.decide(&call, &tool);
+        let second = decider.decide(permission_check(&call, &tool));
         tokio::pin!(second);
         let second = tokio::select! {
             event = rx.recv() => panic!("remembered command must not send PermissionRequired: {event:?}"),
@@ -684,7 +919,7 @@ mod tests {
             decider_with_mode_policy_and_path(PermissionMode::Normal, [], config_path);
         let call = execute_call();
         let tool = ExecuteTool;
-        let decision = decider.decide(&call, &tool);
+        let decision = decider.decide(permission_check(&call, &tool));
         tokio::pin!(decision);
 
         let request = tokio::select! {
@@ -714,7 +949,7 @@ mod tests {
             other => panic!("expected Notice, got {other:?}"),
         }
 
-        let second = decider.decide(&call, &tool);
+        let second = decider.decide(permission_check(&call, &tool));
         tokio::pin!(second);
         let second = tokio::select! {
             event = rx.recv() => panic!("remembered command must not send PermissionRequired: {event:?}"),
@@ -732,7 +967,7 @@ mod tests {
             decider_with_mode_policy_and_path(PermissionMode::Normal, [], config_path.clone());
         let call = call();
         let tool = ConfirmTool;
-        let decision = decider.decide(&call, &tool);
+        let decision = decider.decide(permission_check(&call, &tool));
         tokio::pin!(decision);
 
         let request = tokio::select! {
@@ -801,7 +1036,7 @@ mod tests {
         let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::Normal);
         let call = call();
         let tool = ConfirmTool;
-        let decision = decider.decide(&call, &tool);
+        let decision = decider.decide(permission_check(&call, &tool));
         tokio::pin!(decision);
 
         let request = tokio::select! {
@@ -827,7 +1062,7 @@ mod tests {
         let (decider, mut rx, _mode) = decider_with_mode(PermissionMode::Normal);
         let call = call();
         let tool = ConfirmTool;
-        let decision = decider.decide(&call, &tool);
+        let decision = decider.decide(permission_check(&call, &tool));
         tokio::pin!(decision);
 
         let request = tokio::select! {

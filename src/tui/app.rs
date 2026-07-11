@@ -15,8 +15,12 @@ use crate::tui::command::{command_metadata, parse_command, Command, CommandMetad
 use crate::tui::input_batch::{PasteTailMatcher, TailAction};
 use crate::tui::input_buffer::{reduce_input_buffer, InputBufferAction, InputBufferState};
 use crate::tui::jump_to_bottom::{bump_new_message_count, new_message_count_on_follow_bottom};
+use crate::tui::permission::{
+    network_permission_area, network_permission_layout, PermissionBarrierState,
+};
 use crate::tui::selection::{reduce_selection, SelectionAction, SelectionState};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -471,6 +475,7 @@ pub struct AppState {
     pub thinking_depth: Arc<Mutex<Depth>>,
     pub phase: Phase,
     pub pending_permission: Option<PermissionRequest>,
+    pub permission_barrier: PermissionBarrierState,
     pub pending_plan_approval: Option<PlanApprovalRequest>,
     pub pending_question: Option<PendingQuestion>,
     pub current_plan: Option<ActivePlan>,
@@ -570,6 +575,7 @@ impl AppState {
             thinking_depth: Arc::new(Mutex::new(Depth::Low)),
             phase: Phase::Ready,
             pending_permission: None,
+            permission_barrier: PermissionBarrierState::default(),
             pending_plan_approval: None,
             pending_question: None,
             current_plan: None,
@@ -810,6 +816,56 @@ impl AppState {
         self.pending_permission.is_some()
             || self.pending_plan_approval.is_some()
             || self.pending_question.is_some()
+    }
+
+    pub fn arm_network_permission_after_render(&mut self, area: Rect) {
+        let Some(request) = self.pending_permission.as_ref() else {
+            return;
+        };
+        if request.permission_level != crate::tool::PermissionLevel::Network {
+            return;
+        }
+        let Some(preview) = request.network_preview.as_ref() else {
+            return;
+        };
+        let permission_area = network_permission_area(area);
+        if network_permission_layout(permission_area, preview, self.permission_barrier.scroll)
+            .can_allow
+        {
+            self.permission_barrier
+                .mark_rendered(self.permission_barrier.generation);
+        }
+    }
+
+    pub fn network_permission_needs_input_barrier(&self) -> bool {
+        self.permission_barrier
+            .needs_input_barrier(self.permission_barrier.generation)
+    }
+
+    pub fn complete_network_permission_input_barrier(&mut self) {
+        self.permission_barrier
+            .complete_input_barrier(self.permission_barrier.generation);
+    }
+
+    pub fn unarm_network_permission(&mut self) {
+        self.permission_barrier.resize();
+    }
+
+    fn network_permission_can_allow(&self, terminal_area: Option<Rect>) -> bool {
+        self.pending_permission.as_ref().is_none_or(|request| {
+            request.permission_level != crate::tool::PermissionLevel::Network
+                || terminal_area.is_some_and(|area| {
+                    request.network_preview.as_ref().is_some_and(|preview| {
+                        let layout = network_permission_layout(
+                            network_permission_area(area),
+                            preview,
+                            self.permission_barrier.scroll,
+                        );
+                        self.permission_barrier
+                            .can_allow(self.permission_barrier.generation, layout.can_allow)
+                    })
+                })
+        })
     }
 
     fn apply_input_action(&mut self, action: InputBufferAction) {
@@ -1237,6 +1293,9 @@ impl AppState {
                 }
             }
             AgentEvent::PermissionRequired(request) => {
+                if request.permission_level == crate::tool::PermissionLevel::Network {
+                    self.permission_barrier.begin_request();
+                }
                 self.pending_permission = Some(request);
                 self.phase = Phase::WaitingForPermission;
             }
@@ -1311,7 +1370,7 @@ impl AppState {
     }
 
     pub fn on_key(&mut self, key: KeyEvent, input_tx: &mpsc::UnboundedSender<UserInput>) {
-        self.on_key_inner(key, input_tx, None);
+        self.on_key_inner(key, input_tx, None, None);
     }
 
     pub fn on_key_with_interrupt(
@@ -1320,7 +1379,17 @@ impl AppState {
         input_tx: &mpsc::UnboundedSender<UserInput>,
         interrupt_tx: &mpsc::UnboundedSender<UserInput>,
     ) {
-        self.on_key_inner(key, input_tx, Some(interrupt_tx));
+        self.on_key_inner(key, input_tx, Some(interrupt_tx), None);
+    }
+
+    pub fn on_key_with_interrupt_in_area(
+        &mut self,
+        key: KeyEvent,
+        input_tx: &mpsc::UnboundedSender<UserInput>,
+        interrupt_tx: &mpsc::UnboundedSender<UserInput>,
+        terminal_area: Rect,
+    ) {
+        self.on_key_inner(key, input_tx, Some(interrupt_tx), Some(terminal_area));
     }
 
     fn on_key_inner(
@@ -1328,6 +1397,7 @@ impl AppState {
         key: KeyEvent,
         input_tx: &mpsc::UnboundedSender<UserInput>,
         interrupt_tx: Option<&mpsc::UnboundedSender<UserInput>>,
+        terminal_area: Option<Rect>,
     ) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -1344,8 +1414,39 @@ impl AppState {
         }
 
         if self.pending_permission.is_some() {
+            if self.pending_permission.as_ref().is_some_and(|request| {
+                request.permission_level == crate::tool::PermissionLevel::Network
+            }) {
+                match key.code {
+                    KeyCode::Up => {
+                        self.permission_barrier.scroll =
+                            self.permission_barrier.scroll.saturating_sub(1)
+                    }
+                    KeyCode::Down => {
+                        self.permission_barrier.scroll =
+                            self.permission_barrier.scroll.saturating_add(1)
+                    }
+                    KeyCode::PageUp => {
+                        self.permission_barrier.scroll =
+                            self.permission_barrier.scroll.saturating_sub(8)
+                    }
+                    KeyCode::PageDown => {
+                        self.permission_barrier.scroll =
+                            self.permission_barrier.scroll.saturating_add(8)
+                    }
+                    _ => {}
+                }
+                if matches!(
+                    key.code,
+                    KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                ) {
+                    return;
+                }
+            }
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+                    if self.network_permission_can_allow(terminal_area) =>
+                {
                     self.answer_pending_permission(PermissionReply::AllowOnce);
                 }
                 KeyCode::Char('a') | KeyCode::Char('A')
@@ -1705,20 +1806,34 @@ fn is_insertable_char_key(key: KeyEvent) -> bool {
     }
 }
 
+pub(crate) struct BatchInputContext<'a> {
+    pub input_tx: &'a mpsc::UnboundedSender<UserInput>,
+    pub interrupt_tx: &'a mpsc::UnboundedSender<UserInput>,
+    pub terminal_area: Option<Rect>,
+}
+
 pub(crate) fn apply_batch_input_key(
     state: &mut AppState,
     key: KeyEvent,
     intent: crate::tui::input_batch::KeyIntent,
     modal_closed_in_batch: &mut bool,
     pending_str: &mut String,
-    input_tx: &mpsc::UnboundedSender<UserInput>,
-    interrupt_tx: &mpsc::UnboundedSender<UserInput>,
+    ctx: BatchInputContext<'_>,
 ) -> ApplyBatchKeyResult {
     use crate::tui::input_batch::KeyIntent;
+    let BatchInputContext {
+        input_tx,
+        interrupt_tx,
+        terminal_area,
+    } = ctx;
 
     if state.has_pending_dialog() {
         flush_merged_input_chars(state, pending_str);
-        state.on_key_with_interrupt(key, input_tx, interrupt_tx);
+        if let Some(area) = terminal_area {
+            state.on_key_with_interrupt_in_area(key, input_tx, interrupt_tx, area);
+        } else {
+            state.on_key_with_interrupt(key, input_tx, interrupt_tx);
+        }
         return if state.has_pending_dialog() {
             ApplyBatchKeyResult::Continue
         } else {
@@ -2950,6 +3065,8 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({ "path": "note.txt" }),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: tx,
         }));
@@ -3162,6 +3279,8 @@ mod tests {
             state.apply(AgentEvent::PermissionRequired(PermissionRequest {
                 tool_name: "write_file".to_string(),
                 args: json!({}),
+                permission_level: crate::tool::PermissionLevel::Edit,
+                network_preview: None,
                 allow_always_key: None,
                 responder: permission_tx,
             }));
@@ -3286,6 +3405,8 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: allow_tx,
         }));
@@ -3530,6 +3651,8 @@ mod tests {
         allow_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: allow_tx,
         }));
@@ -3545,6 +3668,8 @@ mod tests {
         deny_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: deny_tx,
         }));
@@ -3557,6 +3682,75 @@ mod tests {
     }
 
     #[test]
+    fn network_permission_requires_render_barrier_but_deny_is_always_available() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let (first_tx, mut first_rx) = oneshot::channel();
+        let mut state = AppState::new();
+        let preview = crate::tool::NetworkPermissionPreview {
+            authorizable: true,
+            full_args: json!({ "url": "https://example.com" }),
+            canonical_initial_target: Some("https://example.com/".to_string()),
+            scope: Some(crate::tool::NetworkPermissionScope {
+                max_redirects: 3,
+                may_cross_origin: true,
+                ssrf_each_hop: true,
+            }),
+            denial_reason: None,
+        };
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "web_fetch".to_string(),
+            args: json!({ "url": "https://example.com" }),
+            permission_level: crate::tool::PermissionLevel::Network,
+            network_preview: Some(preview.clone()),
+            allow_always_key: None,
+            responder: first_tx,
+        }));
+
+        state.on_key(key(KeyCode::PageDown), &input_tx);
+        assert_eq!(state.permission_barrier.scroll, 8);
+        state.on_key(key(KeyCode::PageUp), &input_tx);
+        assert_eq!(state.permission_barrier.scroll, 0);
+        state.on_key(key(KeyCode::Char('y')), &input_tx);
+        assert!(first_rx.try_recv().is_err());
+        state.arm_network_permission_after_render(ratatui::layout::Rect::new(0, 0, 80, 24));
+        state.on_key(key(KeyCode::Char('y')), &input_tx);
+        assert!(first_rx.try_recv().is_err());
+        state.complete_network_permission_input_barrier();
+        state.on_key_with_interrupt_in_area(
+            key(KeyCode::Char('y')),
+            &input_tx,
+            &interrupt_tx,
+            ratatui::layout::Rect::new(0, 0, 80, 10),
+        );
+        assert!(first_rx.try_recv().is_err());
+        state.on_key_with_interrupt_in_area(
+            key(KeyCode::Char('y')),
+            &input_tx,
+            &interrupt_tx,
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+        );
+        assert_eq!(first_rx.try_recv().unwrap(), PermissionReply::AllowOnce);
+
+        let (second_tx, mut second_rx) = oneshot::channel();
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "web_fetch".to_string(),
+            args: json!({ "url": "https://example.com" }),
+            permission_level: crate::tool::PermissionLevel::Network,
+            network_preview: Some(preview),
+            allow_always_key: None,
+            responder: second_tx,
+        }));
+        state.arm_network_permission_after_render(ratatui::layout::Rect::new(0, 0, 80, 24));
+        state.complete_network_permission_input_barrier();
+        state.unarm_network_permission();
+        state.on_key(key(KeyCode::Char('y')), &input_tx);
+        assert!(second_rx.try_recv().is_err());
+        state.on_key(key(KeyCode::Char('n')), &input_tx);
+        assert_eq!(second_rx.try_recv().unwrap(), PermissionReply::Deny);
+    }
+
+    #[test]
     fn on_key_answers_pending_permission_with_enter_or_escape() {
         let (input_tx, _input_rx) = mpsc::unbounded_channel();
         let (allow_tx, mut allow_rx) = oneshot::channel();
@@ -3564,6 +3758,8 @@ mod tests {
         allow_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: allow_tx,
         }));
@@ -3577,6 +3773,8 @@ mod tests {
         deny_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: deny_tx,
         }));
@@ -3594,6 +3792,8 @@ mod tests {
         allow_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "run_shell".to_string(),
             args: json!({ "command": "cargo test" }),
+            permission_level: crate::tool::PermissionLevel::Execute,
+            network_preview: None,
             allow_always_key: Some("cargo test".to_string()),
             responder: allow_tx,
         }));
@@ -3609,6 +3809,8 @@ mod tests {
         ignored_state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "edit_file".to_string(),
             args: json!({ "path": "src/lib.rs" }),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: ignored_tx,
         }));
@@ -3852,6 +4054,8 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: allow_tx,
         }));
@@ -3941,6 +4145,8 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "run_shell".to_string(),
             args: json!({ "command": "echo" }),
+            permission_level: crate::tool::PermissionLevel::Execute,
+            network_preview: None,
             allow_always_key: None,
             responder: allow_tx,
         }));
@@ -3972,7 +4178,7 @@ mod tests {
         interrupt_tx: &mpsc::UnboundedSender<UserInput>,
     ) {
         use crate::tui::app::{
-            apply_batch_input_key, flush_merged_input_chars, ApplyBatchKeyResult,
+            apply_batch_input_key, flush_merged_input_chars, ApplyBatchKeyResult, BatchInputContext,
         };
         use crate::tui::input_batch::classify_key_batch;
 
@@ -3986,8 +4192,11 @@ mod tests {
                 *intent,
                 &mut modal_closed_in_batch,
                 &mut pending_str,
-                input_tx,
-                interrupt_tx,
+                BatchInputContext {
+                    input_tx,
+                    interrupt_tx,
+                    terminal_area: Some(ratatui::layout::Rect::new(0, 0, 80, 24)),
+                },
             ) {
                 ApplyBatchKeyResult::Continue => {}
                 ApplyBatchKeyResult::BreakBatch => break,
@@ -4050,6 +4259,8 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: permission_tx,
         }));
@@ -4072,6 +4283,57 @@ mod tests {
         assert!(state.pending_permission.is_none());
         assert_eq!(state.input(), "");
         assert!(!state.input().contains('\n'));
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn batch_network_permission_discards_pre_barrier_approval_keys() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
+        let (permission_tx, mut permission_rx) = oneshot::channel();
+        let mut state = AppState::new();
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "web_fetch".to_string(),
+            args: json!({ "url": "https://example.com" }),
+            permission_level: crate::tool::PermissionLevel::Network,
+            network_preview: Some(crate::tool::NetworkPermissionPreview {
+                authorizable: true,
+                full_args: json!({ "url": "https://example.com" }),
+                canonical_initial_target: Some("https://example.com/".to_string()),
+                scope: Some(crate::tool::NetworkPermissionScope {
+                    max_redirects: 3,
+                    may_cross_origin: true,
+                    ssrf_each_hop: true,
+                }),
+                denial_reason: None,
+            }),
+            allow_always_key: None,
+            responder: permission_tx,
+        }));
+
+        apply_press_key_batch(
+            &mut state,
+            &[key(KeyCode::Char('y')), key(KeyCode::Enter)],
+            &input_tx,
+            &interrupt_tx,
+        );
+        assert!(permission_rx.try_recv().is_err());
+        assert!(state.pending_permission.is_some());
+
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        state.arm_network_permission_after_render(area);
+        state.complete_network_permission_input_barrier();
+        apply_press_key_batch(
+            &mut state,
+            &[key(KeyCode::Char('y'))],
+            &input_tx,
+            &interrupt_tx,
+        );
+        assert_eq!(
+            permission_rx.try_recv().unwrap(),
+            PermissionReply::AllowOnce
+        );
+        assert!(state.pending_permission.is_none());
         assert!(input_rx.try_recv().is_err());
     }
 

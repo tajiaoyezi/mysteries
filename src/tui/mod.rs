@@ -38,6 +38,7 @@ pub mod input_buffer;
 pub(crate) mod input_layout;
 pub mod jump_to_bottom;
 pub(crate) mod markdown;
+pub mod permission;
 pub mod render;
 pub mod selection;
 pub mod terminal;
@@ -198,7 +199,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
     let mut clipboard = ArboardClipboard::new();
     let mut last_frame: Option<Buffer> = None;
 
-    draw_frame(&mut terminal, &state, &theme, &mut last_frame)?;
+    draw_frame(&mut terminal, &mut state, &theme, &mut last_frame)?;
 
     loop {
         let mut skip_frame = false;
@@ -262,7 +263,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
                                         flush_debug_event_log();
                                     }
                                     state.set_paste_receiving_hint(true);
-                                    draw_frame(&mut terminal, &state, &theme, &mut last_frame)?;
+                                    draw_frame(&mut terminal, &mut state, &theme, &mut last_frame)?;
                                     state.set_paste_receiving_hint(false);
                                     batch = bridge_event_batch(batch)?;
                                     if process_event_batch(
@@ -366,7 +367,7 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
         }
 
         if !skip_frame {
-            draw_frame(&mut terminal, &state, &theme, &mut last_frame)?;
+            draw_frame(&mut terminal, &mut state, &theme, &mut last_frame)?;
         }
     }
 
@@ -572,13 +573,14 @@ fn flush_debug_event_log() {
 
 fn draw_frame(
     terminal: &mut terminal::TerminalGuard,
-    state: &app::AppState,
+    state: &mut app::AppState,
     theme: &theme::Theme,
     last_frame: &mut Option<Buffer>,
 ) -> Result<(), CliError> {
     let completed = terminal
         .terminal_mut()
         .draw(|frame| render::render(frame, state, theme))?;
+    state.arm_network_permission_after_render(completed.area);
     if state.has_selection() {
         *last_frame = Some(completed.buffer.clone());
     } else {
@@ -639,6 +641,7 @@ fn handle_selection_key(
 
 fn handle_resize(state: &mut app::AppState) {
     state.clear_selection();
+    state.unarm_network_permission();
 }
 
 /// 两次取消键到达间隔判定结果。
@@ -1236,6 +1239,14 @@ fn process_event_batch(batch: Vec<Event>, ctx: EventBatchContext<'_>) -> Result<
         interrupt_tx,
         debug_events,
     } = ctx;
+    let terminal_size = terminal.terminal_mut().size()?;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, terminal_size.width, terminal_size.height);
+    let isolate_network_approval = state.network_permission_needs_input_barrier();
+    let batch = if isolate_network_approval {
+        isolate_network_approval_events(batch)
+    } else {
+        batch
+    };
     for event in &batch {
         if debug_events {
             append_debug_event_line(&debug_event_line(event));
@@ -1319,8 +1330,11 @@ fn process_event_batch(batch: Vec<Event>, ctx: EventBatchContext<'_>) -> Result<
                     intent,
                     &mut modal_closed_in_batch,
                     &mut pending_str,
-                    input_tx,
-                    interrupt_tx,
+                    app::BatchInputContext {
+                        input_tx,
+                        interrupt_tx,
+                        terminal_area: Some(terminal_area),
+                    },
                 ) {
                     app::ApplyBatchKeyResult::Continue => {}
                     app::ApplyBatchKeyResult::BreakBatch => break,
@@ -1354,8 +1368,29 @@ fn process_event_batch(batch: Vec<Event>, ctx: EventBatchContext<'_>) -> Result<
     }
 
     app::flush_merged_input_chars(state, &mut pending_str);
+    if isolate_network_approval {
+        state.complete_network_permission_input_barrier();
+    }
 
     Ok(break_loop)
+}
+
+fn isolate_network_approval_events(batch: Vec<Event>) -> Vec<Event> {
+    batch
+        .into_iter()
+        .filter(|event| {
+            !matches!(event, Event::Paste(_))
+                && !matches!(
+                    event,
+                    Event::Key(key)
+                        if is_key_press(*key)
+                            && matches!(
+                                key.code,
+                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+                            )
+                )
+        })
+        .collect()
 }
 
 pub async fn run_agent_task(
@@ -1508,11 +1543,11 @@ mod tests {
     use super::{
         apply_loaded_plan, apply_mouse_wheel_scroll_to_state, arrows_route_to_completion,
         cancel_action, handle_mouse_selection_event, handle_queue_cancel_key, handle_resize,
-        handle_selection_key, prepare_session_startup, push_session_save_notice_if_error,
-        run_agent_task, scroll_action_for_key, selection_key_action, should_exit,
-        terminal_session_event, write_session_snapshot, CancelAction, ExitIntent,
-        MouseWheelScrollAction, RunAgentTaskConfig, SelectionKeyAction, StartupMode,
-        DEFAULT_SYSTEM_PROMPT, EXIT_DOUBLE_TAP,
+        handle_selection_key, isolate_network_approval_events, prepare_session_startup,
+        push_session_save_notice_if_error, run_agent_task, scroll_action_for_key,
+        selection_key_action, should_exit, terminal_session_event, write_session_snapshot,
+        CancelAction, ExitIntent, MouseWheelScrollAction, RunAgentTaskConfig, SelectionKeyAction,
+        StartupMode, DEFAULT_SYSTEM_PROMPT, EXIT_DOUBLE_TAP,
     };
     use crate::agent::message::Message;
     use crate::agent::AgentStatus;
@@ -1551,6 +1586,23 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant as StdInstant;
     use tokio::sync::{mpsc, oneshot, Mutex};
+
+    #[test]
+    fn network_input_barrier_drops_queued_approval_events_only() {
+        let retained = isolate_network_approval_events(vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Event::Paste("y".to_string()),
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            Event::Resize(40, 10),
+        ]);
+
+        assert_eq!(retained.len(), 3);
+        assert!(matches!(retained[0], Event::Key(key) if key.code == KeyCode::Down));
+        assert!(matches!(retained[1], Event::Key(key) if key.code == KeyCode::Char('n')));
+        assert!(matches!(retained[2], Event::Resize(40, 10)));
+    }
     use tokio::time::{timeout, Duration};
 
     fn normal_channel_decider(tx: mpsc::UnboundedSender<AgentEvent>) -> ChannelDecider {
@@ -2066,6 +2118,8 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: perm_tx,
         }));
@@ -2386,6 +2440,8 @@ mod tests {
         pending.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: tx,
         }));
@@ -2409,6 +2465,8 @@ mod tests {
         pending.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "write_file".to_string(),
             args: json!({}),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: tx,
         }));

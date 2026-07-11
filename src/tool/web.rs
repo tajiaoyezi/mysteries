@@ -1,5 +1,8 @@
 use crate::tool::fs::truncate_utf8;
-use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
+use crate::tool::{
+    NetworkPermissionPreview, NetworkPermissionScope, PermissionLevel, Tool, ToolContext,
+    ToolOutcome,
+};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use regex::Regex;
@@ -15,6 +18,10 @@ const WEB_MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REDIRECTS: u32 = 3;
 const BROWSER_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+pub fn redirect_allowed(redirects_followed: u32) -> bool {
+    redirects_followed < MAX_REDIRECTS
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResult {
@@ -297,6 +304,42 @@ fn string_arg<'a>(args: &'a Value, field: &str) -> Option<&'a str> {
     args.get(field).and_then(Value::as_str)
 }
 
+fn web_fetch_request(args: &Value) -> Result<String, WebError> {
+    let url = string_arg(args, "url").ok_or_else(|| WebError::new("missing or invalid url"))?;
+    reqwest::Url::parse(url)
+        .map(|url| url.to_string())
+        .map_err(|err| WebError::new(format!("invalid url: {err}")))
+}
+
+fn web_search_request(args: &Value) -> Result<String, WebError> {
+    let query =
+        string_arg(args, "query").ok_or_else(|| WebError::new("missing or invalid query"))?;
+    Ok(ddg_search_url(query))
+}
+
+fn authorizable_preview(
+    args: &Value,
+    target: Result<String, WebError>,
+    scope: NetworkPermissionScope,
+) -> NetworkPermissionPreview {
+    match target {
+        Ok(canonical_initial_target) => NetworkPermissionPreview {
+            authorizable: true,
+            full_args: args.clone(),
+            canonical_initial_target: Some(canonical_initial_target),
+            scope: Some(scope),
+            denial_reason: None,
+        },
+        Err(err) => NetworkPermissionPreview {
+            authorizable: false,
+            full_args: args.clone(),
+            canonical_initial_target: None,
+            scope: None,
+            denial_reason: Some(err.to_string()),
+        },
+    }
+}
+
 fn error_outcome(content: impl Into<String>) -> ToolOutcome {
     ToolOutcome {
         content: content.into(),
@@ -323,6 +366,8 @@ impl WebError {
 #[async_trait]
 pub trait WebFetcher: Send + Sync {
     async fn fetch(&self, url: &str) -> Result<String, WebError>;
+
+    fn permission_scope(&self) -> NetworkPermissionScope;
 }
 
 pub struct MockFetcher {
@@ -349,6 +394,14 @@ impl WebFetcher for MockFetcher {
         match &self.response {
             Ok(html) => Ok(html.clone()),
             Err(err) => Err(WebError::new(&err.message)),
+        }
+    }
+
+    fn permission_scope(&self) -> NetworkPermissionScope {
+        NetworkPermissionScope {
+            max_redirects: 0,
+            may_cross_origin: false,
+            ssrf_each_hop: false,
         }
     }
 }
@@ -414,7 +467,7 @@ impl WebFetcher for ReqwestFetcher {
                 .map_err(|err| WebError::new(format!("request failed: {err}")))?;
 
             if response.status().is_redirection() {
-                if redirects >= MAX_REDIRECTS {
+                if !redirect_allowed(redirects) {
                     return Err(WebError::new("too many redirects"));
                 }
                 let location = response
@@ -434,6 +487,14 @@ impl WebFetcher for ReqwestFetcher {
         };
 
         process_http_response(response).await
+    }
+
+    fn permission_scope(&self) -> NetworkPermissionScope {
+        NetworkPermissionScope {
+            max_redirects: MAX_REDIRECTS,
+            may_cross_origin: true,
+            ssrf_each_hop: true,
+        }
     }
 }
 
@@ -478,15 +539,24 @@ impl Tool for WebFetchTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::ReadOnly
+        PermissionLevel::Network
+    }
+
+    fn network_permission_preview(&self, args: &Value) -> NetworkPermissionPreview {
+        authorizable_preview(
+            args,
+            web_fetch_request(args),
+            self.fetcher.permission_scope(),
+        )
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
-        let Some(url) = string_arg(&args, "url") else {
-            return error_outcome("missing or invalid url");
+        let url = match web_fetch_request(&args) {
+            Ok(url) => url,
+            Err(err) => return error_outcome(err.to_string()),
         };
 
-        let html = match self.fetcher.fetch(url).await {
+        let html = match self.fetcher.fetch(&url).await {
             Ok(html) => html,
             Err(err) => return error_outcome(err.to_string()),
         };
@@ -523,15 +593,23 @@ impl Tool for WebSearchTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::ReadOnly
+        PermissionLevel::Network
+    }
+
+    fn network_permission_preview(&self, args: &Value) -> NetworkPermissionPreview {
+        authorizable_preview(
+            args,
+            web_search_request(args),
+            self.fetcher.permission_scope(),
+        )
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
-        let Some(query) = string_arg(&args, "query") else {
-            return error_outcome("missing or invalid query");
+        let search_url = match web_search_request(&args) {
+            Ok(search_url) => search_url,
+            Err(err) => return error_outcome(err.to_string()),
         };
 
-        let search_url = ddg_search_url(query);
         let html = match self.fetcher.fetch(&search_url).await {
             Ok(html) => html,
             Err(err) => return error_outcome(err.to_string()),
@@ -561,10 +639,11 @@ mod tests {
         MockFetcher, ReqwestFetcher, WebFetchTool, WebFetcher, WebSearchTool, MAX_SEARCH_RESULTS,
         WEB_MAX_BYTES,
     };
-    use crate::tool::{Tool, ToolContext};
+    use crate::tool::{NetworkPermissionScope, Tool, ToolContext};
     use serde_json::json;
     use std::net::IpAddr;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     // 真抓 DDG 片段(2026-07-05, query=rust ownership);含 &amp;rut= / &#x27; / <b> / result__a·result__snippet
     const DDG_FIXTURE: &str = r#"
@@ -592,6 +671,37 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CaptureFetcher {
+        urls: Arc<Mutex<Vec<String>>>,
+        scope: NetworkPermissionScope,
+    }
+
+    impl CaptureFetcher {
+        fn new(scope: NetworkPermissionScope) -> Self {
+            Self {
+                urls: Arc::new(Mutex::new(Vec::new())),
+                scope,
+            }
+        }
+
+        fn urls(&self) -> Vec<String> {
+            self.urls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WebFetcher for CaptureFetcher {
+        async fn fetch(&self, url: &str) -> Result<String, super::WebError> {
+            self.urls.lock().unwrap().push(url.to_string());
+            Ok("<p>captured</p>".to_string())
+        }
+
+        fn permission_scope(&self) -> NetworkPermissionScope {
+            self.scope.clone()
+        }
+    }
+
     // --- 1.1 ddg_search_url / decode_uddg ---
 
     #[test]
@@ -599,6 +709,14 @@ mod tests {
         let url = ddg_search_url("rust ownership");
         assert!(url.starts_with("https://html.duckduckgo.com/html/?"));
         assert!(url.contains("q=rust+ownership"));
+    }
+
+    #[test]
+    fn redirect_budget_allows_only_the_first_three_redirects() {
+        assert!(super::redirect_allowed(0));
+        assert!(super::redirect_allowed(1));
+        assert!(super::redirect_allowed(2));
+        assert!(!super::redirect_allowed(3));
     }
 
     #[test]
@@ -829,6 +947,120 @@ mod tests {
         assert!(!outcome.is_error);
         assert_eq!(outcome.content, html_to_text(html));
         assert!(!outcome.truncated);
+    }
+
+    #[test]
+    fn web_tools_require_network_permission() {
+        let fetch = WebFetchTool::new(Box::new(MockFetcher::ok("unused")));
+        let search = WebSearchTool::new(Box::new(MockFetcher::ok("unused")));
+
+        assert_eq!(
+            fetch.permission_level(),
+            crate::tool::PermissionLevel::Network
+        );
+        assert_eq!(
+            search.permission_level(),
+            crate::tool::PermissionLevel::Network
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_preview_uses_the_canonical_url_sent_to_its_fetcher() {
+        let scope = NetworkPermissionScope {
+            max_redirects: 7,
+            may_cross_origin: true,
+            ssrf_each_hop: true,
+        };
+
+        for raw_url in [
+            "https://user:pass@EXAMPLE.com:443/path",
+            "https://bücher.example/guide",
+            "http://2130706433/numeric-ip",
+            "https://[2001:4860:4860::8888]:443/ipv6",
+        ] {
+            let capture = CaptureFetcher::new(scope.clone());
+            let tool = WebFetchTool::new(Box::new(capture.clone()));
+            let args = json!({ "url": raw_url });
+            let preview = tool.network_permission_preview(&args);
+            let expected = reqwest::Url::parse(raw_url).unwrap().to_string();
+
+            assert!(preview.authorizable, "{raw_url}");
+            assert_eq!(
+                preview.canonical_initial_target.as_deref(),
+                Some(expected.as_str())
+            );
+            assert_eq!(preview.scope, Some(scope.clone()));
+
+            let outcome = tool.execute(args, &ctx(4096)).await;
+            assert!(!outcome.is_error, "{raw_url}");
+            assert_eq!(capture.urls(), vec![expected]);
+        }
+    }
+
+    #[tokio::test]
+    async fn web_search_preview_uses_the_ddg_url_sent_to_its_fetcher() {
+        let scope = NetworkPermissionScope {
+            max_redirects: 2,
+            may_cross_origin: false,
+            ssrf_each_hop: true,
+        };
+
+        for query in ["rust ownership", "Rust 所有权 & 借用"] {
+            let capture = CaptureFetcher::new(scope.clone());
+            let tool = WebSearchTool::new(Box::new(capture.clone()));
+            let args = json!({ "query": query });
+            let preview = tool.network_permission_preview(&args);
+            let expected = ddg_search_url(query);
+
+            assert!(preview.authorizable, "{query}");
+            assert_eq!(
+                preview.canonical_initial_target.as_deref(),
+                Some(expected.as_str())
+            );
+            assert_eq!(preview.scope, Some(scope.clone()));
+
+            let _ = tool.execute(args, &ctx(4096)).await;
+            assert_eq!(capture.urls(), vec![expected]);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_web_fetch_arguments_are_unauthorizable_and_do_not_fetch() {
+        for args in [
+            json!({}),
+            json!({ "url": 42 }),
+            json!({ "url": "http://[invalid" }),
+        ] {
+            let capture = CaptureFetcher::new(NetworkPermissionScope {
+                max_redirects: 3,
+                may_cross_origin: true,
+                ssrf_each_hop: true,
+            });
+            let tool = WebFetchTool::new(Box::new(capture.clone()));
+            let preview = tool.network_permission_preview(&args);
+
+            assert!(!preview.authorizable, "{args}");
+            assert!(preview
+                .denial_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty()));
+
+            let outcome = tool.execute(args, &ctx(4096)).await;
+            assert!(outcome.is_error);
+            assert!(capture.urls().is_empty());
+        }
+    }
+
+    #[test]
+    fn reqwest_fetcher_declares_its_redirect_and_ssrf_permission_scope() {
+        assert_eq!(
+            ReqwestFetcher::new().permission_scope(),
+            NetworkPermissionScope {
+                max_redirects: 3,
+                may_cross_origin: true,
+                ssrf_each_hop: true,
+            }
+        );
     }
 
     #[test]

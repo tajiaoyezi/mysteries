@@ -8,13 +8,15 @@ pub use context::{ContextError, ContextStrategy, Passthrough};
 
 use crate::agent::message::Message;
 use crate::error::{AgentError, ProviderError};
-use crate::permission::{gate, PermissionDecider, PermissionDecision, PermissionMode};
+use crate::permission::{
+    gate, PermissionDecider, PermissionDenial, PermissionGateOutcome, PermissionMode,
+};
 use crate::provider::{DeltaSink, Depth, ModelRequest, Provider, ThinkingConfig, Usage};
 use crate::tool::{PermissionLevel, ToolContext, ToolOutcome, ToolRegistry};
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant. Do not claim to be Claude, ChatGPT, OpenAI, Anthropic, or any specific upstream model. If asked about your model identity, say you are running inside Mysteries and the configured model name is shown in the status line.";
-pub const PLAN_MODE_INSTRUCTION: &str = "你在 plan 模式(只读:read_file/grep/glob/web_*,不改文件/不执行命令)。用户只是问 → 直接答;撞到岔路/歧义 → ask_user 弹选项让用户定;用户要执行任务 → 调研够了 submit_plan 交结构化 plan、每步带可验收 validation。每步 description 一句话简述(尽量 ≤30 字),不写长段落、不堆细节;细节留到执行时或放进 validation";
+pub const PLAN_MODE_INSTRUCTION: &str = "你在 plan 模式。可使用 ReadOnly 与 Network 工具调研；每次 Network 调用仍须用户授权。禁止 Edit 与 Execute 工具。用户只是问 → 直接答;撞到岔路/歧义 → ask_user 弹选项让用户定;用户要执行任务 → 调研够了 submit_plan 交结构化 plan、每步带可验收 validation。每步 description 一句话简述(尽量 ≤30 字),不写长段落、不堆细节;细节留到执行时或放进 validation";
 const DEFAULT_MODEL: &str = "mock-model";
 
 pub async fn run_single_turn(
@@ -213,7 +215,10 @@ impl Agent {
                 observer.on_tool_call_started(&call.id, &call.name, &call.arguments, readonly);
 
                 if mode == PermissionMode::Plan
-                    && tool.permission_level() != PermissionLevel::ReadOnly
+                    && matches!(
+                        tool.permission_level(),
+                        PermissionLevel::Edit | PermissionLevel::Execute
+                    )
                 {
                     let outcome = ToolOutcome {
                         content: "plan mode forbids non-readonly tools".to_string(),
@@ -250,9 +255,15 @@ impl Agent {
                     observer.on_status(AgentStatus::WaitingForPermission);
                 }
 
-                if gate(&call, tool, self.decider.as_ref()).await == PermissionDecision::Deny {
+                let gate_outcome = gate(&call, tool, self.decider.as_ref()).await;
+                if let PermissionGateOutcome::Deny(denial) = gate_outcome {
                     let outcome = ToolOutcome {
-                        content: "user denied tool execution".to_string(),
+                        content: match denial {
+                            PermissionDenial::UserDenied => {
+                                "user denied tool execution".to_string()
+                            }
+                            PermissionDenial::NetworkUnauthorizable(reason) => reason,
+                        },
                         is_error: true,
                         truncated: false,
                         exit: None,
@@ -330,7 +341,9 @@ mod tests {
     };
     use crate::agent::message::Message;
     use crate::error::{AgentError, ProviderError};
-    use crate::permission::{PermissionDecider, PermissionDecision, PermissionMode};
+    use crate::permission::{
+        PermissionCheck, PermissionDecider, PermissionDecision, PermissionMode,
+    };
     use crate::provider::mock::MockProvider;
     use crate::provider::{
         DeltaSink, Depth, FinishReason, ModelResponse, Provider, ThinkingBlock, ThinkingConfig,
@@ -338,7 +351,11 @@ mod tests {
     };
     use crate::tool::edit::WriteFileTool;
     use crate::tool::plan::{MockPlanApprover, Plan, PlanApprover, PlanDecision, SubmitPlanTool};
-    use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome, ToolRegistry};
+    use crate::tool::web::{WebError, WebFetchTool, WebFetcher, WebSearchTool};
+    use crate::tool::{
+        NetworkPermissionPreview, NetworkPermissionScope, PermissionLevel, Tool, ToolContext,
+        ToolOutcome, ToolRegistry,
+    };
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use std::path::PathBuf;
@@ -636,7 +653,7 @@ mod tests {
 
     #[async_trait]
     impl PermissionDecider for AllowAll {
-        async fn decide(&self, _call: &ToolCall, _tool: &dyn Tool) -> PermissionDecision {
+        async fn decide(&self, _check: PermissionCheck<'_>) -> PermissionDecision {
             PermissionDecision::Allow
         }
     }
@@ -645,7 +662,7 @@ mod tests {
 
     #[async_trait]
     impl PermissionDecider for DenyAll {
-        async fn decide(&self, _call: &ToolCall, _tool: &dyn Tool) -> PermissionDecision {
+        async fn decide(&self, _check: PermissionCheck<'_>) -> PermissionDecision {
             PermissionDecision::Deny
         }
     }
@@ -720,6 +737,97 @@ mod tests {
         executions: Arc<AtomicUsize>,
     }
 
+    struct NetworkTool {
+        preview: NetworkPermissionPreview,
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct CountingFetcher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl WebFetcher for CountingFetcher {
+        async fn fetch(&self, _url: &str) -> Result<String, WebError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("<html></html>".to_string())
+        }
+
+        fn permission_scope(&self) -> NetworkPermissionScope {
+            NetworkPermissionScope {
+                max_redirects: 0,
+                may_cross_origin: false,
+                ssrf_each_hop: false,
+            }
+        }
+    }
+
+    impl NetworkTool {
+        fn authorizable(executions: Arc<AtomicUsize>) -> Self {
+            Self {
+                preview: NetworkPermissionPreview {
+                    authorizable: true,
+                    full_args: json!({ "url": "https://example.com" }),
+                    canonical_initial_target: Some("https://example.com/".to_string()),
+                    scope: Some(NetworkPermissionScope {
+                        max_redirects: 3,
+                        may_cross_origin: true,
+                        ssrf_each_hop: true,
+                    }),
+                    denial_reason: None,
+                },
+                executions,
+            }
+        }
+
+        fn reject_only(reason: &str, executions: Arc<AtomicUsize>) -> Self {
+            Self {
+                preview: NetworkPermissionPreview {
+                    authorizable: false,
+                    full_args: json!({ "url": "bad" }),
+                    canonical_initial_target: None,
+                    scope: None,
+                    denial_reason: Some(reason.to_string()),
+                },
+                executions,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for NetworkTool {
+        fn name(&self) -> &str {
+            "network"
+        }
+
+        fn description(&self) -> &str {
+            "Requires network permission"
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Network
+        }
+
+        fn network_permission_preview(&self, _args: &Value) -> NetworkPermissionPreview {
+            self.preview.clone()
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            ToolOutcome {
+                content: "network result".to_string(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            }
+        }
+    }
+
     #[async_trait]
     impl Tool for ConfirmTool {
         fn name(&self) -> &str {
@@ -773,6 +881,24 @@ mod tests {
         registry
             .register(Box::new(ConfirmTool { executions }))
             .unwrap();
+        registry
+    }
+
+    fn registry_with_network_tool(tool: NetworkTool) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(tool)).unwrap();
+        registry
+    }
+
+    fn registry_with_denied_web_tool(name: &str, calls: Arc<AtomicUsize>) -> ToolRegistry {
+        let fetcher = CountingFetcher { calls };
+        let mut registry = ToolRegistry::new();
+        match name {
+            "web_fetch" => registry.register(Box::new(WebFetchTool::new(Box::new(fetcher)))),
+            "web_search" => registry.register(Box::new(WebSearchTool::new(Box::new(fetcher)))),
+            other => panic!("unexpected web tool: {other}"),
+        }
+        .unwrap();
         registry
     }
 
@@ -1100,6 +1226,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_observed_characterizes_network_as_non_readonly_and_reports_denial() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "network-1".to_string(),
+                name: "network".to_string(),
+                arguments: json!({ "url": "bad" }),
+            }]),
+            response("recovered"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry_with_network_tool(NetworkTool::reject_only("invalid target", executions)),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let observer = RecordingObserver::default();
+        let mut history = vec![Message::User("research".to_string())];
+
+        assert_eq!(
+            agent
+                .run_observed(&mut history, &ctx(), &sink, &observer)
+                .await
+                .unwrap(),
+            "recovered"
+        );
+
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ObservedEvent::Status(AgentStatus::CallingModel),
+                ObservedEvent::ToolCallStarted {
+                    readonly: false,
+                    ..
+                },
+                ObservedEvent::Status(AgentStatus::WaitingForPermission),
+                ObservedEvent::ToolCallFinished {
+                    outcome: ToolOutcome { is_error: true, .. },
+                    ..
+                },
+                ObservedEvent::Status(AgentStatus::CallingModel),
+                ObservedEvent::Status(AgentStatus::Idle),
+            ]
+        ));
+    }
+
+    #[tokio::test]
     async fn run_observed_emits_on_usage_when_model_response_has_usage() {
         let first_usage = Usage {
             input_tokens: 100,
@@ -1242,6 +1418,78 @@ mod tests {
                 is_error: true,
                 ..
             } if call_id == "call-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn denied_web_tools_never_call_their_fetcher_and_preserve_user_denial() {
+        for (name, arguments) in [
+            ("web_fetch", json!({ "url": "https://example.com" })),
+            ("web_search", json!({ "query": "rust ownership" })),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(MockProvider::new(vec![
+                tool_response(vec![ToolCall {
+                    id: format!("{name}-1"),
+                    name: name.to_string(),
+                    arguments,
+                }]),
+                response("recovered"),
+            ]));
+            let agent = Agent::new(
+                provider,
+                registry_with_denied_web_tool(name, calls.clone()),
+                Box::new(DenyAll),
+                "mock-model".to_string(),
+                4,
+            );
+            let sink = NoopSink;
+            let mut history = vec![Message::User("research".to_string())];
+
+            assert_eq!(
+                agent.run(&mut history, &ctx(), &sink).await.unwrap(),
+                "recovered"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{name}");
+            assert!(matches!(
+                &history[2],
+                Message::ToolResult { content, is_error: true, .. }
+                    if content == "user denied tool execution"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn yolo_malformed_web_fetch_is_rejected_before_fetching() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "web-fetch-invalid".to_string(),
+                name: "web_fetch".to_string(),
+                arguments: json!({ "url": "http://[invalid" }),
+            }]),
+            response("recovered"),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            registry_with_denied_web_tool("web_fetch", calls.clone()),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        agent.set_permission_mode(Arc::new(Mutex::new(PermissionMode::Yolo)));
+        let sink = NoopSink;
+        let mut history = vec![Message::User("research".to_string())];
+
+        assert_eq!(
+            agent.run(&mut history, &ctx(), &sink).await.unwrap(),
+            "recovered"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            &history[2],
+            Message::ToolResult { content, is_error: true, .. }
+                if content.starts_with("invalid url:")
         ));
     }
 
@@ -1475,6 +1723,103 @@ mod tests {
             .map(|schema| schema.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(tool_names, vec!["echo", "submit_plan"]);
+    }
+
+    #[tokio::test]
+    async fn agent_plan_mode_allows_authorizable_network_tools_after_permission() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "network-1".to_string(),
+                name: "network".to_string(),
+                arguments: json!({ "url": "https://example.com" }),
+            }]),
+            response("done"),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            registry_with_network_tool(NetworkTool::authorizable(executions.clone())),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        agent.set_permission_mode(Arc::new(Mutex::new(PermissionMode::Plan)));
+        let sink = NoopSink;
+        let mut history = vec![Message::User("research".to_string())];
+
+        assert_eq!(
+            agent.run(&mut history, &ctx(), &sink).await.unwrap(),
+            "done"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            &history[2],
+            Message::ToolResult { content, is_error: false, .. } if content == "network result"
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_preserves_network_system_denial_reason_in_history() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "network-1".to_string(),
+                name: "network".to_string(),
+                arguments: json!({ "url": "bad" }),
+            }]),
+            response("recovered"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry_with_network_tool(NetworkTool::reject_only(
+                "invalid network target",
+                executions.clone(),
+            )),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        let sink = NoopSink;
+        let mut history = vec![Message::User("research".to_string())];
+
+        assert_eq!(
+            agent.run(&mut history, &ctx(), &sink).await.unwrap(),
+            "recovered"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            &history[2],
+            Message::ToolResult { content, is_error: true, .. }
+                if content == "invalid network target"
+        ));
+    }
+
+    #[tokio::test]
+    async fn plan_instruction_describes_network_permission_and_validation_without_readonly_web_claim(
+    ) {
+        let mode = Arc::new(Mutex::new(PermissionMode::Plan));
+        let provider = Arc::new(MockProvider::new(vec![response("planning")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            registry_with_echo(),
+            Box::new(AllowAll),
+            "mock-model".to_string(),
+            4,
+        );
+        agent.set_permission_mode(mode);
+        let sink = NoopSink;
+        let mut history = vec![Message::User("plan this".to_string())];
+
+        agent.run(&mut history, &ctx(), &sink).await.unwrap();
+
+        let Message::System(instruction) = &provider.recorded_requests()[0].messages[0] else {
+            panic!("Plan mode must inject a system instruction");
+        };
+        assert!(instruction.contains("Network"));
+        assert!(instruction.contains("Edit"));
+        assert!(instruction.contains("Execute"));
+        assert!(instruction.contains("validation"));
+        assert!(!instruction.contains("只读:read_file/grep/glob/web_*"));
     }
 
     #[tokio::test]

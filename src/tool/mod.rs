@@ -19,6 +19,16 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> Value;
     fn permission_level(&self) -> PermissionLevel;
 
+    fn network_permission_preview(&self, args: &Value) -> NetworkPermissionPreview {
+        NetworkPermissionPreview {
+            authorizable: false,
+            full_args: args.clone(),
+            canonical_initial_target: None,
+            scope: None,
+            denial_reason: Some("network tool does not provide a permission preview".to_string()),
+        }
+    }
+
     fn plan_only(&self) -> bool {
         false
     }
@@ -79,7 +89,10 @@ impl ToolRegistry {
             .iter()
             .filter(|tool| match mode {
                 PermissionMode::Plan => {
-                    tool.permission_level() == PermissionLevel::ReadOnly || tool.plan_only()
+                    matches!(
+                        tool.permission_level(),
+                        PermissionLevel::ReadOnly | PermissionLevel::Network
+                    ) || tool.plan_only()
                 }
                 _ => !tool.plan_only(),
             })
@@ -100,6 +113,22 @@ pub struct ToolOutcome {
     pub exit: Option<i32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkPermissionScope {
+    pub max_redirects: u32,
+    pub may_cross_origin: bool,
+    pub ssrf_each_hop: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkPermissionPreview {
+    pub authorizable: bool,
+    pub full_args: Value,
+    pub canonical_initial_target: Option<String>,
+    pub scope: Option<NetworkPermissionScope>,
+    pub denial_reason: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolContext {
     pub cwd: PathBuf,
@@ -109,6 +138,7 @@ pub struct ToolContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PermissionLevel {
     ReadOnly,
+    Network,
     Edit,
     Execute,
 }
@@ -308,6 +338,13 @@ mod tests {
             .unwrap();
         registry
             .register(Box::new(mock_tool(
+                "network_tool",
+                "Network tool",
+                PermissionLevel::Network,
+            )))
+            .unwrap();
+        registry
+            .register(Box::new(mock_tool(
                 "edit_tool",
                 "Edit tool",
                 PermissionLevel::Edit,
@@ -333,7 +370,20 @@ mod tests {
     }
 
     #[test]
-    fn schemas_for_plan_includes_readonly_and_plan_only_preserving_order() {
+    fn default_network_preview_is_reject_only_with_a_reason() {
+        let args = json!({ "url": "https://example.com" });
+        let tool = mock_tool("network_tool", "Network tool", PermissionLevel::Network);
+        let preview = tool.network_permission_preview(&args);
+
+        assert!(!preview.authorizable);
+        assert!(preview
+            .denial_reason
+            .is_some_and(|reason| !reason.is_empty()));
+        assert_eq!(preview.full_args, args);
+    }
+
+    #[test]
+    fn schemas_for_plan_includes_readonly_network_and_plan_only_preserving_order() {
         let registry = registry_with_mixed_tools();
         let schemas = registry.schemas_for(PermissionMode::Plan);
 
@@ -342,7 +392,7 @@ mod tests {
                 .iter()
                 .map(|schema| schema.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["read_tool", "submit_plan"]
+            vec!["read_tool", "network_tool", "submit_plan"]
         );
     }
 
@@ -361,7 +411,7 @@ mod tests {
                     .iter()
                     .map(|schema| schema.name.as_str())
                     .collect::<Vec<_>>(),
-                vec!["read_tool", "edit_tool", "exec_tool"],
+                vec!["read_tool", "network_tool", "edit_tool", "exec_tool"],
                 "mode={mode:?}"
             );
         }
@@ -370,14 +420,20 @@ mod tests {
     #[test]
     fn schemas_unchanged_when_not_filtering_by_mode() {
         let registry = registry_with_mixed_tools();
-        assert_eq!(registry.schemas().len(), 4);
+        assert_eq!(registry.schemas().len(), 5);
         assert_eq!(
             registry
                 .schemas()
                 .iter()
                 .map(|schema| schema.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["read_tool", "edit_tool", "exec_tool", "submit_plan"]
+            vec![
+                "read_tool",
+                "network_tool",
+                "edit_tool",
+                "exec_tool",
+                "submit_plan"
+            ]
         );
     }
 }

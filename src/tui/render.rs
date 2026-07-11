@@ -10,6 +10,7 @@ use crate::tui::input_layout::{
 };
 use crate::tui::jump_to_bottom::jump_to_bottom_pill_text;
 use crate::tui::markdown::render_markdown;
+use crate::tui::permission::network_permission_layout;
 use crate::tui::selection::{col_range_for_row, Selection};
 use crate::tui::theme::Theme;
 use crate::tui::width::{char_width, display_width, truncate_text_to_width};
@@ -41,6 +42,13 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
         Block::default().style(Style::default().bg(theme.bg_base)),
         area,
     );
+
+    if state.pending_permission.as_ref().is_some_and(|request| {
+        request.permission_level == crate::tool::PermissionLevel::Network && area.height < 12
+    }) {
+        render_permission(frame, area, state, theme);
+        return;
+    }
 
     let rows = layout_rows(area, state);
     let mut next_row = 5usize;
@@ -127,6 +135,12 @@ fn active_plan_is_folded(state: &AppState) -> bool {
 fn transcript_min_height(state: &AppState) -> u16 {
     if state.pending_plan_approval.is_some() || state.pending_question.is_some() {
         0
+    } else if state
+        .pending_permission
+        .as_ref()
+        .is_some_and(|request| request.permission_level == crate::tool::PermissionLevel::Network)
+    {
+        3
     } else {
         8
     }
@@ -244,6 +258,9 @@ fn status_top_gap_height(state: &AppState) -> u16 {
 
 fn permission_height(state: &AppState) -> u16 {
     if let Some(request) = &state.pending_permission {
+        if request.permission_level == crate::tool::PermissionLevel::Network {
+            return 12;
+        }
         let diff_rows = compute_diff(&request.tool_name, &request.args).len() as u16;
         return 7 + diff_rows;
     }
@@ -1174,6 +1191,10 @@ fn render_permission(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
     let Some(request) = &state.pending_permission else {
         return;
     };
+    if request.permission_level == crate::tool::PermissionLevel::Network {
+        render_network_permission(frame, area, state, theme, request);
+        return;
+    }
     let mut lines = vec![
         Line::from(Span::styled(
             "▲ 需要授权",
@@ -1261,6 +1282,79 @@ fn render_permission(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme:
         )),
     ]);
 
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.warning_fg).bg(theme.warning_bg))
+                .style(Style::default().fg(theme.text_primary).bg(theme.warning_bg)),
+        )
+        .style(Style::default().fg(theme.text_primary).bg(theme.warning_bg));
+    frame.render_widget(paragraph, area);
+}
+
+fn render_network_permission(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    request: &crate::tui::channel::PermissionRequest,
+) {
+    let Some(preview) = request.network_preview.as_ref() else {
+        return;
+    };
+    let layout = network_permission_layout(area, preview, state.permission_barrier.scroll);
+    if area.height < 12 {
+        let lines = vec![
+            Line::from(Span::styled(
+                "▲ 需要网络授权",
+                Style::default()
+                    .fg(theme.warning_fg)
+                    .bg(theme.warning_bg)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("tool: {}", request.tool_name)),
+            Line::from("终端过小"),
+            Line::from("不可检查 · 仅拒绝"),
+            Line::from("[n · 拒绝]"),
+        ];
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.warning_fg).bg(theme.warning_bg))
+                    .style(Style::default().fg(theme.text_primary).bg(theme.warning_bg)),
+            )
+            .style(Style::default().fg(theme.text_primary).bg(theme.warning_bg));
+        frame.render_widget(paragraph, area);
+        return;
+    }
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "▲ 需要网络授权",
+            Style::default()
+                .fg(theme.warning_fg)
+                .bg(theme.warning_bg)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!("tool: {}", request.tool_name)),
+    ];
+    lines.extend(
+        layout.lines[layout.visible_range]
+            .iter()
+            .cloned()
+            .map(Line::from),
+    );
+    if let Some(hint) = layout.position_hint {
+        lines.push(Line::from(hint));
+    }
+    if layout.can_allow {
+        lines.push(Line::from("[y · 允许本次]   [n · 拒绝]"));
+        lines.push(Line::from("提示:Enter = 允许 · Esc = 拒绝"));
+    } else {
+        lines.push(Line::from("[n · 拒绝]"));
+        lines.push(Line::from("此请求不可允许 · Esc = 拒绝"));
+    }
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
@@ -4871,10 +4965,139 @@ mod tests {
                 "old_string": "    pub max_iterations: u32,",
                 "new_string": "    pub timeout_secs: u64,"
             }),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: tx,
         }));
         state
+    }
+
+    fn network_permission_state(authorizable: bool) -> AppState {
+        let (tx, _rx) = oneshot::channel();
+        let mut state = AppState::new();
+        let preview = crate::tool::NetworkPermissionPreview {
+            authorizable,
+            full_args: json!({ "query": "Rust \u{202e}安全 & 网络权限" }),
+            canonical_initial_target: authorizable
+                .then(|| "https://html.duckduckgo.com/html/?q=Rust+%E5%AE%89%E5%85%A8".to_string()),
+            scope: authorizable.then_some(crate::tool::NetworkPermissionScope {
+                max_redirects: 3,
+                may_cross_origin: true,
+                ssrf_each_hop: true,
+            }),
+            denial_reason: (!authorizable).then(|| "invalid URL".to_string()),
+        };
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "web_search".to_string(),
+            args: preview.full_args.clone(),
+            permission_level: crate::tool::PermissionLevel::Network,
+            network_preview: Some(preview),
+            allow_always_key: None,
+            responder: tx,
+        }));
+        state
+    }
+
+    fn network_web_fetch_permission_state() -> AppState {
+        let (tx, _rx) = oneshot::channel();
+        let mut state = AppState::new();
+        let url = format!(
+            "https://example.com/research/{}?visible=安全&bidi=\u{202e}&zero=\u{200b}&literal=\\u{{202E}}&tail=LAST",
+            "long-segment/".repeat(2)
+        );
+        let canonical_target = reqwest::Url::parse(&url).unwrap().to_string();
+        let preview = crate::tool::NetworkPermissionPreview {
+            authorizable: true,
+            full_args: json!({ "url": url }),
+            canonical_initial_target: Some(canonical_target),
+            scope: Some(crate::tool::NetworkPermissionScope {
+                max_redirects: 3,
+                may_cross_origin: true,
+                ssrf_each_hop: true,
+            }),
+            denial_reason: None,
+        };
+        state.apply(AgentEvent::PermissionRequired(PermissionRequest {
+            tool_name: "web_fetch".to_string(),
+            args: preview.full_args.clone(),
+            permission_level: crate::tool::PermissionLevel::Network,
+            network_preview: Some(preview),
+            allow_always_key: None,
+            responder: tx,
+        }));
+        state
+    }
+
+    #[test]
+    fn network_permission_render_shows_safe_scope_and_reject_only_action_set() {
+        let valid =
+            render_to_styled_with_size(&network_permission_state(true), &Theme::midnight(), 80, 24);
+        assert!(valid.contains("需要网络授权"));
+        assert!(valid.contains("max_redirects"), "{valid}");
+        assert!(valid.contains("=3"));
+        assert!(valid.contains("\\u{202E}"));
+        assert!(valid.contains("允许本次"));
+        assert!(!valid.contains("总是允许"));
+
+        let rejected = render_to_styled_with_size(
+            &network_permission_state(false),
+            &Theme::midnight(),
+            80,
+            24,
+        );
+        assert!(rejected.contains("reject-only"));
+        assert!(rejected.contains("invalid URL"));
+        assert!(!rejected.contains("允许本次"));
+        assert!(rejected.contains("拒绝"));
+    }
+
+    #[test]
+    fn network_permission_midnight_web_fetch_first_snapshot_candidate() {
+        let first = network_web_fetch_permission_state();
+        insta::assert_snapshot!(
+            "network_permission_midnight_web_fetch_first",
+            render_to_styled_with_size(&first, &Theme::midnight(), 160, 24)
+        );
+    }
+
+    #[test]
+    fn network_permission_midnight_web_fetch_last_snapshot_candidate() {
+        let mut last = network_web_fetch_permission_state();
+        last.permission_barrier.scroll = usize::MAX;
+        insta::assert_snapshot!(
+            "network_permission_midnight_web_fetch_last",
+            render_to_styled_with_size(&last, &Theme::midnight(), 40, 24)
+        );
+    }
+
+    #[test]
+    fn network_permission_midnight_reject_only_snapshot_candidate() {
+        insta::assert_snapshot!(
+            "network_permission_midnight_reject_only",
+            render_to_styled_with_size(
+                &network_permission_state(false),
+                &Theme::midnight(),
+                80,
+                24
+            )
+        );
+    }
+
+    #[test]
+    fn network_permission_midnight_small_terminal_snapshot_candidate() {
+        insta::assert_snapshot!(
+            "network_permission_midnight_small_terminal",
+            render_to_styled_with_size(&network_permission_state(true), &Theme::midnight(), 20, 8)
+        );
+    }
+
+    #[test]
+    fn network_permission_daylight_web_search_snapshot_candidate() {
+        insta::assert_snapshot!(
+            "network_permission_daylight_web_search",
+            render_to_styled_with_size(&network_permission_state(true), &Theme::daylight(), 80, 24)
+        );
     }
 
     fn command_permission_state() -> AppState {
@@ -4886,6 +5109,8 @@ mod tests {
         state.apply(AgentEvent::PermissionRequired(PermissionRequest {
             tool_name: "run_shell".to_string(),
             args: json!({ "command": "cargo test --lib" }),
+            permission_level: crate::tool::PermissionLevel::Execute,
+            network_preview: None,
             allow_always_key: Some("cargo test --lib".to_string()),
             responder: tx,
         }));
@@ -4905,6 +5130,8 @@ mod tests {
                 "path": "src/generated-long-diff.txt",
                 "content": content
             }),
+            permission_level: crate::tool::PermissionLevel::Edit,
+            network_preview: None,
             allow_always_key: None,
             responder: tx,
         }));

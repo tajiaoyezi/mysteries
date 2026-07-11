@@ -1,0 +1,87 @@
+## MODIFIED Requirements
+
+### Requirement: 工具抽象与注册表
+
+系统 SHALL 定义 `Tool` trait(`name` / `description` / `schema` / `permission_level` / `network_permission_preview(args)` / `execute(args, ctx) -> ToolOutcome`,async,dyn 安全)、`ToolRegistry`(按名注册与查找)、`ToolOutcome{content, is_error, truncated}`、`ToolContext{cwd, max_output_bytes}`、`PermissionLevel{ReadOnly, Network, Edit, Execute}`。`ReadOnly` 表该工具不产生需 Tool permission gate 授权的外部网络、文件写入或进程执行,因而可由权限门直接放行；交互 / 计划工具仍可通过各自 seam 发起用户交互或更新计划状态。`Network` 表工具执行会产生外部网络活动(不含 Agent 与 Provider 之间的模型协议 transport)；`Edit` 表文件改动类工具(写 / 编辑)；`Execute` 表命令执行类工具(shell)。Network 仅在 preview authorizable 后进入 mode matrix；有效 Network、Edit、Execute 在 `Normal` 均需确认，`AcceptEdits` 仅自动放行 Edit，`Yolo` 自动放行有效 Network / Edit / Execute；不可授权 Network 在所有 mode 下拒绝(详见 permission-gate)。该 enum 不是通用 effect / concurrency taxonomy。
+
+#### Scenario: 注册与按名分发
+
+- **WHEN** 向 registry 注册一个 mock `Tool` 并以其 `name` 查找
+- **THEN** 取得该 tool,可对其 `execute` 得到 `ToolOutcome`
+
+#### Scenario: 按名查找未注册工具
+
+- **WHEN** 以一个未注册的名字查找 registry
+- **THEN** 返回「不存在」(None),不 panic
+
+#### Scenario: 工具声明四类权限级别
+
+- **WHEN** 查询本地文件读取 / 搜索类工具的 `permission_level`
+- **THEN** 返回 `ReadOnly`
+- **WHEN** 查询 `web_fetch` / `web_search` 的 `permission_level`
+- **THEN** 返回 `Network`
+- **WHEN** 查询文件写 / 编辑类工具的 `permission_level`
+- **THEN** 返回 `Edit`
+- **WHEN** 查询命令执行类工具(shell)的 `permission_level`
+- **THEN** 返回 `Execute`
+
+#### Scenario: Provider transport 不属于工具 Network 权限
+
+- **WHEN** Agent 为一次模型推理调用已配置的 Provider HTTP transport
+- **THEN** 该 transport 不经过 Tool permission gate；只有 `Tool::execute` 诱发的外部网络活动声明为 `Network`
+
+#### Scenario: 交互与计划工具保持 ReadOnly
+
+- **WHEN** 查询 `submit_plan` / `update_plan` / `ask_user` 的 `permission_level`
+- **THEN** 三者仍返回 `ReadOnly`；其审批、内存计划更新或用户交互由各自 seam 管理,不因新增 Network 改 level
+
+### Requirement: Tool::plan_only 与 mode-aware schema 下发(schema-omit)
+
+`Tool` SHALL 提供 `fn plan_only(&self) -> bool`(default `false`);标记「仅 Plan 模式有意义」的工具(如 `submit_plan`)override 为 `true`。`ToolRegistry` SHALL 提供 `schemas_for(mode: PermissionMode) -> Vec<schema>`:
+- **`Plan` 模式**:仅含 `permission_level()==ReadOnly || permission_level()==Network || plan_only()` 的工具(本地只读研究工具 + 需授权的网络研究工具 + plan_only 工具),摘掉 `Edit` / `Execute` 类(schema-omit)。
+- **非 `Plan` 模式**:仅含 `!plan_only()` 的工具(全部除 plan_only 类——plan_only 工具在别模式无意义、不下发),其中包含 `Network`。
+
+两路 MUST 维持既有插入顺序。既有 `schemas()`(不分 mode)行为 MUST 不变(behavior-preserving)。`plan_only` 默认与 `schemas_for` 过滤为 headless 纯逻辑,强制 TDD。
+
+#### Scenario: Plan 模式摘变更类、留 ReadOnly + Network + plan_only
+
+- **WHEN** registry 依次含 ReadOnly / Network / Edit / Execute / plan_only 各一,取 `schemas_for(Plan)`
+- **THEN** 仅含 ReadOnly / Network / plan_only 三项(Edit/Execute 被摘),顺序保持
+
+#### Scenario: 非 Plan 模式摘 plan_only、保留 Network
+
+- **WHEN** 取 `schemas_for(Normal)`(或 AcceptEdits / Yolo)
+- **THEN** 含 ReadOnly / Network / Edit / Execute,不含 plan_only 项,顺序保持
+
+#### Scenario: plan_only 默认 false
+
+- **WHEN** 查一个未 override 的普通工具的 `plan_only()`
+- **THEN** 为 `false`
+
+## ADDED Requirements
+
+### Requirement: Network preview 由工具拥有且默认不可授权
+
+系统 SHALL 定义结构化 `NetworkPermissionPreview{authorizable, full_args, canonical_initial_target, scope, denial_reason}`；其中 scope 至少表达 `max_redirects`、`may_cross_origin` 与 `ssrf_each_hop`。`authorizable=true` 时 canonical target / scope MUST 存在且 denial reason 为空；`authorizable=false` 时 denial reason MUST 非空，target / scope 不得被用于 Allow。`Tool::network_permission_preview(args)` MUST 为纯函数、确定性且零 DNS / HTTP / `WebFetcher`；default MUST 返回 `authorizable=false` 与 generic full args / 不可授权原因。generic fallback 仅用于解释拒绝,不得获得 Allow。
+
+只有 Network 工具的专用实现成功解析必要参数、能确定 execute 将使用的 canonical initial target，且 scope 与 transport 的真实常量同源时，才可返回 `authorizable=true`。permission-gate、TUI 与 CLI MUST 消费该结构，不得按 tool name 重建 URL、DDG endpoint 或 redirect scope。非 Network 工具不因 default preview 改变既有行为。
+
+#### Scenario: 未 override 的 Network 工具默认不可授权
+
+- **WHEN** 一个声明 `PermissionLevel::Network` 的 mock Tool 未 override `network_permission_preview`
+- **THEN** preview 为 `authorizable=false`,保留 terminal-safe 格式化所需的 full args 与原因,不得成为可授权 generic preview
+
+#### Scenario: 畸形必要参数产生不可授权 preview
+
+- **WHEN** 专用 Network 工具收到缺失、类型错误或无法确定 canonical target 的必要参数
+- **THEN** preview 为 `authorizable=false`、零 DNS / HTTP / WebFetcher,并携不可授权原因
+
+#### Scenario: 专用 preview 可授权且不执行网络
+
+- **WHEN** 专用 Network 工具收到合法参数并调用 `network_permission_preview`
+- **THEN** 返回 `authorizable=true`、canonical initial target 与真实 scope,且此过程不调用 execute / DNS / HTTP / WebFetcher
+
+#### Scenario: 非 Network 工具不受 preview 默认值影响
+
+- **WHEN** ReadOnly / Edit / Execute 工具沿用 default preview
+- **THEN** 其既有 gate、mode 与执行行为不变；default 不可授权语义只约束 PermissionLevel::Network

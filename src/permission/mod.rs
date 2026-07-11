@@ -1,12 +1,32 @@
 use crate::provider::ToolCall;
-use crate::tool::{PermissionLevel, Tool};
+use crate::tool::{NetworkPermissionPreview, PermissionLevel, Tool};
 use async_trait::async_trait;
 use std::collections::BTreeSet;
+
+pub mod preview;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
     Deny,
+}
+
+pub struct PermissionCheck<'a> {
+    pub call: &'a ToolCall,
+    pub tool: &'a dyn Tool,
+    pub network_preview: Option<&'a NetworkPermissionPreview>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionDenial {
+    UserDenied,
+    NetworkUnauthorizable(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionGateOutcome {
+    Allow,
+    Deny(PermissionDenial),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +92,11 @@ pub enum PermissionMode {
 
 pub fn auto_allows(mode: PermissionMode, level: PermissionLevel) -> bool {
     match (mode, level) {
+        (PermissionMode::Yolo, PermissionLevel::Network) => true,
+        (
+            PermissionMode::Normal | PermissionMode::AcceptEdits | PermissionMode::Plan,
+            PermissionLevel::Network,
+        ) => false,
         (PermissionMode::Normal, PermissionLevel::Edit | PermissionLevel::Execute) => false,
         (PermissionMode::AcceptEdits, PermissionLevel::Edit) => true,
         (PermissionMode::AcceptEdits, PermissionLevel::Execute) => false,
@@ -101,32 +126,98 @@ pub fn permission_mode_label(mode: PermissionMode) -> &'static str {
 
 #[async_trait]
 pub trait PermissionDecider: Send + Sync {
-    async fn decide(&self, call: &ToolCall, tool: &dyn Tool) -> PermissionDecision;
+    async fn decide(&self, check: PermissionCheck<'_>) -> PermissionDecision;
 }
 
 pub async fn gate(
     call: &ToolCall,
     tool: &dyn Tool,
     decider: &dyn PermissionDecider,
-) -> PermissionDecision {
+) -> PermissionGateOutcome {
     match tool.permission_level() {
-        PermissionLevel::ReadOnly => PermissionDecision::Allow,
-        PermissionLevel::Edit | PermissionLevel::Execute => decider.decide(call, tool).await,
+        PermissionLevel::ReadOnly => PermissionGateOutcome::Allow,
+        PermissionLevel::Network => {
+            let preview = tool.network_permission_preview(&call.arguments);
+            let denial_reason = network_preview_denial_reason(&preview);
+            let decision = decider
+                .decide(PermissionCheck {
+                    call,
+                    tool,
+                    network_preview: Some(&preview),
+                })
+                .await;
+
+            match (denial_reason, decision) {
+                (Some(reason), _) => {
+                    PermissionGateOutcome::Deny(PermissionDenial::NetworkUnauthorizable(reason))
+                }
+                (None, PermissionDecision::Allow) => PermissionGateOutcome::Allow,
+                (None, PermissionDecision::Deny) => {
+                    PermissionGateOutcome::Deny(PermissionDenial::UserDenied)
+                }
+            }
+        }
+        PermissionLevel::Edit | PermissionLevel::Execute => {
+            match decider
+                .decide(PermissionCheck {
+                    call,
+                    tool,
+                    network_preview: None,
+                })
+                .await
+            {
+                PermissionDecision::Allow => PermissionGateOutcome::Allow,
+                PermissionDecision::Deny => {
+                    PermissionGateOutcome::Deny(PermissionDenial::UserDenied)
+                }
+            }
+        }
     }
+}
+
+fn network_preview_denial_reason(preview: &NetworkPermissionPreview) -> Option<String> {
+    if !preview.authorizable {
+        return Some(
+            preview
+                .denial_reason
+                .clone()
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or_else(|| "network preview is not authorizable".to_string()),
+        );
+    }
+
+    if preview.canonical_initial_target.is_none() {
+        return Some("network preview is missing a canonical initial target".to_string());
+    }
+
+    if preview.scope.is_none() {
+        return Some("network preview is missing a permission scope".to_string());
+    }
+
+    preview
+        .denial_reason
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+        .map(|_| "authorizable network preview contains a denial reason".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         auto_allows, cycle_permission_mode, gate, normalize, permission_mode_label,
-        PermissionDecider, PermissionDecision, PermissionMode, PolicyEngine,
+        PermissionCheck, PermissionDecider, PermissionDecision, PermissionDenial,
+        PermissionGateOutcome, PermissionMode, PolicyEngine,
     };
     use crate::provider::ToolCall;
-    use crate::tool::{PermissionLevel, Tool, ToolContext, ToolOutcome};
+    use crate::tool::{
+        NetworkPermissionPreview, NetworkPermissionScope, PermissionLevel, Tool, ToolContext,
+        ToolOutcome,
+    };
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     struct MockTool {
         permission_level: PermissionLevel,
@@ -160,6 +251,57 @@ mod tests {
         }
     }
 
+    struct PreviewTool {
+        preview: NetworkPermissionPreview,
+        preview_calls: AtomicUsize,
+    }
+
+    impl PreviewTool {
+        fn new(preview: NetworkPermissionPreview) -> Self {
+            Self {
+                preview,
+                preview_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn preview_calls(&self) -> usize {
+            self.preview_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for PreviewTool {
+        fn name(&self) -> &str {
+            "network_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Network tool"
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Network
+        }
+
+        fn network_permission_preview(&self, _args: &Value) -> NetworkPermissionPreview {
+            self.preview_calls.fetch_add(1, Ordering::SeqCst);
+            self.preview.clone()
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
+            ToolOutcome {
+                content: "ok".to_string(),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            }
+        }
+    }
+
     struct StaticDecider {
         decision: PermissionDecision,
         calls: AtomicUsize,
@@ -180,10 +322,47 @@ mod tests {
 
     #[async_trait]
     impl PermissionDecider for StaticDecider {
-        async fn decide(&self, call: &ToolCall, tool: &dyn Tool) -> PermissionDecision {
+        async fn decide(&self, check: PermissionCheck<'_>) -> PermissionDecision {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(call.name, "mock_tool");
-            assert_eq!(tool.name(), "mock_tool");
+            assert_eq!(check.call.name, "mock_tool");
+            assert_eq!(check.tool.name(), "mock_tool");
+            self.decision.clone()
+        }
+    }
+
+    struct RecordingDecider {
+        decision: PermissionDecision,
+        calls: AtomicUsize,
+        seen_preview: Mutex<Option<NetworkPermissionPreview>>,
+    }
+
+    impl RecordingDecider {
+        fn new(decision: PermissionDecision) -> Self {
+            Self {
+                decision,
+                calls: AtomicUsize::new(0),
+                seen_preview: Mutex::new(None),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn seen_preview(&self) -> Option<NetworkPermissionPreview> {
+            self.seen_preview
+                .lock()
+                .expect("preview mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl PermissionDecider for RecordingDecider {
+        async fn decide(&self, check: PermissionCheck<'_>) -> PermissionDecision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.seen_preview.lock().expect("preview mutex poisoned") =
+                check.network_preview.cloned();
             self.decision.clone()
         }
     }
@@ -201,6 +380,47 @@ mod tests {
             id: "call-command".to_string(),
             name: "mock_tool".to_string(),
             arguments: json!({ "command": command }),
+        }
+    }
+
+    fn network_call() -> ToolCall {
+        ToolCall {
+            id: "call-network".to_string(),
+            name: "network_tool".to_string(),
+            arguments: json!({ "url": "https://example.com" }),
+        }
+    }
+
+    fn authorizable_preview() -> NetworkPermissionPreview {
+        NetworkPermissionPreview {
+            authorizable: true,
+            full_args: json!({ "url": "https://example.com" }),
+            canonical_initial_target: Some("https://example.com/".to_string()),
+            scope: Some(NetworkPermissionScope {
+                max_redirects: 3,
+                may_cross_origin: true,
+                ssrf_each_hop: true,
+            }),
+            denial_reason: None,
+        }
+    }
+
+    fn unauthorizable_preview(reason: &str) -> NetworkPermissionPreview {
+        NetworkPermissionPreview {
+            authorizable: false,
+            full_args: json!({ "url": "not-a-url" }),
+            canonical_initial_target: None,
+            scope: None,
+            denial_reason: Some(reason.to_string()),
+        }
+    }
+
+    fn assert_network_unauthorizable(outcome: PermissionGateOutcome) {
+        match outcome {
+            PermissionGateOutcome::Deny(PermissionDenial::NetworkUnauthorizable(reason)) => {
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected NetworkUnauthorizable, got {other:?}"),
         }
     }
 
@@ -233,6 +453,9 @@ mod tests {
         let execute_tool = MockTool {
             permission_level: PermissionLevel::Execute,
         };
+        let network_tool = MockTool {
+            permission_level: PermissionLevel::Network,
+        };
 
         assert_eq!(
             PolicyEngine::permission_key(&command_call(json!("git status")), &edit_tool),
@@ -250,6 +473,19 @@ mod tests {
         assert_eq!(
             PolicyEngine::permission_key(&command_call(json!("   ")), &execute_tool),
             None
+        );
+        assert_eq!(
+            PolicyEngine::permission_key(
+                &command_call(json!("curl https://example.com")),
+                &network_tool
+            ),
+            None
+        );
+        assert!(
+            !PolicyEngine::from_commands(["curl https://example.com"]).is_allowed(
+                &command_call(json!("curl https://example.com")),
+                &network_tool
+            )
         );
     }
 
@@ -295,7 +531,7 @@ mod tests {
 
         let decision = gate(&call(), &tool, &decider).await;
 
-        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(decision, PermissionGateOutcome::Allow);
         assert_eq!(decider.calls(), 0);
     }
 
@@ -310,11 +546,123 @@ mod tests {
 
             assert_eq!(
                 gate(&call(), &tool, &allow).await,
-                PermissionDecision::Allow
+                PermissionGateOutcome::Allow
             );
             assert_eq!(allow.calls(), 1);
-            assert_eq!(gate(&call(), &tool, &deny).await, PermissionDecision::Deny);
+            assert_eq!(
+                gate(&call(), &tool, &deny).await,
+                PermissionGateOutcome::Deny(PermissionDenial::UserDenied)
+            );
             assert_eq!(deny.calls(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_passes_no_network_preview_for_edit_and_execute() {
+        for level in [PermissionLevel::Edit, PermissionLevel::Execute] {
+            let tool = MockTool {
+                permission_level: level,
+            };
+            let decider = RecordingDecider::new(PermissionDecision::Allow);
+
+            assert_eq!(
+                gate(&call(), &tool, &decider).await,
+                PermissionGateOutcome::Allow
+            );
+            assert_eq!(decider.calls(), 1);
+            assert_eq!(decider.seen_preview(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn network_gate_forwards_one_authorizable_preview_to_decider() {
+        let preview = authorizable_preview();
+        let tool = PreviewTool::new(preview.clone());
+        let decider = RecordingDecider::new(PermissionDecision::Allow);
+
+        let outcome = gate(&network_call(), &tool, &decider).await;
+
+        assert_eq!(decider.calls(), 1);
+        assert_eq!(tool.preview_calls(), 1);
+        assert_eq!(decider.seen_preview(), Some(preview));
+        assert_eq!(outcome, PermissionGateOutcome::Allow);
+    }
+
+    #[tokio::test]
+    async fn network_gate_preserves_user_denial_for_authorizable_preview() {
+        let tool = PreviewTool::new(authorizable_preview());
+        let decider = RecordingDecider::new(PermissionDecision::Deny);
+
+        let outcome = gate(&network_call(), &tool, &decider).await;
+
+        assert_eq!(
+            outcome,
+            PermissionGateOutcome::Deny(PermissionDenial::UserDenied)
+        );
+        assert_eq!(decider.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn network_gate_preserves_unauthorizable_reason_regardless_of_decider_result() {
+        for decision in [PermissionDecision::Allow, PermissionDecision::Deny] {
+            let preview = unauthorizable_preview("invalid URL");
+            let tool = PreviewTool::new(preview.clone());
+            let decider = RecordingDecider::new(decision);
+
+            let outcome = gate(&network_call(), &tool, &decider).await;
+
+            assert_eq!(
+                outcome,
+                PermissionGateOutcome::Deny(PermissionDenial::NetworkUnauthorizable(
+                    "invalid URL".to_string()
+                ))
+            );
+            assert_eq!(decider.calls(), 1);
+            assert_eq!(decider.seen_preview(), Some(preview));
+            assert_eq!(tool.preview_calls(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn network_gate_rejects_malformed_authorizable_preview() {
+        for preview in [
+            NetworkPermissionPreview {
+                authorizable: true,
+                full_args: json!({ "url": "https://example.com" }),
+                canonical_initial_target: None,
+                scope: Some(NetworkPermissionScope {
+                    max_redirects: 3,
+                    may_cross_origin: true,
+                    ssrf_each_hop: true,
+                }),
+                denial_reason: None,
+            },
+            NetworkPermissionPreview {
+                authorizable: true,
+                full_args: json!({ "url": "https://example.com" }),
+                canonical_initial_target: Some("https://example.com/".to_string()),
+                scope: None,
+                denial_reason: None,
+            },
+            NetworkPermissionPreview {
+                authorizable: true,
+                full_args: json!({ "url": "https://example.com" }),
+                canonical_initial_target: Some("https://example.com/".to_string()),
+                scope: Some(NetworkPermissionScope {
+                    max_redirects: 3,
+                    may_cross_origin: true,
+                    ssrf_each_hop: true,
+                }),
+                denial_reason: Some("unexpected reason".to_string()),
+            },
+        ] {
+            let tool = PreviewTool::new(preview.clone());
+            let decider = RecordingDecider::new(PermissionDecision::Allow);
+
+            assert_network_unauthorizable(gate(&network_call(), &tool, &decider).await);
+            assert_eq!(decider.calls(), 1);
+            assert_eq!(decider.seen_preview(), Some(preview));
+            assert_eq!(tool.preview_calls(), 1);
         }
     }
 
@@ -322,6 +670,10 @@ mod tests {
 
     #[test]
     fn auto_allows_normal_mode_never_auto_allows_edit_or_execute() {
+        assert!(!auto_allows(
+            PermissionMode::Normal,
+            PermissionLevel::Network
+        ));
         assert!(!auto_allows(PermissionMode::Normal, PermissionLevel::Edit));
         assert!(!auto_allows(
             PermissionMode::Normal,
@@ -331,6 +683,10 @@ mod tests {
 
     #[test]
     fn auto_allows_accept_edits_mode_allows_edit_not_execute() {
+        assert!(!auto_allows(
+            PermissionMode::AcceptEdits,
+            PermissionLevel::Network
+        ));
         assert!(auto_allows(
             PermissionMode::AcceptEdits,
             PermissionLevel::Edit
@@ -345,10 +701,12 @@ mod tests {
     fn auto_allows_yolo_mode_allows_edit_and_execute() {
         assert!(auto_allows(PermissionMode::Yolo, PermissionLevel::Edit));
         assert!(auto_allows(PermissionMode::Yolo, PermissionLevel::Execute));
+        assert!(auto_allows(PermissionMode::Yolo, PermissionLevel::Network));
     }
 
     #[test]
     fn auto_allows_plan_mode_never_auto_allows_edit_or_execute() {
+        assert!(!auto_allows(PermissionMode::Plan, PermissionLevel::Network));
         assert!(!auto_allows(PermissionMode::Plan, PermissionLevel::Edit));
         assert!(!auto_allows(PermissionMode::Plan, PermissionLevel::Execute));
         assert!(!auto_allows(

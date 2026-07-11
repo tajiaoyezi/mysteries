@@ -1,0 +1,12 @@
+---
+source: src/tui/render.rs
+expression: "render_to_styled_with_size(&network_permission_state(true),\n&Theme::midnight(), 20, 8)"
+---
+‹warning.fg bg=warning.bg›┌──────────────────┐‹/›
+‹warning.fg bg=warning.bg›│‹/›‹warning.fg bg=warning.bg +bold›▲ 需要网络授权‹/›‹text.primary bg=warning.bg›    ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›tool: web_search  ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›终端过小          ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›不可检查 · 仅拒绝 ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›[n · 拒绝]        ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›│‹/›‹text.primary bg=warning.bg›                  ‹/›‹warning.fg bg=warning.bg›│‹/›
+‹warning.fg bg=warning.bg›└──────────────────┘‹/›
