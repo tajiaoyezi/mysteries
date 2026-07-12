@@ -58,4 +58,4 @@
 - [x] 10.2 按 `manual-verification.md` 完成 locked 依赖树验证；用户亲测或经用户显式委托的实施 agent 均可依据真实输出勾选，通过前不得提交/推送。
 - [x] 10.3 运行已通过 7.3 的 release binary 完成 markdown 真机冒烟；用户亲测或经用户显式委托且实际观察 TUI 的实施 agent 均可勾选，通过前不得提交/推送。
 - [x] 10.4 PR 上独立 `security-audit` job 首次 green；通过前不得 merge。
-- [ ] 10.5 合入后在 `master` 上 `workflow_dispatch` 仍 green；通过前不得 archive。
+- [x] 10.5 合入后在 `master` 上 `workflow_dispatch` 仍 green；通过前不得 archive。
