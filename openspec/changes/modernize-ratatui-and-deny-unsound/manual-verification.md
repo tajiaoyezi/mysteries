@@ -132,9 +132,20 @@ CREDENTIALS_UNCHANGED：True（用户确认）
 失败项与复现步骤：无
 ```
 
+## 8.5–8.6 远端与合入后门禁
+
+- PR：`#4`，实现 merge SHA：`e82cf2a455838f6063c28932b1d35dfba4f20740`。
+- PR 最新 head 的 Windows CI、Ubuntu CI 与 Security audit 全部通过。
+- `master` push 的 Security audit run：`29183880624`，job：`86626446906`，结论：success。
+- merge SHA 的 audit log 确认固定安装 `cargo-audit 0.22.2`，通过绝对 `$AUDIT_BIN` 执行 `audit --deny unsound --file "$GITHUB_WORKSPACE/Cargo.lock"`，扫描根 `Cargo.lock` 并成功退出。
+- audit 保留唯一 allowed warning `RUSTSEC-2025-0141`（`syntect -> bincode 1.3.3` unmaintained）；据命令策略与 exit 0 得出 0 vulnerability / 0 unsound，不宣称 warning-free。
+- 已知 GitHub Actions Node20→Node24 兼容警告仍按设计留给独立 `modernize-github-actions-runtime` change，不属于本次阻塞。
+
 ## 最终结论
 
 - [x] 8.1 全部通过。
 - [x] 8.2 全部通过。
 - [x] 8.3 全部通过。
 - [x] 可以进入提交 / PR / 远端 CI 阶段。
+- [x] 8.5 PR 最新 head 的 Windows / Ubuntu CI 与 Security audit 全部通过。
+- [x] 8.6 实现 merge SHA 的 `master` Security audit 通过，可以进入 OpenSpec archive 准备阶段。
