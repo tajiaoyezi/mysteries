@@ -31,5 +31,7 @@
 - [x] 5.2 等待 5.1 所记录 merge-ref SHA 的 Windows CI、Ubuntu CI 与 RustSec dependency audit 全部成功，逐 job 检查完整日志/annotations 不含 Node.js 20 deprecated、被强制运行于 Node.js 24、`DEP0040 punycode` 或 `DEP0169 url.parse()`；检查两个平台 cache，首轮 hit 时记录 restore，首轮 miss 时保存该 attempt 的 post-job save 日志并 rerun 同一 run（相同 merge-ref SHA、递增 attempt），再以 `--attempt` 读取新日志验证 restore，不得改 key、清 cache 或改变 revision 制造结果
 - [x] 5.3 仅在 5.1/5.2 成立后合入 implementation PR；在 `manual-verification.md` 记录精确 implementation merge SHA，按 workflow + `event=push` 唯一查询该 SHA 的 CI 与 Security audit runs，验证 Windows/Ubuntu/Security 全部成功且同样无四类 runtime/cache deprecation 语义，记录 run IDs/attempts
 - [x] 5.4 创建独立 post-merge evidence branch，先把 branch name 写入 `manual-verification.md`，再以一个原子 evidence commit 提交已填充的手册与 5.1-5.4 完成状态；勾选 5.4 仅表示该 branch 与 durable evidence commit 已创建，文件不得自引用尚未生成的 commit SHA/PR number，该 commit 只能证明更早的 implementation revisions
+- [x] 5.5 修复 implementation PR merge-ref 模板的 merged-state 重放：open PR 比较 live `merge_commit_sha`，merged PR 使用持久记录的 `PR_API_MERGE_SHA` / `TESTED_MERGE_SHA`，并以 PR #7 验证 markers 与 parents 仍可重放
+- [x] 5.6 以 `codex/modernize-github-actions-runtime-review-fix` 作为新的 bounded review-remediation evidence carrier，原子持久化 5.5 与时序契约修复；勾选仅表示 carrier commit 已创建，其 push、PR、merge 与精确 merge SHA 最终 master gate 仍是非 checkbox archive precondition
 
 > 非 checkbox archive precondition：5.4 的 evidence commit 创建后，仍须 push、创建并合入 evidence PR；其精确 evidence merge SHA 的最终 `master` push checks 必须由 archive 阶段按 `manual-verification.md` 查询，并写入用户审阅的 archive 决策记录。不得让 evidence commit 证明自身，也不得追加递归 evidence commit。
