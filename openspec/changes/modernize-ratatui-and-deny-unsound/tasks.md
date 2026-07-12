@@ -53,5 +53,5 @@
 - [x] 8.2 真机在 Normal / AcceptEdits / Plan 下分别触发一次可授权 C6 并用 `n` / `Esc` 拒绝；在 Yolo 下先确认同类 authorizable 调用自动放行且不出现 C6，再用 invalid Network preview 触发 `reject-only` C6、确认不可授权并以 `n` / `Esc` 关闭。随后验证模型输出后仍可滚动、Esc 中断可恢复、mouse capture / raw mode / alt-screen 在双 Ctrl+C 退出后完整恢复；所有行为和布局应与迁移前一致。
 - [x] 8.3 在 Windows Terminal 真机进入 `auth login` 的交互式 provider/model selector 与隐藏 key 输入，验证方向键、Enter、Backspace、隐藏字符回显和非 Press 事件不会重复输入；分别用 Esc / Ctrl+C 取消，确认没有持久化测试凭据、raw mode 完整恢复且 PowerShell 可立即继续输入。
 - [x] 8.4 提交/推送前复核改动范围、完整本地门禁、仅一份经用户批准的快照 diff 与真机记录；未经用户授权不得执行 Git 写操作。
-- [ ] 8.5 PR 上等待最新 head 的 Windows + Ubuntu `CI` 与 `Security audit` 全部通过；检查 audit log 真实执行绝对 binary 的 `audit --deny unsound`、扫描根 lockfile并 exit 0，同时保留允许的 unmaintained warning。报告可据命令策略与 exit 0 得出 0 vulnerability / 0 unsound，但不得声称原始 log 含未实际输出的零计数，也不能用旧 SHA 的 green 代替。
+- [x] 8.5 PR 上等待最新 head 的 Windows + Ubuntu `CI` 与 `Security audit` 全部通过；检查 audit log 真实执行绝对 binary 的 `audit --deny unsound`、扫描根 lockfile并 exit 0，同时保留允许的 unmaintained warning。报告可据命令策略与 exit 0 得出 0 vulnerability / 0 unsound，但不得声称原始 log 含未实际输出的零计数，也不能用旧 SHA 的 green 代替。
 - [ ] 8.6 合入后在 `master` 对最终 merge SHA 运行或确认 `Security audit`（含 `workflow_dispatch`），再次验证相同策略与结果；全部证据齐备后才允许进入 OpenSpec archive，archive 时按 AGENTS.md 起草并经用户审阅 change 决策记录。
