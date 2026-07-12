@@ -57,4 +57,4 @@ jobs:
           AUDIT_BIN="$AUDIT_ROOT/bin/cargo-audit"
           test -x "$AUDIT_BIN"
           test "$("$AUDIT_BIN" --version)" = "cargo-audit $CARGO_AUDIT_VERSION"
-          "$AUDIT_BIN" audit --file "$GITHUB_WORKSPACE/Cargo.lock"
+          "$AUDIT_BIN" audit --deny unsound --file "$GITHUB_WORKSPACE/Cargo.lock"

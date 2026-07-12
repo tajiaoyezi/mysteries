@@ -21,10 +21,10 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked                       # ⚠️ 跑全量,别用 --lib —— --lib 不含 tests/ 集成测试
 cargo build --release --locked
-cargo-audit audit --file Cargo.lock       # vulnerability 阻断;informational warning 保持可见
+cargo-audit audit --deny unsound --file Cargo.lock # vulnerability / unsound 阻断;unmaintained 保持可见但不阻断
 ```
 
-CI(`.github/workflows/ci.yml`)在 Windows + Linux 上强制 fmt、clippy、全量 test 与 release build；独立的 `.github/workflows/security-audit.yml` 在 Ubuntu 上执行 RustSec 审计，可配置为 required check。**`cargo test` 必须跑全量**:曾有一条集成断言因门禁只跑 `--lib` 潜伏一周未被发现。
+CI(`.github/workflows/ci.yml`)在 Windows + Linux 上强制 fmt、clippy、全量 test 与 release build；独立的 `.github/workflows/security-audit.yml` 在 Ubuntu 上执行 RustSec 审计，可配置为 required check。该门禁对 vulnerability 与 kind=`unsound` hard-fail，其他 informational warning（当前为 `bincode` unmaintained）继续如实展示但不阻断，因此成功不等于 warning-free。**`cargo test` 必须跑全量**:曾有一条集成断言因门禁只跑 `--lib` 潜伏一周未被发现。
 
 ## 工程流程:OpenSpec 先行
 

@@ -11,15 +11,16 @@
 - **Network 权限级**:`web_fetch` / `web_search` 从 `ReadOnly` 拆为 `Network`;TUI 与 `--headless` 展示 terminal-safe 完整参数、canonical target 和 redirect/SSRF scope。有效 preview 默认逐次询问,Yolo 仅自动放行可授权 preview;未知/畸形调用 fail-closed,SSRF 仍逐跳强制。Provider transport 不属于 Tool gate。
 - **Plan 进度持久化**:`SessionLine::Plan` 把 `current_plan` 随会话 jsonl 落盘;`--resume` / `--continue` 经 plan-only seam `apply_loaded_plan` 做**纯视觉恢复**(不执行续接)。**降级不兼容**:升级后写出的含 `Plan` 行会话,回退到旧 v1.1.0 二进制读取会 `Err`。
 - **CLI `--help` / `-h` / `--version`**:输出用法 / 版本号后退出;此前这些及任意未知 flag 都会静默进入 TUI。
-- **RustSec 依赖安全门禁**:新增独立、最小权限的 `security-audit` workflow，在 PR、`master` push、每周 schedule 与手动触发时用隔离安装的固定 `cargo-audit` 审计已提交的根 `Cargo.lock`；vulnerability 与审计基础设施错误阻断，informational warning 保持可见。
+- **RustSec 依赖安全门禁**:新增独立、最小权限的 `security-audit` workflow，在 PR、`master` push、每周 schedule 与手动触发时用隔离安装的固定 `cargo-audit` 审计已提交的根 `Cargo.lock`；vulnerability、kind=`unsound` warning 与审计基础设施错误阻断，其他 informational warning 保持可见。
 
 ### 变更
 - README tests badge 去数字化(`800+`),不再硬编码具体数,避免与实际测试数漂移。
 - 四个本地读取工具的同步文件工作经 `spawn_blocking` + 进程级 Semaphore(4) offload,避免占满 Tokio worker。
-- `syntect` 从 `default-fancy` 收窄为实际使用的默认 syntax/theme + `regex-fancy`，移除未使用的 plist/yaml/html loader 依赖面；仍保留 `bincode`、`paste`、`lru` informational warning，不宣称 warning-free。
+- `syntect` 从 `default-fancy` 收窄为实际使用的默认 syntax/theme + `regex-fancy`，移除未使用的 plist/yaml/html loader 依赖面。
+- TUI 迁移到最小 feature 的 `ratatui 0.30` + 单一 `crossterm 0.29`，移除 unmaintained `paste 1.0.15` 与受 `RUSTSEC-2026-0002` 影响的 `lru 0.12.5` 路径；RustSec 门禁增加 `--deny unsound`，vulnerability / unsound 均阻断。`syntect -> bincode 1.3.3` unmaintained warning 继续可见但不阻断，不宣称 warning-free。
 
 ### 安全
-- 修复 `crossbeam-epoch 0.9.18` 的 `RUSTSEC-2026-0204`，并通过移除未使用的 `plist -> quick-xml 0.39.4` 路径修复 `RUSTSEC-2026-0194` / `RUSTSEC-2026-0195`，当前根 lockfile 为 0 vulnerability。
+- 修复 `crossbeam-epoch 0.9.18` 的 `RUSTSEC-2026-0204`，并通过移除未使用的 `plist -> quick-xml 0.39.4` 路径修复 `RUSTSEC-2026-0194` / `RUSTSEC-2026-0195`；Ratatui 迁移同时消除 `RUSTSEC-2026-0002`，当前根 lockfile 为 0 vulnerability / 0 unsound。
 
 ### 测试
 - 新增 CLI flag 解析 5 组单测(`wants_help` / `wants_version` / `help_text` / `version_text`);`tui::width` CJK 显示宽度补 8 组 characterization 测试(全 / 半角边界、零宽标记、截断),经 mutation check 防假绿。
