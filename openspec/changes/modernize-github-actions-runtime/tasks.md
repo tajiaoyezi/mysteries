@@ -27,9 +27,9 @@
 
 ## 5. 远端运行与不可变证据
 
-- [ ] 5.1 在用户授权 Git 写操作后从同一 repository 分支创建 implementation PR；在 `manual-verification.md` 锁定 PR head/base、PR API merge SHA、三个 jobs 的 `Show tested revision` 输出、run IDs/attempts，断言两个 workflow 的 REST `run.head_sha` 等于 PR head、三个 revision 输出等于同一 tested merge-ref SHA，且该 merge commit 的 first/second parents 分别等于 base/head；若任一 revision 漂移则废弃旧证据并等待新 runs
-- [ ] 5.2 等待 5.1 所记录 merge-ref SHA 的 Windows CI、Ubuntu CI 与 RustSec dependency audit 全部成功，逐 job 检查完整日志/annotations 不含 Node.js 20 deprecated、被强制运行于 Node.js 24、`DEP0040 punycode` 或 `DEP0169 url.parse()`；检查两个平台 cache，首轮 hit 时记录 restore，首轮 miss 时保存该 attempt 的 post-job save 日志并 rerun 同一 run（相同 merge-ref SHA、递增 attempt），再以 `--attempt` 读取新日志验证 restore，不得改 key、清 cache 或改变 revision 制造结果
-- [ ] 5.3 仅在 5.1/5.2 成立后合入 implementation PR；在 `manual-verification.md` 记录精确 implementation merge SHA，按 workflow + `event=push` 唯一查询该 SHA 的 CI 与 Security audit runs，验证 Windows/Ubuntu/Security 全部成功且同样无四类 runtime/cache deprecation 语义，记录 run IDs/attempts
-- [ ] 5.4 创建独立 post-merge evidence branch，先把 branch name 写入 `manual-verification.md`，再以一个原子 evidence commit 提交已填充的手册与 5.1-5.4 完成状态；勾选 5.4 仅表示该 branch 与 durable evidence commit 已创建，文件不得自引用尚未生成的 commit SHA/PR number，该 commit 只能证明更早的 implementation revisions
+- [x] 5.1 在用户授权 Git 写操作后从同一 repository 分支创建 implementation PR；在 `manual-verification.md` 锁定 PR head/base、PR API merge SHA、三个 jobs 的 `Show tested revision` 输出、run IDs/attempts，断言两个 workflow 的 REST `run.head_sha` 等于 PR head、三个 revision 输出等于同一 tested merge-ref SHA，且该 merge commit 的 first/second parents 分别等于 base/head；若任一 revision 漂移则废弃旧证据并等待新 runs
+- [x] 5.2 等待 5.1 所记录 merge-ref SHA 的 Windows CI、Ubuntu CI 与 RustSec dependency audit 全部成功，逐 job 检查完整日志/annotations 不含 Node.js 20 deprecated、被强制运行于 Node.js 24、`DEP0040 punycode` 或 `DEP0169 url.parse()`；检查两个平台 cache，首轮 hit 时记录 restore，首轮 miss 时保存该 attempt 的 post-job save 日志并 rerun 同一 run（相同 merge-ref SHA、递增 attempt），再以 `--attempt` 读取新日志验证 restore，不得改 key、清 cache 或改变 revision 制造结果
+- [x] 5.3 仅在 5.1/5.2 成立后合入 implementation PR；在 `manual-verification.md` 记录精确 implementation merge SHA，按 workflow + `event=push` 唯一查询该 SHA 的 CI 与 Security audit runs，验证 Windows/Ubuntu/Security 全部成功且同样无四类 runtime/cache deprecation 语义，记录 run IDs/attempts
+- [x] 5.4 创建独立 post-merge evidence branch，先把 branch name 写入 `manual-verification.md`，再以一个原子 evidence commit 提交已填充的手册与 5.1-5.4 完成状态；勾选 5.4 仅表示该 branch 与 durable evidence commit 已创建，文件不得自引用尚未生成的 commit SHA/PR number，该 commit 只能证明更早的 implementation revisions
 
 > 非 checkbox archive precondition：5.4 的 evidence commit 创建后，仍须 push、创建并合入 evidence PR；其精确 evidence merge SHA 的最终 `master` push checks 必须由 archive 阶段按 `manual-verification.md` 查询，并写入用户审阅的 archive 决策记录。不得让 evidence commit 证明自身，也不得追加递归 evidence commit。
