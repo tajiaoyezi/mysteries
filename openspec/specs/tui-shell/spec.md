@@ -1135,7 +1135,7 @@ TUI SHALL 在输入缓冲层把**大段粘贴**折叠为一个原子占位符 to
 
 ### Requirement: Assistant 消息 markdown 渲染(CommonMark+GFM,代码块语法高亮)
 
-TUI SHALL 把 `TranscriptBlock::Assistant(text)` 的正文按 markdown(CommonMark + GFM 表格/删除线)渲染为带样式的 `ratatui::Line`,经 `src/tui/markdown.rs` 的 `render_markdown(text, theme, width) -> Vec<Line<'static>>`;其余 `TranscriptBlock` 变体 MUST NOT 受影响。渲染 MUST 用 `pulldown-cmark` 解析、`syntect`(`default-fancy` feature、纯 Rust regex-fancy 引擎、不引 C `onig`)做围栏代码块语法高亮。
+TUI SHALL 把 `TranscriptBlock::Assistant(text)` 的正文按 markdown(CommonMark + GFM 表格/删除线)渲染为带样式的 `ratatui::Line`,经 `src/tui/markdown.rs` 的 `render_markdown(text, theme, width) -> Vec<Line<'static>>`;其余 `TranscriptBlock` 变体 MUST NOT 受影响。渲染 MUST 用 `pulldown-cmark` 解析、`syntect` 的 `default-syntaxes`、`default-themes`、`regex-fancy` 最小 feature 组合做围栏代码块语法高亮；MUST 保持纯 Rust regex-fancy 引擎、不引 C `onig`，并 MUST NOT 启用聚合 feature `default-fancy` 或未使用的 `plist-load`、`yaml-load`、`html`、`regex-onig`。
 
 **元素映射**:标题 H1..H6 → `text_title`+`BOLD`(H1 加 `accent_primary`);`**strong**` → `+BOLD`、`*em*` → `+ITALIC`、`~~del~~` → `+CROSSED_OUT`+`text_muted`;`inline code` → `text_body` on `bg_surface_alt`;无序/有序列表 → `• `/`N. ` marker + 按嵌套层缩进;`> quote` → `▎ ` 前缀 + `text_secondary`;`---` → 整行 `─`;链接 `[t](u)` → 文字 `accent_primary`+`UNDERLINED`(URL v1 不内联)。
 
@@ -1158,6 +1158,11 @@ TUI SHALL 把 `TranscriptBlock::Assistant(text)` 的正文按 markdown(CommonMar
 
 - **WHEN** `Assistant` 正文含 ` ```rust\nfn main() {}\n``` `
 - **THEN** 代码块整体加区分底色(`bg_sunken`)、带 `rust` 语言标签;`fn`(关键字)与 `main`(标识符)渲成**不同 fg**(syntect 高亮);`SyntaxSet`/`ThemeSet` 仅懒加载一次
+
+#### Scenario: 最小 syntect features 保持既有高亮结果
+
+- **WHEN** 项目仅以 `default-syntaxes`、`default-themes`、`regex-fancy` 编译 `syntect`，并用 `TestBackend + insta` 渲染既有暗/亮主题 markdown 代码块
+- **THEN** 默认 syntax/theme、语言标签、token fg 与 `bg_sunken` MUST 与变更前快照一致，依赖图 MUST NOT 包含 `plist`、`quick-xml` 或 `yaml-rust`，且既有快照 MUST 零 churn、不得 approve 新基线
 
 #### Scenario: 未知语言代码块退化为纯色块
 
