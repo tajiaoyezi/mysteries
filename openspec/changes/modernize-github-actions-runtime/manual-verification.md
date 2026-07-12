@@ -2,7 +2,7 @@
 
 > 本文件是远端运行证据的持久载体，`tasks.md` 仍是唯一进度状态源。
 > implementation evidence 由独立 post-merge evidence commit/PR 提交；该 commit 只证明更早且不可变的 revision，不证明自身。
-> evidence PR 合入后的最终 `master` checks 在 archive 阶段查询，并写入经用户审阅的 archive 决策记录；不得为记录该结果再创建递归 evidence commit。
+> 最新 evidence carrier PR 合入后的最终 `master` checks 在 archive 阶段查询，并写入经用户审阅的 archive 决策记录；不得为记录该结果再创建递归 evidence commit。
 
 ## 1. 证据语义
 
@@ -10,7 +10,7 @@
 
 - `PR_HEAD_SHA`：`pull_request.head.sha`；
 - `PR_BASE_SHA`：产生该 merge-ref 时的 `pull_request.base.sha`；
-- `PR_API_MERGE_SHA`：证据收集时 PR API 的 `merge_commit_sha`；
+- `PR_API_MERGE_SHA`：证据收集时 PR API 的 `merge_commit_sha`；PR 合入后 GitHub 会把 live 字段改为实际 implementation merge commit，事后重放 MUST 使用这里持久记录的值；
 - `RUN_HEAD_SHA`：Actions REST workflow run 的 `head_sha`，MUST 等于 `PR_HEAD_SHA`；
 - `TESTED_MERGE_SHA`：三个 `Show tested revision` steps 输出的 `TESTED_REVISION=<40hex>` marker，MUST 各恰好出现一次、相等且等于 `PR_API_MERGE_SHA`；
 - `TESTED_PARENT_1` / `TESTED_PARENT_2`：merge commit object 的 parents，MUST 分别等于 base/head；
@@ -112,12 +112,26 @@ RUNTIME_WARNING_MATCHES=0
 ```powershell
 $repo = gh repo view --json nameWithOwner --jq '.nameWithOwner'
 $prNumber = <PR_NUMBER>
+$recordedHeadSha = '<PR_HEAD_SHA>'
+$recordedBaseSha = '<PR_BASE_SHA>'
+$recordedPrApiMergeSha = '<PR_API_MERGE_SHA>'
+$recordedTestedMergeSha = '<TESTED_MERGE_SHA>'
 $pr = gh api "repos/$repo/pulls/$prNumber" | ConvertFrom-Json
-$headSha = $pr.head.sha
-$baseSha = $pr.base.sha
-$prApiMergeSha = $pr.merge_commit_sha
 if ($pr.head.repo.full_name -ne $repo) { throw 'implementation PR 必须来自同一 repository 分支，不能用 fork PR 证明 cache save' }
-if (-not $prApiMergeSha) { throw 'PR merge_commit_sha 尚未生成，等待 GitHub 计算 mergeability 后重试' }
+foreach ($recordedSha in @($recordedHeadSha, $recordedBaseSha, $recordedPrApiMergeSha, $recordedTestedMergeSha)) {
+    if ($recordedSha -notmatch '^[0-9a-f]{40}$') { throw "持久证据不是完整 SHA: $recordedSha" }
+}
+if ($recordedPrApiMergeSha -ne $recordedTestedMergeSha) { throw '持久记录的 PR API merge SHA 与 tested merge SHA 不一致' }
+if ($pr.head.sha -ne $recordedHeadSha -or $pr.base.sha -ne $recordedBaseSha) { throw '当前 PR head/base 与持久证据不一致' }
+if ($pr.state -eq 'open') {
+    if (-not $pr.merge_commit_sha) { throw 'PR merge_commit_sha 尚未生成，等待 GitHub 计算 mergeability 后重试' }
+    if ($pr.merge_commit_sha -ne $recordedPrApiMergeSha) { throw 'open PR 的 live merge_commit_sha 与持久证据不一致' }
+} elseif (-not $pr.merged) {
+    throw 'PR 已关闭但未合入，不能重放 implementation merge-ref 证据'
+}
+$headSha = $recordedHeadSha
+$baseSha = $recordedBaseSha
+$expectedTestedMergeSha = $recordedTestedMergeSha
 
 gh pr checks $prNumber
 $ciRun = gh api "repos/$repo/actions/runs/<CI_RUN_ID>" | ConvertFrom-Json
@@ -158,7 +172,7 @@ $securityRevision = Get-TestedRevision <SECURITY_RUN_ID> $securityRun.run_attemp
 $uniqueRevisions = @($windowsRevision, $ubuntuRevision, $securityRevision) | Select-Object -Unique
 if ($uniqueRevisions.Count -ne 1) { throw '三个 jobs 测试的 revision 不一致' }
 $testedMergeSha = $windowsRevision
-if ($testedMergeSha -ne $prApiMergeSha) { throw 'tested revision 不等于 PR API merge_commit_sha' }
+if ($testedMergeSha -ne $expectedTestedMergeSha) { throw 'tested revision 不等于持久记录的 merge-ref SHA' }
 
 $mergeObject = gh api "repos/$repo/git/commits/$testedMergeSha" | ConvertFrom-Json
 if ($mergeObject.parents.Count -ne 2) { throw 'tested revision 不是双 parent merge commit' }
@@ -186,7 +200,8 @@ if ($mergeObject.parents[0].sha -ne $baseSha -or $mergeObject.parents[1].sha -ne
 
 - 两个 runs 的 `event` 都是 `pull_request`；
 - 两个 REST `run.head_sha` 都等于 `PR_HEAD_SHA`，不得写入 `TESTED_MERGE_SHA`；
-- 三个目标 jobs 的日志各恰好包含一个 `TESTED_REVISION=<40hex>` marker，三个 SHA 相等并等于 `PR_API_MERGE_SHA`，共同写入 `TESTED_MERGE_SHA`；
+- open PR 的 live `merge_commit_sha` 必须等于已记录的 `PR_API_MERGE_SHA`；PR 合入后该 live 字段不再参与比较，模板改用持久记录的 `PR_API_MERGE_SHA` / `TESTED_MERGE_SHA`；
+- 三个目标 jobs 的日志各恰好包含一个 `TESTED_REVISION=<40hex>` marker，三个 SHA 相等并等于持久记录的 `TESTED_MERGE_SHA`；
 - `TESTED_MERGE_SHA` 的 first/second parents 分别等于记录的 `PR_BASE_SHA` / `PR_HEAD_SHA`；
 - 三个 jobs 均为 `success`；
 - 完整日志与 annotations 中四类 warning 匹配数均为 0。
@@ -426,13 +441,18 @@ if ($warningMatches.Count -ne 0) { $warningMatches; throw 'implementation merge 
 
 ## 7. Post-merge evidence 与 archive gate
 
-post-merge evidence branch 创建后，先把其 branch name 填入本文件，再以一个原子 evidence commit 提交第 2–6 节与 `tasks.md` 5.1–5.4 完成状态。5.4 checkbox 的完成边界仅为该 branch 与 durable evidence commit 已创建；不得要求 commit 在自身内容里记录尚未存在的 SHA/PR number：
+post-merge evidence branch 创建后，先把其 branch name 填入本文件，再以一个原子 evidence commit 提交第 2–6 节与 `tasks.md` 5.1–5.4 完成状态。5.4 checkbox 的完成边界仅为该 branch 与 durable evidence commit 已创建；不得要求 commit 在自身内容里记录尚未存在的 SHA/PR number。
+
+若 evidence PR 合入后的只读审查发现本手册或其他 OpenSpec artifact 有缺陷，MAY 通过新的 bounded review-remediation evidence carrier 修复，但 MUST 同时满足：实现侧不得修改 workflow、Rust、Cargo 或其他产品文件；新 branch name 必须在其 commit 前写入 `EVIDENCE_BRANCH`；原 carrier 写入 `SUPERSEDED_EVIDENCE_BRANCH`；commit 不得记录自身尚未存在的 SHA/PR number；新 PR 合入后必须用本节 archive gate 验证其精确 merge SHA。任何后续 remediation 都必须重复该 carrier 轮换，不得直接把未提交修改静默带入 archive。
+
+当前最新 carrier：
 
 ```text
-EVIDENCE_BRANCH=codex/modernize-github-actions-runtime-evidence
+EVIDENCE_BRANCH=codex/modernize-github-actions-runtime-review-fix
+SUPERSEDED_EVIDENCE_BRANCH=codex/modernize-github-actions-runtime-evidence
 ```
 
-evidence commit 的 push、PR 创建/合入及其最终 `master` checks 是非 checkbox archive precondition。evidence PR 合入后，不再修改本文件；archive 前执行：
+最新 evidence carrier commit 的 push、PR 创建/合入及其最终 `master` checks 是非 checkbox archive precondition。carrier PR 合入后不得直接回写本文件；若需 review remediation，必须先按上述规则轮换 carrier。archive 前执行：
 
 ```powershell
 $repo = gh repo view --json nameWithOwner --jq '.nameWithOwner'
