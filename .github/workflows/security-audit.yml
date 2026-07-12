@@ -1,0 +1,60 @@
+name: Security audit
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  security-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Validate audit inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f Cargo.lock
+          test ! -L Cargo.lock
+          git ls-files --error-unmatch -- Cargo.lock >/dev/null
+          test "$(git ls-files -s -- Cargo.lock | awk '{print $1}')" = "100644"
+          test ! -e .cargo/audit.toml
+
+      - name: Install isolated cargo-audit
+        shell: bash
+        env:
+          CARGO_AUDIT_VERSION: "0.22.2"
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="$RUNNER_TEMP/cargo-audit-home"
+          export AUDIT_ROOT="$RUNNER_TEMP/cargo-audit-root"
+          test ! -e "$CARGO_HOME"
+          test ! -e "$AUDIT_ROOT"
+          test ! -e "$CARGO_HOME/audit.toml"
+          test ! -e "$CARGO_HOME/config.toml"
+          printf 'CARGO_HOME=%s\nAUDIT_ROOT=%s\n' "$CARGO_HOME" "$AUDIT_ROOT" >> "$GITHUB_ENV"
+          cd "$RUNNER_TEMP"
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --root "$AUDIT_ROOT"
+
+      - name: Audit committed lockfile
+        shell: bash
+        env:
+          CARGO_AUDIT_VERSION: "0.22.2"
+        run: |
+          set -euo pipefail
+          AUDIT_BIN="$AUDIT_ROOT/bin/cargo-audit"
+          test -x "$AUDIT_BIN"
+          test "$("$AUDIT_BIN" --version)" = "cargo-audit $CARGO_AUDIT_VERSION"
+          "$AUDIT_BIN" audit --file "$GITHUB_WORKSPACE/Cargo.lock"

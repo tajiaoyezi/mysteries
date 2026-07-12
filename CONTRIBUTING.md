@@ -6,6 +6,7 @@
 
 - Rust **stable**(仓库根 `rust-toolchain.toml` 已钉版本 + `rustfmt`/`clippy` 组件,`rustup` 会自动装)。
 - 无需其它系统依赖(TLS 走 `rustls`、语法高亮走纯 Rust 的 `syntect` regex-fancy 引擎、无 C `onig`/`openssl`)。
+- 提交前依赖审计使用固定的 `cargo-audit 0.22.2`：`cargo install cargo-audit --version 0.22.2 --locked`。
 
 ```bash
 cargo build              # 构建
@@ -17,11 +18,13 @@ cargo run -- --headless "解释一下 src/agent 的结构"   # 无头单轮
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test                 # ⚠️ 跑全量,别用 --lib —— --lib 不含 tests/ 集成测试
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked                       # ⚠️ 跑全量,别用 --lib —— --lib 不含 tests/ 集成测试
+cargo build --release --locked
+cargo-audit audit --file Cargo.lock       # vulnerability 阻断;informational warning 保持可见
 ```
 
-CI(`.github/workflows/ci.yml`)在 Windows + Linux 上强制这四关。**`cargo test` 必须跑全量**:曾有一条集成断言因门禁只跑 `--lib` 潜伏一周未被发现。
+CI(`.github/workflows/ci.yml`)在 Windows + Linux 上强制 fmt、clippy、全量 test 与 release build；独立的 `.github/workflows/security-audit.yml` 在 Ubuntu 上执行 RustSec 审计，可配置为 required check。**`cargo test` 必须跑全量**:曾有一条集成断言因门禁只跑 `--lib` 潜伏一周未被发现。
 
 ## 工程流程:OpenSpec 先行
 

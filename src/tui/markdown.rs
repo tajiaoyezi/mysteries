@@ -955,6 +955,17 @@ mod tests {
     }
 
     #[test]
+    fn unclosed_rust_fence_renders_available_code_without_panicking() {
+        let theme = Theme::midnight();
+        let lines = render_markdown("```rust\nfn ", &theme, 80);
+
+        assert!(
+            lines.iter().map(line_text).any(|line| line.contains("fn")),
+            "available code should remain visible: {lines:?}"
+        );
+    }
+
+    #[test]
     fn unknown_code_language_falls_back_to_plain_sunken_block() {
         let theme = Theme::midnight();
         let lines = render_markdown("```zzz\nfn main() {}\n```", &theme, 80);

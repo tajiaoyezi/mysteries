@@ -23,7 +23,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 thiserror = "1"
 toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "test-util", "sync"] }
