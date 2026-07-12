@@ -141,12 +141,15 @@ mysteries --headless "解释一下 src/agent 的结构"   # 无头单轮模式
 - **OpenSpec 流程**:每个变更 propose(proposal/design/tasks/spec delta)→ apply → archive。已归档 **59 个 change**,15+ 个能力域 spec 沉淀在 `openspec/specs/`(RFC 2119 风格),每个 change 附一条决策记录到 `.ai_history/logs/`。
 - **TDD**:内核(Loop / 工具 / 权限 / Provider 归一化 / 配置 merge)强制先测后码、红灯独立成步;TUI 外壳走 `TestBackend` + `insta` 快照事后回归。
 - **当前**:**800+ tests 全绿**(lib 单测 + e2e 集成)、`clippy -D warnings` 零警告、行覆盖 **~91%**(llvm-cov;内核如 Agent Loop 99%、工具 96–100%)。
-- **CI**(`.github/workflows/ci.yml`):Windows + Linux 上强制 `fmt --check` + `clippy -D` + **全量 `cargo test`** + `build`。
+- **构建 CI**(`.github/workflows/ci.yml`):Windows + Linux 上强制 `fmt --check` + `clippy -D` + **全量 `cargo test --locked`** + release build。
+- **依赖安全 CI**(`.github/workflows/security-audit.yml`):独立 Ubuntu job 在每个 PR、`master` push、每周 schedule 与手动触发时，用固定 `cargo-audit` 和最新 RustSec database 扫描已提交的 `Cargo.lock`；任一 vulnerability 或审计基础设施错误 hard-fail，informational warning 保持可见但不阻断。
 
 ```bash
-cargo test                                 # 全量(含集成测试)
-cargo clippy --all-targets -- -D warnings  # 零警告基线
-cargo llvm-cov --summary-only              # 覆盖率(需 cargo-llvm-cov)
+cargo test --locked                              # 全量(含集成测试)
+cargo clippy --all-targets --locked -- -D warnings # 零警告基线
+cargo build --release --locked
+cargo-audit audit --file Cargo.lock              # 0 vulnerability,warning 如实保留
+cargo llvm-cov --summary-only                    # 覆盖率(需 cargo-llvm-cov)
 ```
 
 ## 📐 设计文档
