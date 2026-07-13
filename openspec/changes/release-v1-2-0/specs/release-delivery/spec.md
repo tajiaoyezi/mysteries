@@ -6,7 +6,7 @@
 
 #### Scenario: Release-sensitive PR 只验证 package
 - **WHEN** pull request 修改 release workflow、根 manifest/lockfile、release notes 或交付文档
-- **THEN** Windows/Linux package validation MUST checkout并验证该PR的synthetic merge；所有revision markers等于run `head_sha`，Actions run的`pull_requests[].head.sha`必须等于目标PR head SHA，但publish job不运行，仓库中没有新 tag、draft/public Release 或 Release asset
+- **THEN** Windows/Linux package validation MUST checkout并验证该PR的`refs/pull/<n>/merge` synthetic merge；所有revision markers必须等于现场读取的该merge ref SHA，Actions API的run `head_sha`与`pull_requests[].head.sha`必须等于目标PR head SHA，但publish job不运行，仓库中没有新 tag、draft/public Release 或 Release asset
 
 #### Scenario: 手动 dry-run 永不发布
 - **WHEN** 维护者通过 `workflow_dispatch` 在任一 ref 启动 release workflow

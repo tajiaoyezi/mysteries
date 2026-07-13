@@ -70,7 +70,7 @@ implementation PR只勾选本地/PR阶段 tasks；tag与公开 Release相关 tas
 
 只有`Publish GitHub Release`配置job-level concurrency：group由workflow/repository/完整tag ref组成，`cancel-in-progress: false`。package与aggregate仍可并行；相同tag的远端变更必须串行，后续尝试取得锁后重新预检并fail-closed，不能取消正在创建或校验draft的run。
 
-不让 release workflow成为每个普通源码 PR的重复全量CI；普通代码由既有 CI/Security负责，release-sensitive diff和每个tag才承担package验证。`pull_request` run按GitHub标准语义checkout并验证`refs/pull/<n>/merge` synthetic merge，所有revision marker等于该run `head_sha`；远端验收再通过Actions run的`pull_requests[].head.sha`绑定到目标PR head，不能错误要求run `head_sha`等于PR head。tag创建前的人工门禁仍必须查询 implementation merge的普通CI/Security，而不是把 release workflow green当作替代。
+不让 release workflow成为每个普通源码 PR的重复全量CI；普通代码由既有 CI/Security负责，release-sensitive diff和每个tag才承担package验证。`pull_request` run按GitHub标准语义checkout并验证`refs/pull/<n>/merge` synthetic merge，所有revision marker等于现场读取的该merge ref SHA；GitHub Actions API的run `head_sha`与`pull_requests[].head.sha`则都绑定目标PR head，这两个SHA角色不得混淆。tag创建前的人工门禁仍必须查询 implementation merge的普通CI/Security，而不是把 release workflow green当作替代。
 
 ### 3. Metadata job 是唯一版本与 ref 事实源
 

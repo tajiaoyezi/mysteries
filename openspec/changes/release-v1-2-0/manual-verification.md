@@ -213,12 +213,19 @@ if ($ReleaseRuns.Count -ne 1 -or $ReleaseRuns[0].conclusion -ne 'success') {
 $ReleaseRun = $ReleaseRuns[0]
 $ReleaseRunApi = gh api "repos/$Repo/actions/runs/$($ReleaseRun.databaseId)" | ConvertFrom-Json
 $RunPullRequests = @($ReleaseRunApi.pull_requests)
-if ($ReleaseRunApi.head_sha -ne $ReleaseRun.headSha -or $RunPullRequests.Count -ne 1) {
+if ($ReleaseRunApi.head_sha -ne $ReleaseRun.headSha -or $ReleaseRun.headSha -ne $PrInfo.headRefOid -or $RunPullRequests.Count -ne 1) {
     throw 'PR release run head_sha或PR关联异常'
 }
-if ($RunPullRequests[0].number -ne $Pr -or $RunPullRequests[0].head.sha -ne $PrInfo.headRefOid -or $RunPullRequests[0].base.ref -ne 'master') {
+if ($RunPullRequests[0].number -ne $Pr -or $RunPullRequests[0].head.sha -ne $PrInfo.headRefOid -or $RunPullRequests[0].base.ref -ne 'master' -or $RunPullRequests[0].base.sha -ne $PrInfo.baseRefOid) {
     throw 'PR release run没有绑定目标PR head/base'
 }
+$MergeRefs = @(git ls-remote --refs origin "refs/pull/$Pr/merge")
+if ($LASTEXITCODE -ne 0 -or $MergeRefs.Count -ne 1) { throw '无法唯一读取当前PR synthetic merge ref' }
+$MergeParts = @($MergeRefs[0] -split '\s+')
+if ($MergeParts.Count -ne 2 -or $MergeParts[0] -notmatch '^[0-9a-f]{40}$' -or $MergeParts[1] -ne "refs/pull/$Pr/merge") {
+    throw '当前PR synthetic merge ref格式异常'
+}
+$SyntheticMergeSha = $MergeParts[0]
 $ReleaseRunDetail = gh run view $ReleaseRun.databaseId --attempt $ReleaseRun.attempt --json jobs | ConvertFrom-Json
 $ExpectedRevisionJobs = @(
     'Validate release metadata',
@@ -233,7 +240,7 @@ foreach ($ExpectedJobName in $ExpectedRevisionJobs) {
     $Log = @(gh run view $ReleaseRun.databaseId --attempt $ReleaseRun.attempt --job $Jobs[0].databaseId --log)
     if ($LASTEXITCODE -ne 0 -or $Log.Count -eq 0) { throw "无法读取PR job log: $ExpectedJobName" }
     $Matches = [regex]::Matches(($Log -join "`n"), 'RELEASE_REVISION=([0-9a-f]{40})')
-    if ($Matches.Count -ne 1 -or $Matches[0].Groups[1].Value -ne $ReleaseRun.headSha) {
+    if ($Matches.Count -ne 1 -or $Matches[0].Groups[1].Value -ne $SyntheticMergeSha) {
         throw "PR revision marker缺失、重复或不等于synthetic merge: $ExpectedJobName"
     }
 }
