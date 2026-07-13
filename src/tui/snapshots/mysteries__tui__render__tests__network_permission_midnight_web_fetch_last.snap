@@ -2,7 +2,7 @@
 source: src/tui/render.rs
 expression: "render_to_styled_with_size(&last, &Theme::midnight(), 40, 24)"
 ---
-‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.1.0‹/›
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.2.0‹/›
 
 ‹border.strong›────────────────────────────────────────‹/›
 ‹accent.primary›〔/help〕‹/›‹text.primary› 查看内置命令‹/›

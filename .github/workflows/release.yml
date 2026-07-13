@@ -1,0 +1,599 @@
+name: Release
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "CHANGELOG.md"
+      - "README.md"
+      - "deliverables/README.md"
+      - "LICENSE"
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_RUST_VERSION: "1.96.1"
+  RELEASE_RUST_COMMIT: "31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd"
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      revision: ${{ steps.validate.outputs.revision }}
+      publish: ${{ steps.validate.outputs.publish }}
+    steps:
+      - name: Checkout release revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate event, version, notes, and provenance
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          revision="$(git rev-parse HEAD)"
+          test "$revision" = "$GITHUB_SHA"
+          printf 'RELEASE_REVISION=%s\n' "$revision"
+
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          version="$(jq -er --arg manifest "$GITHUB_WORKSPACE/Cargo.toml" \
+            '[.packages[] | select(.manifest_path == $manifest) | .version] | if length == 1 then .[0] else error("root package must be unique") end' \
+            <<<"$metadata")"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+
+          mapfile -t lock_versions < <(awk '
+            $0 == "[[package]]" { package_name = ""; next }
+            $1 == "name" && $3 == "\"mysteries\"" { package_name = "mysteries"; next }
+            package_name == "mysteries" && $1 == "version" {
+              gsub(/\"/, "", $3); print $3; package_name = ""
+            }
+          ' Cargo.lock)
+          test "${#lock_versions[@]}" -eq 1
+          test "${lock_versions[0]}" = "$version"
+          cargo tree --locked -p "mysteries@$version" --depth 0 >/dev/null
+
+          test "$(grep -Ec '^## \[Unreleased\]$' CHANGELOG.md)" -eq 1
+          test "$(grep -Ec "^## \[$version\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md)" -eq 1
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          grep -q '[^[:space:]]' release-notes.md
+
+          publish=false
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              [[ "$GITHUB_REF" =~ ^refs/pull/[0-9]+/merge$ ]]
+              ;;
+            workflow_dispatch)
+              ;;
+            push)
+              [[ "$GITHUB_REF" =~ ^refs/tags/(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]]
+              tag_name="${BASH_REMATCH[1]}"
+              tag_version="${tag_name#v}"
+              test "$tag_version" = "$version"
+
+              git fetch --force --no-tags origin \
+                refs/heads/master:refs/remotes/origin/master \
+                "$GITHUB_REF:$GITHUB_REF"
+              test "$(git cat-file -t "$GITHUB_REF")" = tag
+              tag_object="$(git rev-parse "$GITHUB_REF")"
+              peeled="$(git rev-parse "$GITHUB_REF^{}")"
+              master="$(git rev-parse refs/remotes/origin/master)"
+              test "$tag_object" != "$peeled"
+              test "$peeled" = "$revision"
+              test "$peeled" = "$GITHUB_SHA"
+              test "$peeled" = "$master"
+              publish=true
+              ;;
+            *)
+              echo "unsupported release event: $GITHUB_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            printf 'version=%s\n' "$version"
+            printf 'revision=%s\n' "$revision"
+            printf 'publish=%s\n' "$publish"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes-${{ steps.validate.outputs.version }}
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  package-windows:
+    name: Package release (windows-x86_64)
+    needs: metadata
+    runs-on: windows-2022
+    steps:
+      - name: Checkout release revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Verify revision
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ needs.metadata.outputs.revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Revision = (git rev-parse HEAD).Trim()
+          if ($Revision -ne $env:EXPECTED_REVISION) { throw 'Windows checkout revision不一致' }
+          "RELEASE_REVISION=$Revision"
+
+      - name: Install and verify fixed Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install $env:RELEASE_RUST_VERSION --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'rustup toolchain install失败' }
+          $Info = (& rustc '+1.96.1' -Vv | Out-String)
+          $Info
+          if ($LASTEXITCODE -ne 0 -or $Info -notmatch "commit-hash: $env:RELEASE_RUST_COMMIT" -or $Info -notmatch 'host: x86_64-pc-windows-msvc') {
+              throw 'Windows release toolchain事实不一致'
+          }
+
+      - name: Build, smoke, and package Windows archive
+        id: package
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & cargo '+1.96.1' build --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release build失败' }
+
+          $Binary = Join-Path $env:GITHUB_WORKSPACE 'target\x86_64-pc-windows-msvc\release\mysteries.exe'
+          if (-not (Test-Path -LiteralPath $Binary -PathType Leaf) -or (Get-Item -LiteralPath $Binary).Length -le 0) {
+              throw 'Windows release binary缺失或为空'
+          }
+          $SmokeHome = Join-Path $env:RUNNER_TEMP 'mysteries-smoke-home-windows'
+          New-Item -ItemType Directory -Path $SmokeHome | Out-Null
+          $env:HOME = $SmokeHome
+          $env:USERPROFILE = $SmokeHome
+          $env:XDG_CONFIG_HOME = Join-Path $SmokeHome '.config'
+          $VersionText = (& $Binary --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $VersionText -ne "mysteries $env:VERSION") { throw 'Windows --version异常' }
+          & $Binary --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Windows --help异常' }
+
+          $Stage = Join-Path $env:RUNNER_TEMP 'mysteries-package-windows'
+          New-Item -ItemType Directory -Path $Stage | Out-Null
+          Copy-Item -LiteralPath $Binary -Destination (Join-Path $Stage 'mysteries.exe')
+          Copy-Item -LiteralPath 'LICENSE','README.md' -Destination $Stage
+          $Expected = @('LICENSE','README.md','mysteries.exe') | Sort-Object
+          $Actual = @(Get-ChildItem -LiteralPath $Stage -File | Select-Object -ExpandProperty Name | Sort-Object)
+          if (Compare-Object $Expected $Actual) { throw 'Windows staging文件集异常' }
+          if (@(Get-ChildItem -LiteralPath $Stage -Recurse | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count -ne 0) {
+              throw 'Windows staging包含reparse point'
+          }
+
+          $ArchiveName = "mysteries-v$env:VERSION-x86_64-pc-windows-msvc.zip"
+          $Archive = Join-Path $env:RUNNER_TEMP $ArchiveName
+          Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Archive
+          if ((Get-Item -LiteralPath $Archive).Length -le 0) { throw 'Windows archive为空' }
+
+          $Expanded = Join-Path $env:RUNNER_TEMP 'mysteries-expanded-windows'
+          Expand-Archive -LiteralPath $Archive -DestinationPath $Expanded
+          $ExpandedFiles = @(Get-ChildItem -LiteralPath $Expanded -File | Select-Object -ExpandProperty Name | Sort-Object)
+          if (Compare-Object $Expected $ExpandedFiles) { throw 'Windows archive文件集异常' }
+          $ExpandedBinary = Join-Path $Expanded 'mysteries.exe'
+          $ExpandedVersion = (& $ExpandedBinary --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $ExpandedVersion -ne "mysteries $env:VERSION") { throw '展开后的Windows --version异常' }
+          & $ExpandedBinary --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw '展开后的Windows --help异常' }
+          "archive=$Archive" >> $env:GITHUB_OUTPUT
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-package-windows-x86_64-pc-windows-msvc
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  package-linux:
+    name: Package release (linux-x86_64)
+    needs: metadata
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout release revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Verify revision
+        shell: bash
+        env:
+          EXPECTED_REVISION: ${{ needs.metadata.outputs.revision }}
+        run: |
+          set -euo pipefail
+          revision="$(git rev-parse HEAD)"
+          test "$revision" = "$EXPECTED_REVISION"
+          printf 'RELEASE_REVISION=%s\n' "$revision"
+
+      - name: Install and verify fixed Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RELEASE_RUST_VERSION" --profile minimal --target x86_64-unknown-linux-gnu
+          info="$(rustc +1.96.1 -Vv)"
+          printf '%s\n' "$info"
+          grep -Fx "commit-hash: $RELEASE_RUST_COMMIT" <<<"$info"
+          grep -Fx 'host: x86_64-unknown-linux-gnu' <<<"$info"
+
+      - name: Build, smoke, and package Linux archive
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo +1.96.1 build --release --locked --target x86_64-unknown-linux-gnu
+
+          binary="$GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/mysteries"
+          test -s "$binary"
+          file "$binary" | grep -E 'ELF 64-bit.*x86-64'
+          smoke_home="$RUNNER_TEMP/mysteries-smoke-home-linux"
+          mkdir -p "$smoke_home"
+          export HOME="$smoke_home"
+          export XDG_CONFIG_HOME="$smoke_home/.config"
+          test "$("$binary" --version)" = "mysteries $VERSION"
+          "$binary" --help >/dev/null
+
+          max_glibc="$(readelf --version-info "$binary" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -n 1)"
+          test -n "$max_glibc"
+          test "$(printf '%s\n' "$max_glibc" 'GLIBC_2.35' | sort -V | tail -n 1)" = 'GLIBC_2.35'
+
+          stage="$RUNNER_TEMP/mysteries-package-linux"
+          mkdir "$stage"
+          install -m 0755 "$binary" "$stage/mysteries"
+          install -m 0644 LICENSE README.md "$stage/"
+          test -z "$(find "$stage" -type l -print -quit)"
+          diff -u \
+            <(printf '%s\n' LICENSE README.md mysteries | sort) \
+            <(find "$stage" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+
+          archive_name="mysteries-v$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          archive="$RUNNER_TEMP/$archive_name"
+          tar --sort=name --owner=0 --group=0 --numeric-owner -C "$stage" \
+            -czf "$archive" LICENSE README.md mysteries
+          test -s "$archive"
+
+          expanded="$RUNNER_TEMP/mysteries-expanded-linux"
+          mkdir "$expanded"
+          tar -xzf "$archive" -C "$expanded"
+          diff -u \
+            <(printf '%s\n' LICENSE README.md mysteries | sort) \
+            <(find "$expanded" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          test -x "$expanded/mysteries"
+          test "$("$expanded/mysteries" --version)" = "mysteries $VERSION"
+          "$expanded/mysteries" --help >/dev/null
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Linux package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-package-linux-x86_64-unknown-linux-gnu
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble release bundle
+    needs:
+      - metadata
+      - package-windows
+      - package-linux
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download Windows package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-package-windows-x86_64-pc-windows-msvc
+          path: inputs/windows
+
+      - name: Download Linux package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-package-linux-x86_64-unknown-linux-gnu
+          path: inputs/linux
+
+      - name: Download release notes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-notes-${{ needs.metadata.outputs.version }}
+          path: inputs/notes
+
+      - name: Validate and seal release bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          windows="mysteries-v$VERSION-x86_64-pc-windows-msvc.zip"
+          linux="mysteries-v$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          test -z "$(find inputs -type l -print -quit)"
+          diff -u \
+            <(printf '%s\n' "inputs/windows/$windows" "inputs/linux/$linux" inputs/notes/release-notes.md | sort) \
+            <(find inputs -type f -print | sort)
+          test -s "inputs/windows/$windows"
+          test -s "inputs/linux/$linux"
+          grep -q '[^[:space:]]' inputs/notes/release-notes.md
+
+          diff -u \
+            <(printf '%s\n' LICENSE README.md mysteries.exe | sort) \
+            <(unzip -Z1 "inputs/windows/$windows" | sed 's#\\#/#g' | sed 's#/$##' | sort)
+          diff -u \
+            <(printf '%s\n' LICENSE README.md mysteries | sort) \
+            <(tar -tzf "inputs/linux/$linux" | sed 's#^\./##' | sed 's#/$##' | sort)
+
+          mkdir bundle
+          cp "inputs/windows/$windows" "inputs/linux/$linux" inputs/notes/release-notes.md bundle/
+          (
+            cd bundle
+            printf '%s\n' "$windows" "$linux" | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+            test "$(wc -l < SHA256SUMS)" -eq 2
+            grep -Ex '[0-9a-f]{64}  [^/ ]+' SHA256SUMS >/dev/null
+            sha256sum --check SHA256SUMS
+          )
+          test -z "$(find bundle -mindepth 1 ! -type f -print -quit)"
+          diff -u \
+            <(printf '%s\n' "$windows" "$linux" SHA256SUMS release-notes.md | sort) \
+            <(find bundle -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+
+      - name: Upload sealed release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundle-${{ needs.metadata.outputs.version }}
+          path: bundle/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - metadata
+      - assemble
+    if: ${{ needs.metadata.outputs.publish == 'true' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      REVISION: ${{ needs.metadata.outputs.revision }}
+      TAG: ${{ github.ref_name }}
+      WINDOWS_ASSET: mysteries-v${{ needs.metadata.outputs.version }}-x86_64-pc-windows-msvc.zip
+      LINUX_ASSET: mysteries-v${{ needs.metadata.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+    steps:
+      - name: Download sealed release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle-${{ needs.metadata.outputs.version }}
+          path: bundle
+
+      - name: Validate sealed bundle locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(find bundle -mindepth 1 ! -type f -print -quit)"
+          diff -u \
+            <(printf '%s\n' "$WINDOWS_ASSET" "$LINUX_ASSET" SHA256SUMS release-notes.md | sort) \
+            <(find bundle -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          grep -q '[^[:space:]]' bundle/release-notes.md
+          (
+            cd bundle
+            test "$(wc -l < SHA256SUMS)" -eq 2
+            grep -Ex '[0-9a-f]{64}  [^/ ]+' SHA256SUMS >/dev/null
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Revalidate remote tag and master under publish lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$TAG" = "v$VERSION"
+          test "$GITHUB_REF" = "refs/tags/$TAG"
+          test "$GITHUB_SHA" = "$REVISION"
+          remote="https://github.com/$GITHUB_REPOSITORY.git"
+
+          master_output="$(git ls-remote --heads "$remote" refs/heads/master)"
+          mapfile -t master_refs <<<"$master_output"
+          test "${#master_refs[@]}" -eq 1
+          master="$(awk '{print $1}' <<<"${master_refs[0]}")"
+
+          tag_output="$(git ls-remote --tags "$remote")"
+          direct_ref="refs/tags/$TAG"
+          peeled_ref="$direct_ref^{}"
+          mapfile -t direct_refs < <(awk -v ref="$direct_ref" '$2 == ref' <<<"$tag_output")
+          mapfile -t peeled_refs < <(awk -v ref="$peeled_ref" '$2 == ref' <<<"$tag_output")
+          test "${#direct_refs[@]}" -eq 1
+          test "${#peeled_refs[@]}" -eq 1
+          tag_object="$(awk '{print $1}' <<<"${direct_refs[0]}")"
+          peeled="$(awk '{print $1}' <<<"${peeled_refs[0]}")"
+          test "$tag_object" != "$peeled"
+          test "$peeled" = "$REVISION"
+          test "$peeled" = "$GITHUB_SHA"
+          test "$peeled" = "$master"
+
+      - name: Show GitHub CLI version
+        shell: bash
+        run: gh --version
+
+      - name: Preflight existing Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          matches="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id")"
+          test -z "$matches"
+
+      - name: Create draft Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "mysteries $TAG" --notes-file bundle/release-notes.md
+
+      - name: Upload draft assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
+            "bundle/$WINDOWS_ASSET" "bundle/$LINUX_ASSET" bundle/SHA256SUMS
+
+      - name: Inspect draft Release through API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > draft.json
+          jq -e --arg tag "$TAG" '
+            .tag_name == $tag and .draft == true and .prerelease == false and
+            (.target_commitish | type == "string" and length > 0) and
+            ([.assets[] | select(.size <= 0)] | length == 0)
+          ' draft.json >/dev/null
+          diff -u \
+            <(printf '%s\n' "$WINDOWS_ASSET" "$LINUX_ASSET" SHA256SUMS | sort) \
+            <(jq -r '.assets[].name' draft.json | sort)
+
+      - name: Download draft assets through API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir draft-download
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir draft-download \
+            --pattern "$WINDOWS_ASSET" --pattern "$LINUX_ASSET" --pattern SHA256SUMS
+
+      - name: Verify downloaded draft assets locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          diff -u \
+            <(printf '%s\n' "$WINDOWS_ASSET" "$LINUX_ASSET" SHA256SUMS | sort) \
+            <(find draft-download -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          (cd draft-download && sha256sum --check SHA256SUMS)
+
+      - name: Publish verified Release as latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Verify public Release metadata through API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > public.json
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == false and .prerelease == false' public.json >/dev/null
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" = "$TAG"
+          diff -u \
+            <(printf '%s\n' "$WINDOWS_ASSET" "$LINUX_ASSET" SHA256SUMS | sort) \
+            <(jq -r '.assets[].name' public.json | sort)
+
+  verify-public-windows:
+    name: Verify published release (windows-x86_64)
+    needs:
+      - metadata
+      - publish
+    if: ${{ needs.metadata.outputs.publish == 'true' && needs.publish.result == 'success' }}
+    runs-on: windows-2022
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download and verify public Windows asset anonymously
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path Env:GH_TOKEN) { throw 'public verify不应存在GH_TOKEN' }
+          if (Test-Path Env:GITHUB_TOKEN) { throw 'public verify不应存在GITHUB_TOKEN' }
+          $Asset = "mysteries-v$env:VERSION-x86_64-pc-windows-msvc.zip"
+          $Base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG"
+          Invoke-WebRequest "$Base/$Asset" -OutFile $Asset
+          Invoke-WebRequest "$Base/SHA256SUMS" -OutFile SHA256SUMS
+          $Lines = @(Get-Content -LiteralPath SHA256SUMS | Where-Object { $_ -match "  $([regex]::Escape($Asset))$" })
+          if ($Lines.Count -ne 1) { throw 'Windows public checksum记录缺失或重复' }
+          $ExpectedHash = ($Lines[0] -split '\s+')[0].ToLowerInvariant()
+          $ActualHash = (Get-FileHash -LiteralPath $Asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($ActualHash -ne $ExpectedHash) { throw 'Windows public checksum不匹配' }
+          Expand-Archive -LiteralPath $Asset -DestinationPath expanded
+          $Expected = @('LICENSE','README.md','mysteries.exe') | Sort-Object
+          $Actual = @(Get-ChildItem -LiteralPath expanded -File | Select-Object -ExpandProperty Name | Sort-Object)
+          if (Compare-Object $Expected $Actual) { throw 'Windows public archive文件集异常' }
+          $Binary = Join-Path (Resolve-Path expanded) 'mysteries.exe'
+          if ((& $Binary --version | Out-String).Trim() -ne "mysteries $env:VERSION") { throw 'Windows public --version异常' }
+          if ($LASTEXITCODE -ne 0) { throw 'Windows public --version失败' }
+          & $Binary --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Windows public --help失败' }
+
+  verify-public-linux:
+    name: Verify published release (linux-x86_64)
+    needs:
+      - metadata
+      - publish
+    if: ${{ needs.metadata.outputs.publish == 'true' && needs.publish.result == 'success' }}
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download and verify public Linux asset anonymously
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "${GH_TOKEN:-}"
+          test -z "${GITHUB_TOKEN:-}"
+          asset="mysteries-v$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          curl -fL --retry 3 -o "$asset" "$base/$asset"
+          curl -fL --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
+          test "$(grep -Ec "^[0-9a-f]{64}  $asset$" SHA256SUMS)" -eq 1
+          grep "  $asset$" SHA256SUMS | sha256sum --check
+          mkdir expanded
+          tar -xzf "$asset" -C expanded
+          diff -u \
+            <(printf '%s\n' LICENSE README.md mysteries | sort) \
+            <(find expanded -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          test -x expanded/mysteries
+          file expanded/mysteries | grep -E 'ELF 64-bit.*x86-64'
+          max_glibc="$(readelf --version-info expanded/mysteries | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -n 1)"
+          test -n "$max_glibc"
+          test "$(printf '%s\n' "$max_glibc" 'GLIBC_2.35' | sort -V | tail -n 1)" = 'GLIBC_2.35'
+          test "$(expanded/mysteries --version)" = "mysteries $VERSION"
+          expanded/mysteries --help >/dev/null

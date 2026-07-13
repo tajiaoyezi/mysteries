@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 [![CI](https://github.com/tajiaoyezi/mysteries/actions/workflows/ci.yml/badge.svg)](https://github.com/tajiaoyezi/mysteries/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-800%2B%20passing-brightgreen.svg)](#-工程方法与质量)
+[![tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](#-工程方法与质量)
 [![no Agent SDK](https://img.shields.io/badge/Agent%20SDK-none%20(self--built)-blueviolet.svg)](#-架构总览)
 
 </div>
@@ -75,6 +75,39 @@
 
 ## 🚀 快速开始
 
+### 下载 GitHub Release（推荐）
+
+在 [v1.2.0 Release](https://github.com/tajiaoyezi/mysteries/releases/tag/v1.2.0) 下载对应平台的 archive 与 `SHA256SUMS`：
+
+- Windows x86_64：`mysteries-v1.2.0-x86_64-pc-windows-msvc.zip`
+- GNU/Linux x86_64：`mysteries-v1.2.0-x86_64-unknown-linux-gnu.tar.gz`
+
+Windows PowerShell：
+
+```powershell
+$Asset = 'mysteries-v1.2.0-x86_64-pc-windows-msvc.zip'
+Invoke-WebRequest "https://github.com/tajiaoyezi/mysteries/releases/download/v1.2.0/$Asset" -OutFile $Asset
+Invoke-WebRequest 'https://github.com/tajiaoyezi/mysteries/releases/download/v1.2.0/SHA256SUMS' -OutFile SHA256SUMS
+$Expected = ((Get-Content SHA256SUMS | Where-Object { $_ -match "  $([regex]::Escape($Asset))$" }) -split '\s+')[0]
+if ((Get-FileHash $Asset -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Expected) { throw 'SHA-256 不匹配' }
+Expand-Archive $Asset -DestinationPath mysteries-v1.2.0
+./mysteries-v1.2.0/mysteries.exe --version
+```
+
+GNU/Linux：
+
+```bash
+curl -fLO https://github.com/tajiaoyezi/mysteries/releases/download/v1.2.0/mysteries-v1.2.0-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/tajiaoyezi/mysteries/releases/download/v1.2.0/SHA256SUMS
+grep 'mysteries-v1.2.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS | sha256sum --check
+tar -xzf mysteries-v1.2.0-x86_64-unknown-linux-gnu.tar.gz
+./mysteries --version
+```
+
+GNU/Linux 预编译包的支持基线为 x86_64、glibc 2.35-compatible（Ubuntu 22.04 或更新的兼容环境）。更老的 glibc 或 musl 环境请从源码构建。
+
+### 从源码构建
+
 ```bash
 cargo build --release         # 二进制产出在 target/release/mysteries(.exe)
 cargo install --path .        # 安装到 ~/.cargo/bin,让 mysteries 全局可用(推荐)
@@ -90,7 +123,7 @@ mysteries --headless "解释一下 src/agent 的结构"   # 无头单轮模式
 > cargo run --release -- --headless "..."
 > ```
 
-首次运行若未配置会自动进入 onboarding。
+无论使用 Release asset 还是源码构建，首次运行若未配置都会自动进入 onboarding。
 
 ## ⚙️ 配置
 

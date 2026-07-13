@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-13
+
+> 首个通过固定 revision、双平台原生构建、checksums 与公开下载复核交付的自动化 GitHub Release。
+
 ### 新增
 - **有界并行安全工具**:同一模型回复中连续的 `list_dir` / `read_file` / `glob` / `grep` 以 per-Agent 上限 4 并行执行;独立 `ToolConcurrency` 元数据(默认 `Exclusive`),不从 `PermissionLevel` 推断。结果仍按模型 occurrence 顺序写入 history / TUI;Network / Edit / Execute / Plan / 交互工具保持串行屏障。
 - **并行批次 TUI**:多张 Running C5 工具卡 + 活动状态行 `并行执行 N 个工具…` / `处理 N 个工具（最多并行 4）…`;Interrupt 收口 Running 卡与未配对 tool result;旧 session 激活前规范化残留 Running / dangling call。
@@ -27,6 +31,8 @@
 
 ## [1.1.0] - 2026-07-06
 
+> 开发里程碑；当时未创建 Git tag 或 GitHub Release。历史源码参考 commit `271d4ee67954dce7ea242144a0268adfd0cd4d61`。
+
 ### 新增
 - **思考模式**:统一 `Depth`(off/low/medium/high/xhigh)抽象,向下映射到 Anthropic adaptive+effort 与 OpenAI `reasoning_effort` 双链;`/think` 命令切换;思考过程 TUI 折叠展示(默认展开、超阈值折叠溢出、`✻ 思考` header);footer 档位指示。
 - **Plan 模式(L1)**:`PermissionMode::Plan` + schema-omit(plan 期只下发只读工具)+ `submit_plan`(结构化计划 + 每步验收)+ `ask_user`(A/B/C 澄清)+ 批准即执行;常驻进度面板 + `update_plan` 逐步上报。
@@ -47,6 +53,8 @@
 
 ## [1.0.0] - 2026-06-27
 
+> 开发里程碑；当时未创建 Git tag 或 GitHub Release。历史源码参考 commit `8c99d0dda69eb5648d7e7ec8871179f73794d439`。
+
 ### 新增
 - 自研 **Agent Loop**:模型决策 → tool_calls 逐个过权限门 → 执行回传 → 续推;`max_iterations` 上限、Esc 中断、全事件入 history。
 - **7 个内置工具**:`list_dir` / `read_file` / `glob` / `grep` / `write_file` / `edit_file`(唯一匹配替换)/ `run_shell`。
@@ -56,5 +64,7 @@
 - **TUI 外壳**:ratatui + crossterm,双 task + channel 架构,Midnight/Daylight 双主题。
 - **凭据链**(env → 文件)、**配置分层**(用户级 + 项目级合并)、**首次运行引导**。
 
-[1.1.0]: https://github.com/tajiaoyezi/mysteries/releases/tag/v1.1.0
-[1.0.0]: https://github.com/tajiaoyezi/mysteries/releases/tag/v1.0.0
+[Unreleased]: https://github.com/tajiaoyezi/mysteries/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/tajiaoyezi/mysteries/releases/tag/v1.2.0
+[1.1.0]: https://github.com/tajiaoyezi/mysteries/commit/271d4ee67954dce7ea242144a0268adfd0cd4d61
+[1.0.0]: https://github.com/tajiaoyezi/mysteries/commit/8c99d0dda69eb5648d7e7ec8871179f73794d439
