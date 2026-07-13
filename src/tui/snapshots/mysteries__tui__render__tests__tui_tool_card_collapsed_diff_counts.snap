@@ -2,7 +2,7 @@
 source: src/tui/render.rs
 expression: text
 ---
-‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.1.0‹/›
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.2.0‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 ‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›edit_file‹/›‹text.muted› path=src/config.rs‹/›‹text.secondary› · ‹/›‹success.fg›+3‹/›‹text.secondary› ‹/›‹error.fg›−2‹/›‹text.secondary› ⌄‹/›‹text.muted› · ctrl+o 展开‹/›
