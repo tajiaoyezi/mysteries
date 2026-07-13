@@ -57,7 +57,7 @@
 
 ## 8. Implementation PR 验证与合入
 
-- [ ] 8.1 在执行Git写操作前向用户展示最终scope与本地门禁；获批后提交/推送implementation branch并创建PR，记录PR number/head/base，tag与GitHub Release仍不存在。
+- [x] 8.1 在执行Git写操作前向用户展示最终scope与本地门禁；获批后提交/推送implementation branch并创建PR，记录PR number/head/base，tag与GitHub Release仍不存在。
 - [ ] 8.2 按`manual-verification.md` §5验证PR普通Windows/Ubuntu CI、Security audit及release metadata/Windows package/Linux package/aggregate全部成功；release run checkout的是synthetic merge，三个checkout job的revision markers均等于run `head_sha`，Actions run的`pull_requests[].head.sha`等于PR head；publish/public verify jobs skipped/absent。
 - [ ] 8.3 下载PR run的内部`release-bundle-1.2.0`，离线验证精确四个文件（两个archives、`SHA256SUMS`与release notes）、checksum与两个archive内容；它只作为workflow artifact，不得被误报为仅含三个公开assets的GitHub Release。
 - [ ] 8.4 对implementation code/workflow/docs与OpenSpec做独立审查，无P0/P1/P2后才允许merge；merge前再次确认远端没有`v1.2.0` tag/draft/public Release。
