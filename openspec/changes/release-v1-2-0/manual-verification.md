@@ -204,9 +204,11 @@ if ($PrInfo.state -ne 'OPEN' -or $PrInfo.baseRefName -ne 'master') { throw 'PR�
 gh pr checks $Pr
 
 $ReleaseRuns = @(gh run list --event pull_request --branch $PrInfo.headRefName --limit 50 --json databaseId,workflowName,headSha,event,status,conclusion,attempt,url | ConvertFrom-Json)
-$ReleaseRuns = @($ReleaseRuns | Where-Object { $_.workflowName -eq 'Release' })
+$ReleaseRuns = @($ReleaseRuns | Where-Object {
+    $_.workflowName -eq 'Release' -and $_.headSha -eq $PrInfo.headRefOid
+})
 if ($ReleaseRuns.Count -ne 1 -or $ReleaseRuns[0].conclusion -ne 'success') {
-    throw 'PR release validation run不唯一或未成功'
+    throw '当前PR head的release validation run不唯一或未成功'
 }
 $ReleaseRun = $ReleaseRuns[0]
 $ReleaseRunApi = gh api "repos/$Repo/actions/runs/$($ReleaseRun.databaseId)" | ConvertFrom-Json
