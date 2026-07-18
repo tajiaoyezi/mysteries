@@ -62,21 +62,21 @@
 - [x] 8.3 下载PR run的内部`release-bundle-1.2.0`，离线验证精确四个文件（两个archives、`SHA256SUMS`与release notes）、checksum与两个archive内容；它只作为workflow artifact，不得被误报为仅含三个公开assets的GitHub Release。
 - [x] 8.4 对implementation code/workflow/docs与OpenSpec做独立审查，无P0/P1/P2后才允许merge；merge前再次确认远端没有`v1.2.0` tag/draft/public Release。
 - [x] 8.5 保留首次tag run与未公开draft供诊断，复现draft tag endpoint返回404；通过repair PR把draft inspect/download/publish改为唯一Release/asset ID路径，并增加静态与真实draft只读回归，禁止手工公开或覆盖assets。
-- [ ] 8.6 repair PR本地门禁、普通CI/Security与PR release validation全部成功且无P0/P1/P2后合入；不得在repair merge前删除旧draft/tag。
+- [x] 8.6 repair PR本地门禁、普通CI/Security与PR release validation全部成功且无P0/P1/P2后合入；不得在repair merge前删除旧draft/tag。
 
 ## 9. Master dry-run 与 v1.2.0 tag
 
-- [ ] 9.1 合入repair PR后，按`manual-verification.md` §6唯一查询新的精确release merge SHA之master CI与Security runs，要求Windows/Ubuntu/RustSec全部success且revision markers等于该merge SHA。
-- [ ] 9.2 在用户已明确批准恢复且repair merge门禁成功后，删除唯一未公开draft与旧的本地/远端`v1.2.0` tag；删除前后均记录draft ID、tag object、peeled commit与public=false，禁止删除任何public Release或其他tag。
-- [ ] 9.3 在`origin/master`仍精确等于新的release merge SHA且旧draft/tag已清理时触发`release.yml` workflow_dispatch dry-run；metadata/package/aggregate全部success且head SHA一致，publish/public verify不运行，远端仍无tag/Release。
-- [ ] 9.4 向用户展示新的release merge SHA、master门禁、dry-run、version/assets/权限摘要并再次取得明确tag授权；旧SHA的授权不得复用。
-- [ ] 9.5 获批后重新创建annotated`v1.2.0` tag并在push前验证peeled commit精确等于新的release merge；push后记录tag object SHA、peeled commit与远端ref，禁止再次移动/覆盖已有tag。
+- [x] 9.1 合入repair PR后，按`manual-verification.md` §6唯一查询新的精确release merge SHA之master CI与Security runs，要求Windows/Ubuntu/RustSec全部success且revision markers等于该merge SHA。
+- [x] 9.2 在用户已明确批准恢复且repair merge门禁成功后，删除唯一未公开draft与旧的本地/远端`v1.2.0` tag；删除前后均记录draft ID、tag object、peeled commit与public=false，禁止删除任何public Release或其他tag。
+- [x] 9.3 在`origin/master`仍精确等于新的release merge SHA且旧draft/tag已清理时触发`release.yml` workflow_dispatch dry-run；metadata/package/aggregate全部success且head SHA一致，publish/public verify不运行，远端仍无tag/Release。
+- [x] 9.4 向用户展示新的release merge SHA、master门禁、dry-run、version/assets/权限摘要并再次取得明确tag授权；旧SHA的授权不得复用。
+- [x] 9.5 获批后重新创建annotated`v1.2.0` tag并在push前验证peeled commit精确等于新的release merge；push后记录tag object SHA、peeled commit与远端ref，禁止再次移动/覆盖已有tag。
 
 ## 10. Tag 发布、公开下载验收与归档
 
-- [ ] 10.1 唯一定位`v1.2.0` tag-triggered release run，验证metadata、Windows/Linux package、aggregate、publish、两个public verify jobs全部success；所有checkout jobs的唯一`RELEASE_REVISION` marker、run `head_sha`与tag peeled commit均等于release merge SHA。
-- [ ] 10.2 按`manual-verification.md` §8验证public/latest GitHub Release metadata与精确三个非空assets；draft/prerelease均false，asset names、sizes及API digest（若提供）与workflow证据一致。
-- [ ] 10.3 按§9从public Release重新下载Windows ZIP与`SHA256SUMS`，验证checksum/文件集/`--version`/`--help`；在Windows Terminal真机启动并正常退出TUI，PowerShell立即可用且不污染测试外credential/session。
-- [ ] 10.4 以tag workflow的Linux public-download job（及可用时的Linux/WSL重复命令）验证Linux tar.gz checksum、文件集、executable bit、`--version`与`--help`。
-- [ ] 10.5 重新运行strict OpenSpec与scope检查；依据真实远端证据完成所有tasks，起草`.ai_history/logs/` archive决策记录交用户审阅，内容必须含`manual-verification.md` §10全部字段且不得含凭据/绝对路径。
-- [ ] 10.6 用户批准决策记录后，同一archive commit完成`release-delivery`新增主spec、`dependency-security` delta sync、最终tasks勾选与change move；创建archive PR并通过checks后合入。不得追加递归evidence commit，archive后`master`领先`v1.2.0` tag属于预期。
+- [x] 10.1 唯一定位`v1.2.0` tag-triggered release run，验证metadata、Windows/Linux package、aggregate、publish、两个public verify jobs全部success；所有checkout jobs的唯一`RELEASE_REVISION` marker、run `head_sha`与tag peeled commit均等于release merge SHA。
+- [x] 10.2 按`manual-verification.md` §8验证public/latest GitHub Release metadata与精确三个非空assets；draft/prerelease均false，asset names、sizes及API digest（若提供）与workflow证据一致。
+- [x] 10.3 按§9从public Release重新下载Windows ZIP与`SHA256SUMS`，验证checksum/文件集/`--version`/`--help`；在Windows Terminal真机启动并正常退出TUI，PowerShell立即可用且不污染测试外credential/session。
+- [x] 10.4 以tag workflow的Linux public-download job（及可用时的Linux/WSL重复命令）验证Linux tar.gz checksum、文件集、executable bit、`--version`与`--help`。
+- [x] 10.5 重新运行strict OpenSpec与scope检查；依据真实远端证据完成所有tasks，起草`.ai_history/logs/` archive决策记录交用户审阅，内容必须含`manual-verification.md` §10全部字段且不得含凭据/绝对路径。
+- [x] 10.6 用户批准决策记录后，同一archive commit完成`release-delivery`新增主spec、`dependency-security` delta sync、最终tasks勾选与change move；创建archive PR并通过checks后合入。不得追加递归evidence commit，archive后`master`领先`v1.2.0` tag属于预期。
