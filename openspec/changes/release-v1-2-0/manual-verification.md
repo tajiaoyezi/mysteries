@@ -162,6 +162,9 @@ $Workflow = Get-Content -LiteralPath '.github\workflows\release.yml' -Raw
   'Verify published release (linux-x86_64)',
   'permissions:', 'contents: read', 'contents: write',
   'persist-credentials: false', 'RELEASE_REVISION=',
+  'steps.draft_release.outputs.release_id',
+  'releases?per_page=100', 'releases/$release_id',
+  'releases/assets/$asset_id',
   'cargo +1.96.1 build --release --locked',
   'windows-2022', 'ubuntu-22.04',
   'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu',
@@ -187,10 +190,32 @@ foreach ($Use in $Uses) {
     if ($Ref -notmatch '@[0-9a-f]{40}$') { throw "Action未固定完整SHA: $Ref" }
 }
 
+$DraftInspectStart = $Workflow.IndexOf('- name: Inspect draft Release through API')
+$PublicVerifyStart = $Workflow.IndexOf('- name: Verify public Release metadata through API')
+if ($DraftInspectStart -lt 0 -or $PublicVerifyStart -le $DraftInspectStart) {
+    throw '无法唯一定位draft/public API验证边界'
+}
+$DraftFlow = $Workflow.Substring($DraftInspectStart, $PublicVerifyStart - $DraftInspectStart)
+@(
+  'releases?per_page=100',
+  'releases/$release_id',
+  'releases/assets/$asset_id',
+  'steps.draft_release.outputs.release_id'
+) | ForEach-Object {
+    if (-not $DraftFlow.Contains($_)) { throw "draft流程未按Release/asset ID绑定: $_" }
+}
+@('releases/tags/$TAG', 'gh release download', 'gh release edit') | ForEach-Object {
+    if ($DraftFlow.Contains($_)) { throw "draft流程包含禁止的tag/CLI访问: $_" }
+}
+$PublicFlow = $Workflow.Substring($PublicVerifyStart)
+if (-not $PublicFlow.Contains('releases/tags/$TAG')) {
+    throw '公开后校验缺少tag endpoint'
+}
+
 git diff --exit-code -- '.github/workflows/ci.yml' '.github/workflows/security-audit.yml'
 ```
 
-再人工逐job审查：workflow顶层read；只有tag-gated publish job为`contents: write`且配置repository/tag concurrency、`cancel-in-progress:false`；publish job没有checkout/Cargo/仓库脚本/binary执行，并在首次API写入前匿名读取remote master与不带`--refs`的tags输出、按完整ref名本地精确过滤唯一tag object/peeled refs，验证tag/peeled SHA不同且peeled等于master/run/metadata revision；`GH_TOKEN`仅出现在Release API shell steps。只有metadata/Windows package/Linux package三个job执行checkout，均只用内建只读token input且不持久化credential；build/package/checksum/smoke无token env。两个public verify jobs只能使用匿名HTTPS URL，不能调用`gh`/API。
+再人工逐job审查：workflow顶层read；只有tag-gated publish job为`contents: write`且配置repository/tag concurrency、`cancel-in-progress:false`；publish job没有checkout/Cargo/仓库脚本/binary执行，并在首次API写入前匿名读取remote master与不带`--refs`的tags输出、按完整ref名本地精确过滤唯一tag object/peeled refs，验证tag/peeled SHA不同且peeled等于master/run/metadata revision；draft创建后必须通过分页Release列表唯一解析`release_id`，随后metadata读取、asset下载、publish始终绑定该Release/asset ID，draft公开前不得调用`/releases/tags/{tag}`，只有publish成功后的公开metadata校验允许使用tag endpoint；`GH_TOKEN`仅出现在Release API shell steps。只有metadata/Windows package/Linux package三个job执行checkout，均只用内建只读token input且不持久化credential；build/package/checksum/smoke无token env。两个public verify jobs只能使用匿名HTTPS URL，不能调用`gh`/API。
 
 ## 5. Implementation PR 门禁
 
@@ -359,7 +384,7 @@ if (Compare-Object ($ExpectedAssets | Sort-Object) $Names) { throw 'Release asse
 if (@($Release.assets | Where-Object size -le 0).Count -ne 0) { throw 'Release含空asset' }
 ```
 
-要求tag workflow所有目标jobs成功，公开前draft/API/download checksum步骤在log中可见，公开后两个verify jobs成功；publish失败/残留draft时停止，不自动删除tag或覆盖asset。
+要求tag workflow所有目标jobs成功；公开前log必须证明draft由分页列表唯一解析为Release ID、metadata通过`/releases/{release_id}`读取、三个asset通过各自`/releases/assets/{asset_id}`下载并校验checksum、publish PATCH仍指向同一Release ID，且公开前不得出现`/releases/tags/{tag}`访问；公开后tag endpoint校验与两个匿名verify jobs成功。publish失败/残留draft时停止，不自动删除tag或覆盖asset。
 
 ## 9. 从公开 Release 下载后复核
 

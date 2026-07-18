@@ -471,30 +471,55 @@ jobs:
             "bundle/$WINDOWS_ASSET" "bundle/$LINUX_ASSET" bundle/SHA256SUMS
 
       - name: Inspect draft Release through API
+        id: draft_release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > draft.json
-          jq -e --arg tag "$TAG" '
-            .tag_name == $tag and .draft == true and .prerelease == false and
+          mapfile -t release_ids < <(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"$TAG\") | .id"
+          )
+          test "${#release_ids[@]}" -eq 1
+          release_id="${release_ids[0]}"
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > draft.json
+          jq -e --arg tag "$TAG" --argjson id "$release_id" '
+            .id == $id and .tag_name == $tag and
+            .draft == true and .prerelease == false and
             (.target_commitish | type == "string" and length > 0) and
             ([.assets[] | select(.size <= 0)] | length == 0)
           ' draft.json >/dev/null
           diff -u \
             <(printf '%s\n' "$WINDOWS_ASSET" "$LINUX_ASSET" SHA256SUMS | sort) \
             <(jq -r '.assets[].name' draft.json | sort)
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
 
       - name: Download draft assets through API
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.release_id }}
         run: |
           set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
           mkdir draft-download
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir draft-download \
-            --pattern "$WINDOWS_ASSET" --pattern "$LINUX_ASSET" --pattern SHA256SUMS
+          asset_count=0
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ "$asset_id" =~ ^[0-9]+$ ]]
+            case "$asset_name" in
+              "$WINDOWS_ASSET"|"$LINUX_ASSET"|SHA256SUMS) ;;
+              *) exit 1 ;;
+            esac
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              > "draft-download/$asset_name"
+            test -s "draft-download/$asset_name"
+            asset_count=$((asset_count + 1))
+          done < <(jq -r '.assets[] | [.id, .name] | @tsv' draft.json)
+          test "$asset_count" -eq 3
 
       - name: Verify downloaded draft assets locally
         shell: bash
@@ -509,18 +534,30 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.release_id }}
         run: |
           set -euo pipefail
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -f make_latest=true > published.json
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '
+            .id == $id and .tag_name == $tag and
+            .draft == false and .prerelease == false
+          ' published.json >/dev/null
 
       - name: Verify public Release metadata through API
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.release_id }}
         run: |
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > public.json
-          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == false and .prerelease == false' public.json >/dev/null
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '
+            .id == $id and .tag_name == $tag and
+            .draft == false and .prerelease == false
+          ' public.json >/dev/null
           test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" = "$TAG"
           diff -u \
             <(printf '%s\n' "$WINDOWS_ASSET" "$LINUX_ASSET" SHA256SUMS | sort) \

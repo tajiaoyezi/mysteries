@@ -120,8 +120,8 @@ publish流程：
 2. 确认同tag不存在draft/public Release，预期asset名称未占用。
 3. 以已存在的远端annotated tag创建stable draft Release，title=`mysteries v<version>`，notes来自Changelog，不自动生成另一份notes。
 4. 上传两个archives和`SHA256SUMS`，不使用`--clobber`。
-5. API回读tag、draft/prerelease/latest状态、asset精确集合、size>0；从draft重新下载并检查SHA-256。
-6. 全部成功才把draft转为public/latest。
+5. 通过paginated Release列表按tag精确筛选唯一draft ID，再用`/releases/{release_id}`回读tag、target、draft/prerelease状态、asset精确集合与size>0；draft阶段禁止使用只解析public Release的`/releases/tags/{tag}`。每个asset必须按回读的asset ID通过`/releases/assets/{asset_id}`重新下载并检查SHA-256。
+6. 全部成功后只按同一Release ID执行PATCH转为public/latest；转公开成功后才允许通过`/releases/tags/{tag}`与`/releases/latest`复核public/latest状态和asset集合。
 7. 只读Windows/Linux verify jobs不设置`GH_TOKEN`/`GITHUB_TOKEN` env、不调用`gh`或API，直接从`https://github.com/<repo>/releases/download/<tag>/<asset>`匿名下载对应archive+checksum，验证并运行`--version`/`--help`，证明public访问而非仅证明token可读。
 
 若draft创建或上传后失败，workflow保留非公开draft供诊断并失败；自动化不删除tag、draft或asset。修复后是否删除未公开draft/tag并重发，必须由用户另行明确批准。Release一旦公开，tag与asset视为不可变；任何缺陷通过v1.2.1修复，禁止重写v1.2.0。
@@ -164,7 +164,7 @@ README优先提供GitHub Release下载和checksum验证，同时保留源码`car
 6. 等待tag workflow完成draft→public→双平台downloaded smoke；人工在Windows Terminal下载release ZIP、校验checksum、启动/退出TUI。
 7. 依据真实远端证据勾选release tasks，起草用户审阅的archive决策记录；同步delta specs并在同一archive PR中移动change。归档后`master`可领先tag，这是预期状态。
 
-回滚边界：tag前可整体revert implementation merge；tag已push但Release未公开时，自动化不做破坏性清理，必须由用户审查后决定删除draft/tag并在修复后重建；Release公开后禁止重写tag/assets，只能发布v1.2.1并在release notes说明修复。
+回滚边界：tag前可整体revert implementation merge；tag已push但Release未公开时，自动化不做破坏性清理，必须保留失败run与draft字段供诊断。用户明确批准恢复后，先通过repair PR修复并验证publish逻辑，再删除未公开draft与旧tag、对新的精确master merge重复CI/dry-run与tag授权后重建；Release公开后禁止重写tag/assets，只能发布v1.2.1并在release notes说明修复。
 
 ## Open Questions
 
