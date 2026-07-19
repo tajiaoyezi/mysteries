@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+### 新增
+- **Agent execution scope 基础**:每次 Agent run 具有稳定 identity、可传播 cancellation、iteration/deadline/child-depth 预算和单调收窄的工具/权限 capability;既有入口保持兼容,TUI Interrupt 改由 Agent Loop 内核收口 history,Provider 回复前中断会隔离未提交的旧 Prompt,避免下一轮继续旧任务。受限 `ToolRegistry` 共享同一工具实例,scope clamp 先于权限模式、allowlist 与用户决策生效。本项只为后续只读 subagent 提供安全基础,尚未提供 `delegate_task`、后台任务或 child session,也不硬取消已进入 blocking pool 的 OS 同步工作。
+
 ## [1.2.0] - 2026-07-13
 
 > 首个通过固定 revision、双平台原生构建、checksums 与公开下载复核交付的自动化 GitHub Release。

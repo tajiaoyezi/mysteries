@@ -487,9 +487,10 @@ struct MockProvider { script: Vec<ModelResponse>, cursor: AtomicUsize }
 | **1.2 持久化** | `Session` 已 `derive(Serialize)`,是天然落盘单元 | 加 `SessionStore` trait(file/sqlite);1.0 无实现 |
 | **1.3 权限工效** | 权限门 `gate()` 已集中决策点 | 在 `ask` 前插 `PolicyEngine`(allowlist/风险分级/always-allow) |
 | **1.4 TUI 体验** | 渲染隔离在 `tui/` | 纯加法:markdown 渲染、diff 高亮、折叠 |
-| **1.5 并行工具** | 独立 `ToolConcurrency` + 默认 Exclusive;连续 ParallelSafe 段 work-conserving 有界并行(上限 4);Exclusive / Network / Edit / Execute / 交互为屏障 | 不按 ReadOnly 推断;TUI Interrupt 收口仅是 turn 级 helper,不是通用 Agent / child cancellation API |
-| **2.0 MCP** | `ToolRegistry` 持 `Box<dyn Tool>` | MCP 工具作为另一种 `Tool` 实现,代理到 MCP server |
-| **2.0 subagent** | Agent Loop 即可构造的单元(Session+Registry+Provider) | child = 带独立 context 预算 + 受限 registry 的另一个 Loop;依赖 1.1 预算 + 1.5 有界调度先例 + 1.3 作用域;须另设计可复用 cancellation |
+| **1.5 并行工具** | 独立 `ToolConcurrency` + 默认 Exclusive;连续 ParallelSafe 段 work-conserving 有界并行(上限 4);Exclusive / Network / Edit / Execute / 交互为屏障 | 不按 ReadOnly 推断;已由通用 Agent execution scope 取代早期 TUI turn helper,Provider / permission / 串并行工具统一响应 cancellation |
+| **1.3 execution scope** | 每次 run 有稳定 identity、parent→child cancellation、iteration/deadline/depth 预算与 capability 上限;受限 registry 共享 `Arc<dyn Tool>` | child scope 只能收紧预算、工具名与权限级,不能扩权;Provider 回复前取消会从后续模型history隔离未提交Prompt,但保留TUI transcript;取消只收口 Agent future/history/observer,不硬取消已进入 blocking pool 的 OS 工作 |
+| **2.0 MCP** | `ToolRegistry` 内部持共享 `Arc<dyn Tool>`,注册边界仍接受 `Box<dyn Tool>` | MCP 工具可作为另一种 `Tool` 实现,代理到 MCP server;本阶段未实现 |
+| **2.0 subagent** | Agent Loop 即可构造的单元(Session+Registry+Provider)+可派生 execution scope | child = 带独立 context 预算 + 受限 registry 的另一个 Loop;execution scope 只是前置安全基础,尚未实现 `delegate_task`、child scheduler、child session 或 subagent UI |
 | **OAuth 登录** | `CredentialChain` 已是可扩展链 | 加 `OAuthCredentialSource`,配合 1.2 存 token |
 
 ---

@@ -1,7 +1,9 @@
+use crate::agent::ExecutionCapabilities;
 use crate::provider::ToolCall;
 use crate::tool::{NetworkPermissionPreview, PermissionLevel, Tool};
 use async_trait::async_trait;
 use std::collections::BTreeSet;
+use thiserror::Error;
 
 pub mod preview;
 
@@ -27,6 +29,24 @@ pub enum PermissionDenial {
 pub enum PermissionGateOutcome {
     Allow,
     Deny(PermissionDenial),
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("execution scope violation: {reason}")]
+pub struct ScopeViolation {
+    reason: String,
+}
+
+impl ScopeViolation {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +195,40 @@ pub async fn gate(
     }
 }
 
+pub async fn gate_scoped(
+    call: &ToolCall,
+    tool: &dyn Tool,
+    decider: &dyn PermissionDecider,
+    capabilities: &ExecutionCapabilities,
+) -> Result<PermissionGateOutcome, ScopeViolation> {
+    ensure_tool_in_scope(tool, capabilities)?;
+    Ok(gate(call, tool, decider).await)
+}
+
+pub fn ensure_tool_in_scope(
+    tool: &dyn Tool,
+    capabilities: &ExecutionCapabilities,
+) -> Result<(), ScopeViolation> {
+    if !capabilities.tool_names().contains(tool.name()) {
+        return Err(ScopeViolation::new(format!(
+            "tool `{}` is outside the execution scope",
+            tool.name()
+        )));
+    }
+    if !capabilities
+        .permission_levels()
+        .contains(&tool.permission_level())
+    {
+        return Err(ScopeViolation::new(format!(
+            "permission level `{:?}` for tool `{}` is outside the execution scope",
+            tool.permission_level(),
+            tool.name()
+        )));
+    }
+
+    Ok(())
+}
+
 fn network_preview_denial_reason(preview: &NetworkPermissionPreview) -> Option<String> {
     if !preview.authorizable {
         return Some(
@@ -204,10 +258,11 @@ fn network_preview_denial_reason(preview: &NetworkPermissionPreview) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_allows, cycle_permission_mode, gate, normalize, permission_mode_label,
+        auto_allows, cycle_permission_mode, gate, gate_scoped, normalize, permission_mode_label,
         PermissionCheck, PermissionDecider, PermissionDecision, PermissionDenial,
         PermissionGateOutcome, PermissionMode, PolicyEngine,
     };
+    use crate::agent::ExecutionCapabilities;
     use crate::provider::ToolCall;
     use crate::tool::{
         NetworkPermissionPreview, NetworkPermissionScope, PermissionLevel, Tool, ToolContext,
@@ -415,6 +470,17 @@ mod tests {
         }
     }
 
+    fn capabilities(
+        tool_names: &[&str],
+        permission_levels: &[PermissionLevel],
+    ) -> ExecutionCapabilities {
+        ExecutionCapabilities::try_new(
+            tool_names.iter().copied(),
+            permission_levels.iter().cloned(),
+        )
+        .unwrap()
+    }
+
     fn assert_network_unauthorizable(outcome: PermissionGateOutcome) {
         match outcome {
             PermissionGateOutcome::Deny(PermissionDenial::NetworkUnauthorizable(reason)) => {
@@ -533,6 +599,81 @@ mod tests {
 
         assert_eq!(decision, PermissionGateOutcome::Allow);
         assert_eq!(decider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn scoped_gate_rejects_readonly_tool_name_before_legacy_allow() {
+        let tool = MockTool {
+            permission_level: PermissionLevel::ReadOnly,
+        };
+        let decider = StaticDecider::new(PermissionDecision::Allow);
+        let restricted = capabilities(&["different_tool"], &[PermissionLevel::ReadOnly]);
+
+        let result = gate_scoped(&call(), &tool, &decider, &restricted).await;
+
+        let violation = result.unwrap_err();
+        assert_eq!(decider.calls(), 0);
+        assert!(violation.reason().contains("mock_tool"));
+        assert!(!violation.reason().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn scoped_gate_rejects_execute_level_before_always_allow_decider() {
+        let tool = MockTool {
+            permission_level: PermissionLevel::Execute,
+        };
+        let decider = StaticDecider::new(PermissionDecision::Allow);
+        let restricted = capabilities(&["mock_tool"], &[PermissionLevel::ReadOnly]);
+
+        let result = gate_scoped(&call(), &tool, &decider, &restricted).await;
+
+        assert_eq!(decider.calls(), 0);
+        let violation = result.unwrap_err();
+        assert!(violation.reason().contains("Execute"));
+    }
+
+    #[tokio::test]
+    async fn scoped_gate_rejects_network_before_preview_and_decider() {
+        let tool = PreviewTool::new(authorizable_preview());
+        let decider = RecordingDecider::new(PermissionDecision::Allow);
+        let restricted = capabilities(&["network_tool"], &[PermissionLevel::ReadOnly]);
+
+        let result = gate_scoped(&network_call(), &tool, &decider, &restricted).await;
+
+        assert_eq!(tool.preview_calls(), 0);
+        assert_eq!(decider.calls(), 0);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn scoped_gate_keeps_allowed_legacy_outcomes_and_denial_variants() {
+        let readonly = MockTool {
+            permission_level: PermissionLevel::ReadOnly,
+        };
+        let readonly_decider = StaticDecider::new(PermissionDecision::Deny);
+        let readonly_capabilities = capabilities(&["mock_tool"], &[PermissionLevel::ReadOnly]);
+        assert_eq!(
+            gate_scoped(
+                &call(),
+                &readonly,
+                &readonly_decider,
+                &readonly_capabilities
+            )
+            .await,
+            Ok(PermissionGateOutcome::Allow)
+        );
+        assert_eq!(readonly_decider.calls(), 0);
+
+        let execute = MockTool {
+            permission_level: PermissionLevel::Execute,
+        };
+        let execute_decider = StaticDecider::new(PermissionDecision::Deny);
+        let execute_capabilities = capabilities(&["mock_tool"], &[PermissionLevel::Execute]);
+        assert_eq!(
+            gate_scoped(&call(), &execute, &execute_decider, &execute_capabilities).await,
+            Ok(PermissionGateOutcome::Deny(PermissionDenial::UserDenied))
+        );
+        assert_eq!(execute_decider.calls(), 1);
     }
 
     #[tokio::test]

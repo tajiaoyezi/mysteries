@@ -39,7 +39,7 @@
 
 ## ✨ 特性
 
-- **Agent Loop 自研**:模型决策 → tool_calls 过权限门 → 执行回传 → 续推;`max_iterations` 上限、Esc 即时中断、全事件落 history。同一回复中连续的本地读取 / 搜索(`list_dir` / `read_file` / `glob` / `grep`)以固定上限 4 有界并行;变更 / 执行 / Network / 交互工具仍串行屏障,权限语义不变。
+- **Agent Loop 自研**:模型决策 → tool_calls 过权限门 → 执行回传 → 续推;每次 run 具有内核级 execution scope,可标识、可取消,并以 iteration/deadline/depth 预算及工具/权限 capability 上限阻止派生 run 扩权;Esc 中断由 Loop 统一收口 history,Provider 回复前中断的未提交 Prompt 不会污染下一轮模型上下文。同一回复中连续的本地读取 / 搜索(`list_dir` / `read_file` / `glob` / `grep`)以固定上限 4 有界并行;变更 / 执行 / Network / 交互工具仍串行屏障,权限语义不变。该基础尚不等于 subagent / 后台任务,且不会强制终止已进入 blocking pool 的 OS 同步工作。
 - **内置工具**:`list_dir` / `read_file` / `glob` / `grep` / `write_file` / `edit_file`(唯一匹配替换)/ `run_shell` + 联网 `web_fetch` / `web_search`(SSRF 护栏)+ Plan 三件 `submit_plan` / `update_plan` / `ask_user`。
 - **四级权限 × 四种模式**:工具按 `ReadOnly/Network/Edit/Execute` 分级;`Normal / AcceptEdits / Yolo / Plan` 经 Shift+Tab 循环。有效 Network preview 在 Normal/AcceptEdits/Plan 下逐次确认,Yolo 仅自动放行可授权 preview;未知或畸形 Network 调用始终拒绝。命令白名单 + always-allow 仅适用于 Execute。
 - **Plan 模式**:先只读调研 → 交出带每步验收的结构化计划 → 你批准后逐步执行,常驻进度面板实时上报。
@@ -154,7 +154,7 @@ mysteries --headless "解释一下 src/agent 的结构"   # 无头单轮模式
 
 | 模块 | 路径 | 职责 |
 |------|------|------|
-| Agent Loop | `src/agent/` | 核心决策循环:模型调用 → 工具执行 → 结果回传 → 续推;Observer 事件外发;上下文压缩 |
+| Agent Loop | `src/agent/` | 核心决策循环:模型调用 → 工具执行 → 结果回传 → 续推;execution scope 提供 run identity、cancellation、预算和不可扩权 capability;Observer 事件外发;上下文压缩 |
 | Provider | `src/provider/` | `Provider` trait + OpenAI/Anthropic/Mock 接入、流式解析、registry 热切换、模型能力表 |
 | Tool 系统 | `src/tool/` | `Tool` trait + `ToolRegistry`,内置工具按 `PermissionLevel` 分级(fs / shell / web / plan / ask) |
 | Permission | `src/permission/` | 权限门:本地只读放行,Network/写/执行经 `PermissionDecider` 确认;Network preview fail-closed;四种模式 + Execute 命令白名单 |
@@ -171,7 +171,7 @@ mysteries --headless "解释一下 src/agent 的结构"   # 无头单轮模式
 
 ## 🧪 工程方法与质量
 
-- **OpenSpec 流程**:每个变更 propose(proposal/design/tasks/spec delta)→ apply → archive。已归档 **59 个 change**,15+ 个能力域 spec 沉淀在 `openspec/specs/`(RFC 2119 风格),每个 change 附一条决策记录到 `.ai_history/logs/`。
+- **OpenSpec 流程**:每个变更 propose(proposal/design/tasks/spec delta)→ apply → archive。已归档 **64 个 change**,19 个能力域 spec 沉淀在 `openspec/specs/`(RFC 2119 风格),每个 change 附一条决策记录到 `.ai_history/logs/`。
 - **TDD**:内核(Loop / 工具 / 权限 / Provider 归一化 / 配置 merge)强制先测后码、红灯独立成步;TUI 外壳走 `TestBackend` + `insta` 快照事后回归。
 - **当前**:**800+ tests 全绿**(lib 单测 + e2e 集成)、`clippy -D warnings` 零警告、行覆盖 **~91%**(llvm-cov;内核如 Agent Loop 99%、工具 96–100%)。
 - **构建 CI**(`.github/workflows/ci.yml`):Windows + Linux 上强制 `fmt --check` + `clippy -D` + **全量 `cargo test --locked`** + release build。

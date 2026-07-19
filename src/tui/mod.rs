@@ -1,7 +1,7 @@
 use crate::agent::message::Message;
 use crate::agent::run_compact_command;
 use crate::agent::DEFAULT_SYSTEM_PROMPT;
-use crate::agent::{Agent, AgentStatus, Compacting};
+use crate::agent::{Agent, AgentStatus, Compacting, ScopedAgentError};
 use crate::app::select_provider;
 use crate::cli::{load_config_or_onboard, CliError, CliPaths, StdinAuthPrompter};
 use crate::config::{Config, ProviderConfig, ProviderKind, ProviderProfile};
@@ -128,7 +128,7 @@ pub(crate) fn normalize_loaded_session(
     history: &mut Vec<Message>,
     transcript: &mut [app::TranscriptBlock],
 ) {
-    fill_dangling_tool_results(history, 0);
+    complete_interrupted_tool_results(history, 0);
     for block in transcript.iter_mut() {
         if let app::TranscriptBlock::Tool(card) = block {
             if card.status == app::ToolCardStatus::Running {
@@ -141,7 +141,9 @@ pub(crate) fn normalize_loaded_session(
     }
 }
 
-/// 当前 turn 中断后按 occurrence / FIFO 补齐未配对 ToolResult。
+/// 按 occurrence / FIFO 补齐指定 history 后缀的未配对 ToolResult。
+///
+/// 当前 turn 已由 Agent execution scope 收口；此 seam 仅供旧 session 激活时规范化。
 pub(crate) fn complete_interrupted_tool_results(
     history: &mut Vec<Message>,
     turn_history_start: usize,
@@ -1579,31 +1581,40 @@ pub async fn run_agent_task(
             channel::UserInput::Prompt(prompt) => {
                 while interrupt_rx.try_recv().is_ok() {}
 
-                let (mut working, turn_history_start) = {
+                let mut working = {
                     let mut history = agent_history.lock().await;
                     history.push(Message::User(prompt));
-                    let turn_history_start = history.len() - 1;
-                    (history.clone(), turn_history_start)
+                    history.clone()
                 };
                 let sink = channel::ChannelSink::new(ui_tx.clone());
                 let observer = channel::ChannelObserver::new(ui_tx.clone());
+                let scope = agent.root_scope();
+                let mut run = Box::pin(agent.run_observed_scoped(
+                    &scope,
+                    &mut working,
+                    &ctx,
+                    &sink,
+                    &observer,
+                ));
 
-                tokio::select! {
-                    result = agent.run_observed(&mut working, &ctx, &sink, &observer) => {
-                        *agent_history.lock().await = working;
-                        match result {
-                            Ok(_) => {
-                                let _ = ui_tx.send(channel::AgentEvent::TurnComplete);
-                            }
-                            Err(err) => {
-                                let _ = ui_tx.send(channel::AgentEvent::Error(error_message(err)));
-                            }
-                        }
-                    }
+                let result = tokio::select! {
+                    biased;
+                    result = &mut run => result,
                     _ = wait_for_interrupt(&mut interrupt_rx) => {
-                        // drop run future 后补齐本 turn 未配对 occurrence，再只发 Interrupted。
-                        complete_interrupted_tool_results(&mut working, turn_history_start);
-                        *agent_history.lock().await = working;
+                        scope.cancel();
+                        run.as_mut().await
+                    }
+                };
+                drop(run);
+                *agent_history.lock().await = working;
+                match result {
+                    Ok(_) => {
+                        let _ = ui_tx.send(channel::AgentEvent::TurnComplete);
+                    }
+                    Err(ScopedAgentError::Agent(err)) => {
+                        let _ = ui_tx.send(channel::AgentEvent::Error(error_message(err)));
+                    }
+                    Err(ScopedAgentError::Cancelled | ScopedAgentError::DeadlineExceeded) => {
                         let _ = ui_tx.send(channel::AgentEvent::Interrupted);
                     }
                 }
@@ -2117,6 +2128,7 @@ mod tests {
 
     struct FirstCallHangsThenRespondsProvider {
         calls: Arc<AtomicUsize>,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
     }
 
     #[async_trait]
@@ -2127,9 +2139,10 @@ mod tests {
 
         async fn complete(
             &self,
-            _req: ModelRequest,
+            req: ModelRequest,
             sink: &dyn DeltaSink,
         ) -> Result<ModelResponse, ProviderError> {
+            self.requests.lock().unwrap().push(req);
             let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
             if call_index == 0 {
                 let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -3374,12 +3387,14 @@ mod tests {
     async fn run_agent_task_interrupt_does_not_consume_queued_prompt() {
         let temp = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
         let assembled = assemble_agent(
             Arc::new(FirstCallHangsThenRespondsProvider {
                 calls: calls.clone(),
+                requests: requests.clone(),
             }),
             &config(),
             Box::new(normal_channel_decider(ui_tx.clone())),
@@ -3434,12 +3449,244 @@ mod tests {
             "expected queued prompt to complete after interrupt"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        {
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 2);
+            assert!(
+                !recorded[1]
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, Message::User(text) if text == "first")),
+                "中断前未完成的旧 Prompt 不得泄漏到下一轮 Provider 请求"
+            );
+            assert!(
+                recorded[1]
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, Message::User(text) if text == "second")),
+                "排队 Prompt 必须成为下一轮唯一待回答的 User turn"
+            );
+        }
         assert!(!handle.is_finished());
 
         drop(input_tx);
         drop(interrupt_tx);
         handle.abort();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn run_agent_task_interrupts_permission_wait_and_closes_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "permission-call".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({ "path": "never.txt", "content": "never" }),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+                thinking: Vec::new(),
+            },
+            ModelResponse {
+                text: "after-permission-interrupt".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            },
+        ]));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            provider,
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let history = agent_history();
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            assembled.compacting,
+            task_hotswap(&temp, BTreeMap::new()),
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx
+            .send(UserInput::Prompt("wait for permission".to_string()))
+            .unwrap();
+        let permission_request = loop {
+            if let AgentEvent::PermissionRequired(request) =
+                ui_rx.recv().await.expect("permission event")
+            {
+                break request;
+            }
+        };
+        interrupt_tx.send(UserInput::Interrupt).unwrap();
+
+        loop {
+            match ui_rx.recv().await.expect("interrupted event") {
+                AgentEvent::Interrupted => break,
+                AgentEvent::ToolCallFinished { .. }
+                | AgentEvent::StatusChanged(AgentStatus::Idle) => {
+                    panic!("permission interrupt must not publish finished/Idle")
+                }
+                _ => {}
+            }
+        }
+        assert!(matches!(
+            ui_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(permission_request);
+        assert!(!temp.path().join("never.txt").exists());
+
+        {
+            let stored = history.lock().await;
+            let results: Vec<_> = stored
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } => Some((call_id.as_str(), content.as_str(), *is_error)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                results,
+                vec![("permission-call", INTERRUPTED_TOOL_CONTENT, true)]
+            );
+        }
+
+        input_tx
+            .send(UserInput::Prompt("continue after permission".to_string()))
+            .unwrap();
+        loop {
+            match ui_rx.recv().await.expect("next prompt event") {
+                AgentEvent::TextDelta(text) => {
+                    assert_eq!(text, "after-permission-interrupt");
+                }
+                AgentEvent::TurnComplete => break,
+                _ => {}
+            }
+        }
+
+        drop(input_tx);
+        drop(interrupt_tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_agent_task_completion_and_interrupt_ready_together_emit_one_terminal() {
+        struct ReleasedProvider {
+            entered: StdMutex<Option<oneshot::Sender<()>>>,
+            release: StdMutex<Option<oneshot::Receiver<()>>>,
+        }
+
+        #[async_trait]
+        impl Provider for ReleasedProvider {
+            fn name(&self) -> &str {
+                "released"
+            }
+
+            async fn complete(
+                &self,
+                _req: ModelRequest,
+                sink: &dyn DeltaSink,
+            ) -> Result<ModelResponse, ProviderError> {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("entered once")
+                    .send(())
+                    .ok();
+                let release = self.release.lock().unwrap().take().expect("release once");
+                release.await.expect("release provider");
+                sink.on_text("race-complete");
+                Ok(ModelResponse {
+                    text: "race-complete".to_string(),
+                    tool_calls: Vec::new(),
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                    thinking: Vec::new(),
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let provider = Arc::new(ReleasedProvider {
+            entered: StdMutex::new(Some(entered_tx)),
+            release: StdMutex::new(Some(release_rx)),
+        });
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            provider,
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            assembled.compacting,
+            task_hotswap(&temp, BTreeMap::new()),
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx
+            .send(UserInput::Prompt("race".to_string()))
+            .unwrap();
+        entered_rx.await.expect("provider entered");
+        release_tx.send(()).unwrap();
+        interrupt_tx.send(UserInput::Interrupt).unwrap();
+
+        let mut terminals = Vec::new();
+        loop {
+            match ui_rx.recv().await.expect("race event") {
+                AgentEvent::TurnComplete => {
+                    terminals.push("complete");
+                    break;
+                }
+                AgentEvent::Interrupted => {
+                    terminals.push("interrupted");
+                    break;
+                }
+                AgentEvent::Error(_) => {
+                    terminals.push("error");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let trailing = timeout(Duration::from_millis(80), ui_rx.recv()).await;
+        assert!(
+            trailing.is_err(),
+            "terminal event must be unique: {trailing:?}"
+        );
+        assert_eq!(terminals.len(), 1);
+
+        drop(input_tx);
+        drop(interrupt_tx);
+        handle.await.unwrap();
     }
 
     #[tokio::test]

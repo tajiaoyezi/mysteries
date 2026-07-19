@@ -27,6 +27,7 @@ syntect = { version = "5", default-features = false, features = ["default-syntax
 thiserror = "1"
 toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "test-util", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
