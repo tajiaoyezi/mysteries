@@ -39,8 +39,9 @@
 
 ## ✨ 特性
 
-- **Agent Loop 自研**:模型决策 → tool_calls 过权限门 → 执行回传 → 续推;每次 run 具有内核级 execution scope,可标识、可取消,并以 iteration/deadline/depth 预算及工具/权限 capability 上限阻止派生 run 扩权;Esc 中断由 Loop 统一收口 history,Provider 回复前中断的未提交 Prompt 不会污染下一轮模型上下文。同一回复中连续的本地读取 / 搜索(`list_dir` / `read_file` / `glob` / `grep`)以固定上限 4 有界并行;变更 / 执行 / Network / 交互工具仍串行屏障,权限语义不变。该基础尚不等于 subagent / 后台任务,且不会强制终止已进入 blocking pool 的 OS 同步工作。
-- **内置工具**:`list_dir` / `read_file` / `glob` / `grep` / `write_file` / `edit_file`(唯一匹配替换)/ `run_shell` + 联网 `web_fetch` / `web_search`(SSRF 护栏)+ Plan 三件 `submit_plan` / `update_plan` / `ask_user`。
+- **Agent Loop 自研**:模型决策 → tool_calls 过权限门 → 执行回传 → 续推;每次 run 具有内核级 execution scope,可标识、可取消,并以 iteration/deadline/depth 预算及工具/权限 capability 上限阻止派生 run 扩权;Esc 中断由 Loop 统一收口 history,Provider 回复前中断的未提交 Prompt 不会污染下一轮模型上下文。同一回复中连续的本地读取 / 搜索(`list_dir` / `read_file` / `glob` / `grep`)与只读委派可进入既有上限 4 的有界安全段;变更 / 执行 / Network / 交互工具仍串行屏障,权限语义不变。
+- **单层只读委派([Unreleased])**:`delegate_task`为每个 occurrence 创建临时child Agent,只暴露`list_dir` / `read_file` / `glob` / `grep`,并把读取限制在canonical workspace root内（包括目录walker加载的parent、`.ignore`与`.gitignore`规则文件）;无递归、后台任务、child session、写入或Network child。outer同时active的child最多4个,这不是单轮调用总量上限;每个child最多8次tool-enabled Provider调用,触顶后至多再发1次forced-final,且从调用开始共用120秒总wall-clock。成本最坏放大为`delegate occurrence数 × 最多9次Provider调用`。
+- **内置工具**:`list_dir` / `read_file` / `glob` / `grep` / `delegate_task`(单层只读委派)/ `write_file` / `edit_file`(唯一匹配替换)/ `run_shell` + 联网 `web_fetch` / `web_search`(SSRF 护栏)+ Plan 三件 `submit_plan` / `update_plan` / `ask_user`。
 - **四级权限 × 四种模式**:工具按 `ReadOnly/Network/Edit/Execute` 分级;`Normal / AcceptEdits / Yolo / Plan` 经 Shift+Tab 循环。有效 Network preview 在 Normal/AcceptEdits/Plan 下逐次确认,Yolo 仅自动放行可授权 preview;未知或畸形 Network 调用始终拒绝。命令白名单 + always-allow 仅适用于 Execute。
 - **Plan 模式**:先只读调研 → 交出带每步验收的结构化计划 → 你批准后逐步执行,常驻进度面板实时上报。
 - **思考模式**:`Depth`(off/low/medium/high/xhigh)统一抽象,映射到 Anthropic adaptive+effort 与 OpenAI `reasoning_effort`;`/think` 切换;思考过程 TUI 折叠展示。
@@ -48,6 +49,8 @@
 - **上下文管理**:`ContextStrategy`(Passthrough / Compacting),超限自动压缩,token 用量实时显示。
 - **会话持久化**:jsonl 快照 + `--resume` 续最近 + 会话选择器 + Ctrl+C 双击退出守卫。
 - **精致 TUI**(ratatui + crossterm,Midnight/Daylight 双主题):Assistant markdown 渲染(syntect 语法高亮 + 简易表格 CJK 对齐)、工具卡 diff 高亮、大粘贴折叠、消息排队(两级取消)、多行输入、鼠标拖选复制、滚轮、输入历史、`/` 命令补全、jump-to-bottom。
+
+> `delegate_task`当前没有per-response occurrence硬上限、跨child token总预算或child-only扫描字节硬上限。四个本地fs工具仍保留既有语义并先完成文件读取 / 目录遍历 / 匹配收集；其中`read_file`与`grep`再按`max_output_bytes`后置截断，`list_dir`与`glob`的既有输出没有该硬上限。因此active child≤4和单child 8+1轮限制不能解释为总token、总输出、总扫描量或总内存的固定上界。
 
 ## 📸 界面一览
 
@@ -171,7 +174,7 @@ mysteries --headless "解释一下 src/agent 的结构"   # 无头单轮模式
 
 ## 🧪 工程方法与质量
 
-- **OpenSpec 流程**:每个变更 propose(proposal/design/tasks/spec delta)→ apply → archive。已归档 **64 个 change**,19 个能力域 spec 沉淀在 `openspec/specs/`(RFC 2119 风格),每个 change 附一条决策记录到 `.ai_history/logs/`。
+- **OpenSpec 流程**:每个变更 propose(proposal/design/tasks/spec delta)→ apply → archive。已归档 **65 个 change**,20 个能力域 spec 沉淀在 `openspec/specs/`(RFC 2119 风格),每个 change 附一条决策记录到 `.ai_history/logs/`。
 - **TDD**:内核(Loop / 工具 / 权限 / Provider 归一化 / 配置 merge)强制先测后码、红灯独立成步;TUI 外壳走 `TestBackend` + `insta` 快照事后回归。
 - **当前**:**800+ tests 全绿**(lib 单测 + e2e 集成)、`clippy -D warnings` 零警告、行覆盖 **~91%**(llvm-cov;内核如 Agent Loop 99%、工具 96–100%)。
 - **构建 CI**(`.github/workflows/ci.yml`):Windows + Linux 上强制 `fmt --check` + `clippy -D` + **全量 `cargo test --locked`** + release build。

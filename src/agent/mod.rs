@@ -1,6 +1,11 @@
 pub mod compacting;
 pub mod context;
+#[cfg(test)]
+mod delegate_concurrency_tests;
 pub mod message;
+#[cfg(test)]
+mod publication_tests;
+mod runtime;
 pub mod scope;
 #[cfg(test)]
 mod scope_tests;
@@ -8,6 +13,7 @@ mod scope_tests;
 pub use compacting::run_compact_command;
 pub use compacting::{CompactCommandOutcome, Compacting, CompactionSettings, SUMMARY_HEADER};
 pub use context::{ContextError, ContextStrategy, Passthrough};
+pub(crate) use runtime::{AgentRuntime, RuntimeSnapshot};
 pub use scope::{
     AgentExecutionScope, ExecutionBudget, ExecutionCapabilities, RunIdentity, ScopeDeriveError,
     ScopedAgentError, StopReason,
@@ -16,11 +22,14 @@ pub use scope::{
 use crate::agent::message::Message;
 use crate::error::{AgentError, ProviderError};
 use crate::permission::{
-    ensure_tool_in_scope, gate_scoped, PermissionDecider, PermissionDenial, PermissionGateOutcome,
-    PermissionMode,
+    ensure_tool_in_execution_scope, gate_scoped, PermissionDecider, PermissionDenial,
+    PermissionGateOutcome, PermissionMode,
 };
 use crate::provider::{DeltaSink, Depth, ModelRequest, Provider, ThinkingConfig, ToolCall, Usage};
-use crate::tool::{PermissionLevel, ToolConcurrency, ToolContext, ToolOutcome, ToolRegistry};
+use crate::tool::{
+    PermissionLevel, ToolConcurrency, ToolContext, ToolExecutionContext, ToolOutcome, ToolRegistry,
+};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant. Do not claim to be Claude, ChatGPT, OpenAI, Anthropic, or any specific upstream model. If asked about your model identity, say you are running inside Mysteries and the configured model name is shown in the status line.";
@@ -113,14 +122,14 @@ pub struct NoopObserver;
 impl AgentObserver for NoopObserver {}
 
 pub struct Agent {
-    provider: Arc<dyn Provider>,
+    runtime: AgentRuntime,
     registry: ToolRegistry,
     decider: Box<dyn PermissionDecider>,
-    model: String,
     max_iterations: u32,
     strategy: Box<dyn ContextStrategy>,
     permission_mode: Arc<Mutex<PermissionMode>>,
     thinking_depth: Arc<Mutex<Depth>>,
+    read_root: Option<PathBuf>,
 }
 
 impl Agent {
@@ -131,16 +140,40 @@ impl Agent {
         model: String,
         max_iterations: u32,
     ) -> Self {
-        Self {
-            provider,
+        Self::with_runtime(
+            AgentRuntime::new(provider, model),
             registry,
             decider,
-            model,
+            max_iterations,
+        )
+    }
+
+    pub(crate) fn with_runtime(
+        runtime: AgentRuntime,
+        registry: ToolRegistry,
+        decider: Box<dyn PermissionDecider>,
+        max_iterations: u32,
+    ) -> Self {
+        Self {
+            runtime,
+            registry,
+            decider,
             max_iterations,
             strategy: Box::new(Passthrough),
             permission_mode: Arc::new(Mutex::new(PermissionMode::Normal)),
             thinking_depth: Arc::new(Mutex::new(Depth::Low)),
+            read_root: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime(&self) -> AgentRuntime {
+        self.runtime.clone()
+    }
+
+    pub(crate) fn with_read_root(mut self, canonical_read_root: PathBuf) -> Self {
+        self.read_root = Some(canonical_read_root);
+        self
     }
 
     pub fn set_thinking_depth(&mut self, depth: Arc<Mutex<Depth>>) {
@@ -163,13 +196,37 @@ impl Agent {
 
     /// Session 恢复等路径：只更新 model / ContextStrategy，不碰 thinking。
     pub fn restore_model(&mut self, model: String) {
-        self.model = model.clone();
+        self.runtime.set_model(model.clone());
         self.strategy.set_model(model);
     }
 
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
-        self.provider = provider.clone();
+        self.runtime.set_provider(provider.clone());
         self.strategy.set_provider(provider);
+    }
+
+    pub(crate) fn replace_provider_model(&mut self, provider: Arc<dyn Provider>, model: String) {
+        self.strategy.set_provider(provider.clone());
+        self.strategy.set_model(model.clone());
+        self.runtime.replace_provider_model(provider, model);
+    }
+
+    pub(crate) fn set_provider_model(
+        &mut self,
+        provider: Arc<dyn Provider>,
+        model: String,
+        history: &mut [Message],
+    ) {
+        for message in history.iter_mut() {
+            if let Message::Assistant { thinking, .. } = message {
+                thinking.clear();
+            }
+        }
+        self.replace_provider_model(provider, model);
+    }
+
+    pub(crate) fn restore_provider_model(&mut self, provider: Arc<dyn Provider>, model: String) {
+        self.replace_provider_model(provider, model);
     }
 
     pub fn set_strategy(&mut self, strategy: Box<dyn ContextStrategy>) {
@@ -177,8 +234,16 @@ impl Agent {
     }
 
     pub fn root_scope(&self) -> AgentExecutionScope {
+        self.root_scope_with_depth(0)
+    }
+
+    pub(crate) fn product_root_scope(&self) -> AgentExecutionScope {
+        self.root_scope_with_depth(1)
+    }
+
+    fn root_scope_with_depth(&self, remaining_child_depth: u32) -> AgentExecutionScope {
         AgentExecutionScope::root(
-            ExecutionBudget::new(self.max_iterations, None, 0),
+            ExecutionBudget::new(self.max_iterations, None, remaining_child_depth),
             ExecutionCapabilities::from_known_unique(
                 self.registry
                     .schemas()
@@ -278,13 +343,14 @@ impl Agent {
             if mode == PermissionMode::Plan {
                 msgs.insert(0, Message::System(PLAN_MODE_INSTRUCTION.to_string()));
             }
+            let RuntimeSnapshot { provider, model } = self.runtime.snapshot();
             let response = Self::wait_scoped(
                 scope,
-                self.provider.complete(
+                provider.complete(
                     ModelRequest {
-                        model: self.model.clone(),
+                        model,
                         messages: msgs,
-                        tools: self.registry.schemas_for_scope(mode, scope.capabilities()),
+                        tools: self.registry.schemas_for_execution_scope(mode, scope),
                         max_tokens: None,
                         thinking: Some(ThinkingConfig { depth }),
                     },
@@ -311,7 +377,9 @@ impl Agent {
             });
 
             if tool_calls.is_empty() {
-                observer.on_scoped_status(&identity, AgentStatus::Idle);
+                if !text.is_empty() {
+                    observer.on_scoped_status(&identity, AgentStatus::Idle);
+                }
                 return Ok(text);
             }
 
@@ -328,11 +396,14 @@ impl Agent {
             .await?
             .map_err(AgentError::from)
             .map_err(ScopedAgentError::Agent)?;
+        Self::scope_checkpoint(scope)?;
+        observer.on_scoped_status(&identity, AgentStatus::CallingModel);
+        let RuntimeSnapshot { provider, model } = self.runtime.snapshot();
         let response = Self::wait_scoped(
             scope,
-            self.provider.complete(
+            provider.complete(
                 ModelRequest {
-                    model: self.model.clone(),
+                    model,
                     messages: msgs,
                     tools: Vec::new(),
                     max_tokens: None,
@@ -345,6 +416,9 @@ impl Agent {
         .map_err(AgentError::from)
         .map_err(ScopedAgentError::Agent)?;
         Self::scope_checkpoint(scope)?;
+        if let Some(ref usage) = response.usage {
+            observer.on_scoped_usage(&identity, usage);
+        }
 
         let text = response.text;
         history.push(Message::Assistant {
@@ -359,6 +433,7 @@ impl Agent {
             }));
         }
 
+        observer.on_scoped_status(&identity, AgentStatus::Idle);
         Ok(text)
     }
 
@@ -407,7 +482,7 @@ impl Agent {
         let Some(tool) = self.registry.get(&call.name) else {
             return false;
         };
-        if !scope.capabilities().allows(tool) {
+        if ensure_tool_in_execution_scope(tool, scope).is_err() {
             return false;
         }
         tool.concurrency() == ToolConcurrency::ParallelSafe
@@ -540,7 +615,7 @@ impl Agent {
             return Ok(());
         };
 
-        if let Err(violation) = ensure_tool_in_scope(tool, scope.capabilities()) {
+        if let Err(violation) = ensure_tool_in_execution_scope(tool, scope) {
             history.push(Message::ToolResult {
                 call_id: call.id.clone(),
                 content: violation.to_string(),
@@ -620,7 +695,18 @@ impl Agent {
         }
 
         observer.on_scoped_status(&identity, AgentStatus::ExecutingTool(call.name.clone()));
-        let outcome = Self::wait_scoped(scope, tool.execute(call.arguments.clone(), ctx)).await?;
+        let execution_context = ToolExecutionContext {
+            tool: ctx,
+            scope,
+            observer,
+            read_root: self.read_root.as_deref(),
+        };
+        let outcome = Self::wait_scoped(
+            scope,
+            tool.execute_scoped(call.arguments.clone(), &execution_context),
+        )
+        .await?;
+        Self::scope_checkpoint(scope)?;
         Self::publish_tool_outcome(&identity, history, observer, &call.id, outcome);
         Ok(())
     }
@@ -692,7 +778,15 @@ impl Agent {
                 .get(&call.name)
                 .expect("parallel eligible implies tool exists");
             let args = call.arguments.clone();
-            async move { (idx, tool.execute(args, ctx).await) }
+            async move {
+                let execution_context = ToolExecutionContext {
+                    tool: ctx,
+                    scope,
+                    observer,
+                    read_root: self.read_root.as_deref(),
+                };
+                (idx, tool.execute_scoped(args, &execution_context).await)
+            }
         });
 
         let mut completed = stream::iter(execs).buffer_unordered(MAX_PARALLEL_TOOL_CALLS);
@@ -709,6 +803,9 @@ impl Agent {
             while next_publish < n {
                 match ready[next_publish].take() {
                     Some(outcome) => {
+                        if let Err(error) = Self::scope_checkpoint(scope) {
+                            return Err((error, next_publish));
+                        }
                         Self::publish_tool_outcome(
                             &identity,
                             history,

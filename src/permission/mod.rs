@@ -1,4 +1,4 @@
-use crate::agent::ExecutionCapabilities;
+use crate::agent::{AgentExecutionScope, ExecutionCapabilities};
 use crate::provider::ToolCall;
 use crate::tool::{NetworkPermissionPreview, PermissionLevel, Tool};
 use async_trait::async_trait;
@@ -223,6 +223,26 @@ pub fn ensure_tool_in_scope(
             "permission level `{:?}` for tool `{}` is outside the execution scope",
             tool.permission_level(),
             tool.name()
+        )));
+    }
+
+    Ok(())
+}
+
+pub fn ensure_tool_in_execution_scope(
+    tool: &dyn Tool,
+    scope: &AgentExecutionScope,
+) -> Result<(), ScopeViolation> {
+    ensure_tool_in_scope(tool, scope.capabilities())?;
+
+    let required_child_depth = tool.required_child_depth();
+    let remaining_child_depth = scope.budget().remaining_child_depth;
+    if required_child_depth > remaining_child_depth {
+        return Err(ScopeViolation::new(format!(
+            "tool `{}` requires child depth {}, but execution scope has {} remaining",
+            tool.name(),
+            required_child_depth,
+            remaining_child_depth
         )));
     }
 

@@ -11,7 +11,7 @@ use crate::provider::{
 };
 use crate::tool::{
     run_blocking_tool, BlockingToolLimiter, PermissionLevel, Tool, ToolConcurrency, ToolContext,
-    ToolOutcome, ToolRegistry,
+    ToolExecutionContext, ToolOutcome, ToolRegistry,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -138,6 +138,90 @@ impl Tool for ImmediateTool {
 fn registry_with_immediate(name: &'static str) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ImmediateTool { name })).unwrap();
+    registry
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScopedContextRecord {
+    identity: RunIdentity,
+    observer_address: usize,
+    cwd: PathBuf,
+    read_root: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct ScopedContextProbeState {
+    legacy_calls: AtomicUsize,
+    scoped_calls: AtomicUsize,
+    records: Mutex<Vec<ScopedContextRecord>>,
+}
+
+struct ScopedContextProbeTool {
+    concurrency: ToolConcurrency,
+    state: Arc<ScopedContextProbeState>,
+}
+
+#[async_trait]
+impl Tool for ScopedContextProbeTool {
+    fn name(&self) -> &str {
+        "scoped_context_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Records the scoped execution context."
+    }
+
+    fn schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::ReadOnly
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        self.concurrency
+    }
+
+    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
+        self.state.legacy_calls.fetch_add(1, Ordering::SeqCst);
+        ToolOutcome {
+            content: "legacy execute".to_string(),
+            is_error: false,
+            truncated: false,
+            exit: None,
+        }
+    }
+
+    async fn execute_scoped(&self, _args: Value, ctx: &ToolExecutionContext<'_>) -> ToolOutcome {
+        self.state.scoped_calls.fetch_add(1, Ordering::SeqCst);
+        self.state
+            .records
+            .lock()
+            .unwrap()
+            .push(ScopedContextRecord {
+                identity: ctx.scope.identity(),
+                observer_address: ctx.observer as *const dyn AgentObserver as *const () as usize,
+                cwd: ctx.tool.cwd.clone(),
+                read_root: ctx.read_root.map(PathBuf::from),
+            });
+        ToolOutcome {
+            content: "scoped execute".to_string(),
+            is_error: false,
+            truncated: false,
+            exit: None,
+        }
+    }
+}
+
+fn registry_with_scoped_probe(
+    concurrency: ToolConcurrency,
+    state: Arc<ScopedContextProbeState>,
+) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(ScopedContextProbeTool { concurrency, state }))
+        .unwrap();
     registry
 }
 
@@ -427,6 +511,206 @@ fn tool_results(history: &[Message]) -> Vec<(String, String, bool)> {
             _ => None,
         })
         .collect()
+}
+
+fn observer_address(observer: &dyn AgentObserver) -> usize {
+    observer as *const dyn AgentObserver as *const () as usize
+}
+
+#[tokio::test]
+async fn serial_dispatch_passes_current_scoped_tool_context() {
+    let state = Arc::new(ScopedContextProbeState::default());
+    let registry = registry_with_scoped_probe(ToolConcurrency::Exclusive, state.clone());
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_response(vec![call("serial", "scoped_context_probe")]),
+        response("done"),
+    ]));
+    let agent = Agent::new(
+        provider,
+        registry,
+        Box::new(AllowAll),
+        "model".to_string(),
+        2,
+    )
+    .with_read_root(PathBuf::from("serial-read-root"));
+    let scope = scope(
+        &["scoped_context_probe"],
+        &[PermissionLevel::ReadOnly],
+        2,
+        None,
+    );
+    let observer = IdentityObserver::default();
+    let context = ToolContext {
+        cwd: PathBuf::from("serial-cwd"),
+        max_output_bytes: 4096,
+    };
+    let mut history = vec![Message::User("serial".to_string())];
+
+    agent
+        .run_observed_scoped(&scope, &mut history, &context, &NoopSink, &observer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state.scoped_calls.load(Ordering::SeqCst),
+        1,
+        "scoped override未被调用：Agent serial dispatch仍走legacy execute"
+    );
+    assert_eq!(state.legacy_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *state.records.lock().unwrap(),
+        vec![ScopedContextRecord {
+            identity: scope.identity(),
+            observer_address: observer_address(&observer),
+            cwd: PathBuf::from("serial-cwd"),
+            read_root: Some(PathBuf::from("serial-read-root")),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn parallel_dispatch_passes_current_scoped_tool_context_per_occurrence() {
+    let state = Arc::new(ScopedContextProbeState::default());
+    let registry = registry_with_scoped_probe(ToolConcurrency::ParallelSafe, state.clone());
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_response(vec![
+            call("parallel-1", "scoped_context_probe"),
+            call("parallel-2", "scoped_context_probe"),
+        ]),
+        response("done"),
+    ]));
+    let agent = Agent::new(
+        provider,
+        registry,
+        Box::new(AllowAll),
+        "model".to_string(),
+        2,
+    )
+    .with_read_root(PathBuf::from("parallel-read-root"));
+    let scope = scope(
+        &["scoped_context_probe"],
+        &[PermissionLevel::ReadOnly],
+        2,
+        None,
+    );
+    let observer = IdentityObserver::default();
+    let context = ToolContext {
+        cwd: PathBuf::from("parallel-cwd"),
+        max_output_bytes: 4096,
+    };
+    let mut history = vec![Message::User("parallel".to_string())];
+
+    agent
+        .run_observed_scoped(&scope, &mut history, &context, &NoopSink, &observer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state.scoped_calls.load(Ordering::SeqCst),
+        2,
+        "scoped override未被调用：Agent ParallelSafe dispatch仍走legacy execute"
+    );
+    assert_eq!(state.legacy_calls.load(Ordering::SeqCst), 0);
+    let records = state.records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    for record in records.iter() {
+        assert_eq!(record.identity, scope.identity());
+        assert_eq!(record.observer_address, observer_address(&observer));
+        assert_eq!(record.cwd, PathBuf::from("parallel-cwd"));
+        assert_eq!(record.read_root, Some(PathBuf::from("parallel-read-root")));
+    }
+}
+
+#[tokio::test]
+async fn concurrent_runs_sharing_one_tool_do_not_cross_scoped_context() {
+    let state = Arc::new(ScopedContextProbeState::default());
+    let registry = registry_with_scoped_probe(ToolConcurrency::Exclusive, state.clone());
+    let first_agent = Agent::new(
+        Arc::new(MockProvider::new(vec![
+            tool_response(vec![call("first", "scoped_context_probe")]),
+            response("first done"),
+        ])),
+        registry.clone(),
+        Box::new(AllowAll),
+        "model".to_string(),
+        2,
+    )
+    .with_read_root(PathBuf::from("first-read-root"));
+    let second_agent = Agent::new(
+        Arc::new(MockProvider::new(vec![
+            tool_response(vec![call("second", "scoped_context_probe")]),
+            response("second done"),
+        ])),
+        registry,
+        Box::new(AllowAll),
+        "model".to_string(),
+        2,
+    )
+    .with_read_root(PathBuf::from("second-read-root"));
+    let first_scope = scope(
+        &["scoped_context_probe"],
+        &[PermissionLevel::ReadOnly],
+        2,
+        None,
+    );
+    let second_scope = scope(
+        &["scoped_context_probe"],
+        &[PermissionLevel::ReadOnly],
+        2,
+        None,
+    );
+    let first_observer = IdentityObserver::default();
+    let second_observer = IdentityObserver::default();
+    let first_context = ToolContext {
+        cwd: PathBuf::from("first-cwd"),
+        max_output_bytes: 4096,
+    };
+    let second_context = ToolContext {
+        cwd: PathBuf::from("second-cwd"),
+        max_output_bytes: 4096,
+    };
+    let mut first_history = vec![Message::User("first".to_string())];
+    let mut second_history = vec![Message::User("second".to_string())];
+
+    let (first, second) = tokio::join!(
+        first_agent.run_observed_scoped(
+            &first_scope,
+            &mut first_history,
+            &first_context,
+            &NoopSink,
+            &first_observer,
+        ),
+        second_agent.run_observed_scoped(
+            &second_scope,
+            &mut second_history,
+            &second_context,
+            &NoopSink,
+            &second_observer,
+        ),
+    );
+    first.unwrap();
+    second.unwrap();
+
+    assert_eq!(
+        state.scoped_calls.load(Ordering::SeqCst),
+        2,
+        "scoped override未被调用：共享Tool的并发run仍走legacy execute"
+    );
+    assert_eq!(state.legacy_calls.load(Ordering::SeqCst), 0);
+    let records = state.records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(records.contains(&ScopedContextRecord {
+        identity: first_scope.identity(),
+        observer_address: observer_address(&first_observer),
+        cwd: PathBuf::from("first-cwd"),
+        read_root: Some(PathBuf::from("first-read-root")),
+    }));
+    assert!(records.contains(&ScopedContextRecord {
+        identity: second_scope.identity(),
+        observer_address: observer_address(&second_observer),
+        cwd: PathBuf::from("second-cwd"),
+        read_root: Some(PathBuf::from("second-read-root")),
+    }));
 }
 
 #[tokio::test]
@@ -1110,6 +1394,217 @@ async fn cancelled_spawn_blocking_work_finishes_naturally_without_publishing_lat
     let _ = watchdog_cancel_tx.send(());
     watchdog.join().unwrap();
     assert!(!watchdog_fired.load(Ordering::SeqCst));
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ScopedLifecycleEvent {
+    Status(RunIdentity, AgentStatus),
+    Usage(RunIdentity, Usage),
+}
+
+#[derive(Default)]
+struct ScopedLifecycleObserver {
+    events: Mutex<Vec<ScopedLifecycleEvent>>,
+}
+
+impl ScopedLifecycleObserver {
+    fn events(&self) -> Vec<ScopedLifecycleEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl AgentObserver for ScopedLifecycleObserver {
+    fn on_scoped_status(&self, identity: &RunIdentity, status: AgentStatus) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ScopedLifecycleEvent::Status(*identity, status));
+    }
+
+    fn on_scoped_usage(&self, identity: &RunIdentity, usage: &Usage) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ScopedLifecycleEvent::Usage(*identity, usage.clone()));
+    }
+}
+
+#[tokio::test]
+async fn forced_final_success_emits_calling_usage_idle_in_scope_order() {
+    let usage = Usage {
+        input_tokens: 2,
+        output_tokens: 3,
+    };
+    let agent = Agent::new(
+        Arc::new(MockProvider::new(vec![response_with_usage("forced")])),
+        ToolRegistry::new(),
+        Box::new(AllowAll),
+        "model".to_string(),
+        0,
+    );
+    let root = scope(&[], &[], 0, None);
+    let identity = root.identity();
+    let observer = ScopedLifecycleObserver::default();
+    let mut history = vec![Message::User("force".to_string())];
+
+    let result = agent
+        .run_observed_scoped(&root, &mut history, &ctx(), &NoopSink, &observer)
+        .await;
+
+    assert_eq!(result, Ok("forced".to_string()));
+    assert_eq!(
+        observer.events(),
+        vec![
+            ScopedLifecycleEvent::Status(identity, AgentStatus::CallingModel),
+            ScopedLifecycleEvent::Usage(identity, usage),
+            ScopedLifecycleEvent::Status(identity, AgentStatus::Idle),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn forced_final_provider_error_emits_calling_without_usage_or_idle() {
+    let agent = Agent::new(
+        Arc::new(MockProvider::new(Vec::new())),
+        ToolRegistry::new(),
+        Box::new(AllowAll),
+        "model".to_string(),
+        0,
+    );
+    let root = scope(&[], &[], 0, None);
+    let identity = root.identity();
+    let observer = ScopedLifecycleObserver::default();
+    let mut history = vec![Message::User("force".to_string())];
+
+    let result = agent
+        .run_observed_scoped(&root, &mut history, &ctx(), &NoopSink, &observer)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ScopedAgentError::Agent(crate::error::AgentError::Provider(
+            ProviderError::Transport(_)
+        )))
+    ));
+    assert_eq!(
+        observer.events(),
+        vec![ScopedLifecycleEvent::Status(
+            identity,
+            AgentStatus::CallingModel,
+        )]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn forced_final_termination_emits_calling_without_usage_or_idle() {
+    let (entered_tx, mut entered_rx) = oneshot::channel();
+    let agent = Agent::new(
+        Arc::new(PendingProvider {
+            entered: Mutex::new(Some(entered_tx)),
+        }),
+        ToolRegistry::new(),
+        Box::new(AllowAll),
+        "model".to_string(),
+        0,
+    );
+    let root = scope(&[], &[], 0, None);
+    let identity = root.identity();
+    let observer = ScopedLifecycleObserver::default();
+    let mut history = vec![Message::User("force".to_string())];
+    let tool_ctx = ctx();
+    let sink = NoopSink;
+    let mut run =
+        Box::pin(agent.run_observed_scoped(&root, &mut history, &tool_ctx, &sink, &observer));
+
+    tokio::select! {
+        result = &mut run => panic!("forced final ended before Provider entered: {result:?}"),
+        entered = &mut entered_rx => entered.unwrap(),
+    }
+    root.cancel();
+    let result = tokio::select! {
+        biased;
+        result = &mut run => result,
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("forced final did not terminate"),
+    };
+    drop(run);
+
+    assert_eq!(result, Err(ScopedAgentError::Cancelled));
+    assert_eq!(
+        observer.events(),
+        vec![ScopedLifecycleEvent::Status(
+            identity,
+            AgentStatus::CallingModel,
+        )]
+    );
+}
+
+#[tokio::test]
+async fn normal_empty_response_emits_usage_but_never_idle() {
+    let usage = Usage {
+        input_tokens: 2,
+        output_tokens: 3,
+    };
+    let agent = Agent::new(
+        Arc::new(MockProvider::new(vec![response_with_usage("")])),
+        ToolRegistry::new(),
+        Box::new(AllowAll),
+        "model".to_string(),
+        2,
+    );
+    let root = scope(&[], &[], 2, None);
+    let identity = root.identity();
+    let observer = ScopedLifecycleObserver::default();
+    let mut history = vec![Message::User("empty".to_string())];
+
+    let result = agent
+        .run_observed_scoped(&root, &mut history, &ctx(), &NoopSink, &observer)
+        .await;
+
+    assert_eq!(result, Ok(String::new()));
+    assert_eq!(
+        observer.events(),
+        vec![
+            ScopedLifecycleEvent::Status(identity, AgentStatus::CallingModel),
+            ScopedLifecycleEvent::Usage(identity, usage),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn forced_final_empty_response_emits_calling_and_usage_but_never_idle() {
+    let usage = Usage {
+        input_tokens: 2,
+        output_tokens: 3,
+    };
+    let agent = Agent::new(
+        Arc::new(MockProvider::new(vec![response_with_usage("")])),
+        ToolRegistry::new(),
+        Box::new(AllowAll),
+        "model".to_string(),
+        0,
+    );
+    let root = scope(&[], &[], 0, None);
+    let identity = root.identity();
+    let observer = ScopedLifecycleObserver::default();
+    let mut history = vec![Message::User("empty".to_string())];
+
+    let result = agent
+        .run_observed_scoped(&root, &mut history, &ctx(), &NoopSink, &observer)
+        .await;
+
+    assert_eq!(
+        result,
+        Err(ScopedAgentError::Agent(
+            crate::error::AgentError::MaxIterations { limit: 0 }
+        ))
+    );
+    assert_eq!(
+        observer.events(),
+        vec![
+            ScopedLifecycleEvent::Status(identity, AgentStatus::CallingModel),
+            ScopedLifecycleEvent::Usage(identity, usage),
+        ]
+    );
 }
 
 #[test]

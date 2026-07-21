@@ -1,7 +1,7 @@
 # tui-shell Specification
 
 ## Purpose
-定义 mysteries 交互式 TUI 外壳的全部交互契约,覆盖三层:架构上以双-task + channel 运行,UI 与 agent task 经 `UserInput` / `AgentEvent` 通信,经既有 `DeltaSink` / `PermissionDecider` / `AgentObserver` 缝接入内核；呈现上约定四区布局、主题令牌、transcript、C5 工具卡与 C6 权限框；交互上约定输入到会话的完整行为及终端生命周期。并行批次允许多张 C5 卡同时 Running，C10 用 `ExecutingTools(count)` 显示已调度总数及固定上限 4；finished 按 occurrence 更新最早同 id Running 卡。Interrupt 会收口本轮 Running 卡与 dangling history，`--continue` / `--resume` 激活会话前还会收口旧 Running 残留。`ChannelDecider` 只消费 gate 传入的 tool-owned Network preview，command allowlist 仅适用于 Execute；`Normal` / `AcceptEdits` / `Yolo` / `Plan` 四档 mode 与 agent task 共用运行时状态。关键立场是逻辑与呈现分层:状态、按键和 Network layout 归约为可单测纯函数,渲染对给定状态确定,以 `TestBackend` + `insta` 带色快照做事后回归。
+定义 mysteries 交互式 TUI 外壳的全部交互契约,覆盖三层:架构上以双-task + channel 运行,UI 与 agent task 经 `UserInput` / `AgentEvent` 通信,经既有 `DeltaSink` / `PermissionDecider` / `AgentObserver` 缝接入内核；呈现上约定四区布局、主题令牌、transcript、C5 工具卡与 C6 权限框；交互上约定输入到会话的完整行为及终端生命周期。并行批次允许多张 C5 卡同时 Running，C10 用 `ExecutingTools(count)` 显示已调度总数及固定上限 4；finished 按 occurrence 更新最早同 id Running 卡。`delegate_task` 只复用 outer C5 工具卡，child status、内部工具与文本不进入 parent transcript，child usage 仍归当前 turn；Interrupt 与 `--continue` / `--resume` 只持久化和恢复 outer 会话状态，不恢复或重跑 child。Interrupt 会收口本轮 Running 卡与 dangling history，`--continue` / `--resume` 激活会话前还会收口旧 Running 残留。`ChannelDecider` 只消费 gate 传入的 tool-owned Network preview，command allowlist 仅适用于 Execute；`Normal` / `AcceptEdits` / `Yolo` / `Plan` 四档 mode 与 agent task 共用运行时状态。关键立场是逻辑与呈现分层:状态、按键和 Network layout 归约为可单测纯函数,渲染对给定状态确定,以 `TestBackend` + `insta` 带色快照做事后回归。
 ## Requirements
 ### Requirement: §3 双-task + channel 协议
 
@@ -1698,3 +1698,27 @@ TUI SHALL 使用 `ratatui 0.30.x`，并在 manifest 中关闭其 default feature
 
 - **WHEN** 完成迁移并审查代码与测试 diff
 - **THEN** Agent Loop、Provider、Tool、Permission、Session、Config、CLI flags、session JSONL 与用户配置格式均无行为变更；TUI 编辑只对应编译器、API 或回归测试实际暴露的 0.30/0.29 兼容点与经批准的单份命令补全快照迁移
+
+### Requirement: delegate_task复用C5工具卡且隔离child事件
+
+TUI SHALL 按`设计规范/03-组件清单.md` C5复用现有ToolCard展示outer `delegate_task`的running/done/error、task args、untrusted output与truncation；不得新增child面板、内部工具卡、层级树、快捷键或theme token。`ChannelObserver` MUST 依据`RunIdentity.parent_run_id`忽略child status/tool started/tool finished，避免C10活动状态与outer卡被覆盖；child每次普通或forced-final Provider响应的usage MUST 继续计入当前turn token统计。child text/thinking sink不得写入parent transcript。
+
+#### Scenario: Midnight与Daylight标准delegate卡
+- **WHEN**分别在Midnight与Daylight主题渲染running、success、error和truncated delegate card
+- **THEN**TestBackend + insta快照仅使用既有C5结构与theme token，现有非delegate快照逐字节零churn
+
+#### Scenario: child内部事件不产生UI块
+- **WHEN**一个delegate child依次产生CallingModel、两个内部读取工具、普通或forced-final usage与最终文本
+- **THEN**transcript只新增outer delegate卡及其最终ToolOutcome，activity不切换为child工具；token统计恰好累加全部child usage且无child文本/工具卡
+
+### Requirement: Interrupt与session恢复只处理outer delegate
+
+产品TUI root SHALL 使用depth 1 execution scope。Interrupt delegate turn时仍按既有root cancellation路径等待Agent Loop收口，并只发送一个Interrupted terminal event；outer running卡转Error，child future与事件停止。保存/恢复只包含outer parent history与标准ToolCard，`--continue`/`--resume`不得恢复、重跑或显示child内部状态。
+
+#### Scenario: delegate运行中Interrupt唯一收口
+- **WHEN**child Provider或读取工具已进入受控等待点后用户按Esc
+- **THEN**只出现一次“已中断本轮”，outer delegate卡为Error，无迟到child Done/status/text，下一Prompt可正常执行
+
+#### Scenario: 恢复中断后的delegate会话
+- **WHEN**中断delegate后退出并分别用`--continue`与picker `--resume`加载
+- **THEN**outer卡无Running残留且不重复ToolResult，child不重启，恢复后的首轮Provider正常

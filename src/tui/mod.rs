@@ -75,11 +75,17 @@ const PASTE_FAST_TOPUP_ROUNDS: usize = 5;
 const CANCEL_DOUBLE_TAP: StdDuration = StdDuration::from_millis(600);
 pub const EXIT_DOUBLE_TAP: StdDuration = StdDuration::from_secs(1);
 
+#[cfg(test)]
+pub(crate) type TestProviderSelector =
+    Arc<dyn Fn(&Config) -> Result<Arc<dyn crate::provider::Provider>, String> + Send + Sync>;
+
 pub struct RunAgentTaskConfig {
     pub profiles: BTreeMap<String, ProviderProfile>,
     pub startup_config: Config,
     pub credentials_path: PathBuf,
     pub tool_ctx: ToolContext,
+    #[cfg(test)]
+    pub(crate) provider_selector: Option<TestProviderSelector>,
 }
 
 struct SessionStartup {
@@ -97,7 +103,7 @@ fn initial_session_snapshot(config: &Config, cwd: PathBuf) -> app::SessionSnapsh
         model: config.model.clone(),
         max_iterations: config.max_iterations,
         cwd,
-        tools: crate::app::default_registry().schemas().len() + 3,
+        tools: crate::app::default_registry().schemas().len() + 4,
     }
 }
 
@@ -267,6 +273,8 @@ pub async fn run_tui(paths: CliPaths, mode: StartupMode) -> Result<(), CliError>
         startup_config: config.clone(),
         credentials_path: paths.credentials.clone(),
         tool_ctx: ctx,
+        #[cfg(test)]
+        provider_selector: None,
     };
     let agent_handle = tokio::spawn(run_agent_task(
         agent,
@@ -1542,6 +1550,8 @@ pub async fn run_agent_task(
         startup_config,
         credentials_path,
         tool_ctx: ctx,
+        #[cfg(test)]
+        provider_selector,
     } = task_config;
     while let Some(input) = input_rx.recv().await {
         match input {
@@ -1561,6 +1571,8 @@ pub async fn run_agent_task(
                     &mut compacting,
                     &mut history,
                     kind,
+                    #[cfg(test)]
+                    provider_selector.as_ref(),
                 ) {
                     Ok(()) => {
                         let _ = ui_tx.send(channel::AgentEvent::ProviderApplied { id, model });
@@ -1588,7 +1600,7 @@ pub async fn run_agent_task(
                 };
                 let sink = channel::ChannelSink::new(ui_tx.clone());
                 let observer = channel::ChannelObserver::new(ui_tx.clone());
-                let scope = agent.root_scope();
+                let scope = agent.product_root_scope();
                 let mut run = Box::pin(agent.run_observed_scoped(
                     &scope,
                     &mut working,
@@ -1641,6 +1653,7 @@ fn apply_set_provider(
     compacting: &mut Compacting,
     history: &mut [Message],
     kind: channel::ProviderSwitchKind,
+    #[cfg(test)] provider_selector: Option<&TestProviderSelector>,
 ) -> Result<(), String> {
     let Some(profile) = profiles.get(id) else {
         return Err(format!("未知 provider: {id}"));
@@ -1668,11 +1681,20 @@ fn apply_set_provider(
         thinking: startup_config.thinking,
     };
 
+    #[cfg(test)]
+    let provider = match provider_selector {
+        Some(selector) => selector(&transient)?,
+        None => select_provider(&transient, credentials).map_err(|err| err.to_string())?,
+    };
+    #[cfg(not(test))]
     let provider = select_provider(&transient, credentials).map_err(|err| err.to_string())?;
-    agent.set_provider(provider.clone());
     match kind {
-        channel::ProviderSwitchKind::SessionRestore => agent.restore_model(model.to_string()),
-        channel::ProviderSwitchKind::Interactive => agent.set_model(model.to_string(), history),
+        channel::ProviderSwitchKind::SessionRestore => {
+            agent.restore_provider_model(provider.clone(), model.to_string())
+        }
+        channel::ProviderSwitchKind::Interactive => {
+            agent.set_provider_model(provider.clone(), model.to_string(), history)
+        }
     }
     compacting.set_provider(provider);
     compacting.set_model(model.to_string());
@@ -1724,8 +1746,10 @@ mod tests {
     use crate::provider::mock::MockProvider;
     use crate::provider::{
         DeltaSink, FinishReason, ModelRequest, ModelResponse, Provider, ThinkingBlock, ToolCall,
+        Usage,
     };
     use crate::session::{SessionMeta, SessionStore, SessionSummary};
+    use crate::tool::delegate::{CHILD_TIMEOUT, DELEGATE_TASK_NAME, SUBAGENT_SYSTEM_PROMPT};
     use crate::tool::plan::StepStatus;
     use crate::tool::{
         run_blocking_tool, BlockingToolLimiter, PermissionLevel, Tool, ToolConcurrency,
@@ -1858,6 +1882,60 @@ mod tests {
                 cwd: temp.path().to_path_buf(),
                 max_output_bytes: 4096,
             },
+            provider_selector: None,
+        }
+    }
+
+    fn delegate_round_responses() -> Vec<ModelResponse> {
+        vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "delegate-1".to_string(),
+                    name: DELEGATE_TASK_NAME.to_string(),
+                    arguments: json!({ "task": "inspect the workspace" }),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+                thinking: Vec::new(),
+            },
+            ModelResponse {
+                text: "child report".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            },
+            ModelResponse {
+                text: "parent done".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            },
+        ]
+    }
+
+    async fn wait_for_turn_complete_without_permission(
+        ui_rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    ) {
+        loop {
+            let event = timeout(Duration::from_secs(2), ui_rx.recv())
+                .await
+                .expect("TUI agent turn timed out")
+                .expect("TUI agent event channel closed before terminal event");
+            match event {
+                AgentEvent::PermissionRequired(request) => {
+                    panic!(
+                        "readonly delegate must not request permission: {}",
+                        request.tool_name
+                    )
+                }
+                AgentEvent::TurnComplete => break,
+                AgentEvent::Error(error) => panic!("TUI agent turn failed: {error}"),
+                AgentEvent::Interrupted => panic!("TUI agent turn was unexpectedly interrupted"),
+                _ => {}
+            }
         }
     }
 
@@ -1985,6 +2063,7 @@ mod tests {
         let snapshot = initial_session_snapshot(&startup_config, selected_meta.cwd.clone());
         assert_eq!(snapshot.provider, startup_config.provider.id);
         assert_eq!(snapshot.model, startup_config.model);
+        assert_eq!(snapshot.tools, 13);
 
         let state = super::app::AppState::with_session_and_history(
             snapshot,
@@ -3224,6 +3303,308 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_agent_task_product_scope_exposes_readonly_delegate_without_permission_in_all_modes(
+    ) {
+        for mode in [
+            PermissionMode::Normal,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Yolo,
+            PermissionMode::Plan,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(MockProvider::new(delegate_round_responses()));
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+            let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+            let permission_mode = Arc::new(StdMutex::new(mode));
+            let decider = ChannelDecider::new(
+                ui_tx.clone(),
+                permission_mode.clone(),
+                PolicyEngine::default(),
+                temp.path().join("config.toml"),
+            );
+            let mut assembled = assemble_agent(
+                provider.clone(),
+                &config(),
+                Box::new(decider),
+                None,
+                None,
+                None,
+            );
+            assembled.agent.set_permission_mode(permission_mode.clone());
+            let handle = tokio::spawn(run_agent_task(
+                assembled.agent,
+                agent_history(),
+                assembled.compacting,
+                task_hotswap(&temp, BTreeMap::new()),
+                input_rx,
+                interrupt_rx,
+                ui_tx,
+            ));
+
+            input_tx
+                .send(UserInput::Prompt(format!("delegate in {mode:?}")))
+                .unwrap();
+            wait_for_turn_complete_without_permission(&mut ui_rx).await;
+
+            drop(input_tx);
+            handle.await.unwrap();
+
+            let requests = provider.recorded_requests();
+            assert_eq!(requests.len(), 3, "mode={mode:?}");
+            assert!(
+                requests[0]
+                    .tools
+                    .iter()
+                    .any(|schema| schema.name == DELEGATE_TASK_NAME),
+                "product root must expose delegate_task in mode={mode:?}"
+            );
+            assert_eq!(
+                requests[1]
+                    .tools
+                    .iter()
+                    .map(|schema| schema.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["list_dir", "read_file", "glob", "grep"],
+                "child must remain readonly in mode={mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_pair_switch_clears_thinking_and_child_uses_complete_new_tuple() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_provider = Arc::new(MockProvider::new(Vec::new()));
+        let new_provider = Arc::new(MockProvider::new(delegate_round_responses()));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            old_provider.clone(),
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "interactive-new".to_string(),
+            ProviderProfile {
+                id: "interactive-new".to_string(),
+                kind: ProviderKind::Mock,
+                base_url: None,
+                model: "interactive-new-model".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        let selector_provider = new_provider.clone();
+        let mut task_config = task_hotswap(&temp, profiles);
+        task_config.provider_selector = Some(Arc::new(move |selected| {
+            if selected.provider.id != "interactive-new"
+                || selected.model != "interactive-new-model"
+            {
+                return Err(format!(
+                    "unexpected provider/model pair: {}/{}",
+                    selected.provider.id, selected.model
+                ));
+            }
+            let provider: Arc<dyn Provider> = selector_provider.clone();
+            Ok(provider)
+        }));
+        let thinking = vec![ThinkingBlock {
+            text: "stale thinking".to_string(),
+            signature: Some("sig-old".to_string()),
+            redacted: false,
+        }];
+        let history = Arc::new(Mutex::new(vec![
+            Message::System(DEFAULT_SYSTEM_PROMPT.to_string()),
+            Message::User("old prompt".to_string()),
+            Message::Assistant {
+                text: "old answer".to_string(),
+                tool_calls: Vec::new(),
+                thinking,
+            },
+        ]));
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            assembled.compacting,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx
+            .send(UserInput::SetProvider {
+                id: "interactive-new".to_string(),
+                model: "interactive-new-model".to_string(),
+                kind: ProviderSwitchKind::Interactive,
+            })
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt(
+                "delegate after interactive switch".to_string(),
+            ))
+            .unwrap();
+        wait_for_turn_complete_without_permission(&mut ui_rx).await;
+
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert!(old_provider.recorded_requests().is_empty());
+        assert!(matches!(
+            &history.lock().await[2],
+            Message::Assistant { thinking, .. } if thinking.is_empty()
+        ));
+        let requests = new_provider.recorded_requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|request| request.model == "interactive-new-model"));
+        assert!(requests[1]
+            .tools
+            .iter()
+            .all(|schema| schema.name != DELEGATE_TASK_NAME));
+    }
+
+    #[tokio::test]
+    async fn session_restore_pair_switch_preserves_thinking_and_child_uses_complete_new_tuple() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_provider = Arc::new(MockProvider::new(Vec::new()));
+        let new_provider = Arc::new(MockProvider::new(delegate_round_responses()));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            old_provider.clone(),
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "restored-new".to_string(),
+            ProviderProfile {
+                id: "restored-new".to_string(),
+                kind: ProviderKind::Mock,
+                base_url: None,
+                model: "restored-new-model".to_string(),
+                auth_type: AuthType::ApiKey,
+            },
+        );
+        let selector_provider = new_provider.clone();
+        let mut task_config = task_hotswap(&temp, profiles);
+        task_config.provider_selector = Some(Arc::new(move |selected| {
+            if selected.provider.id != "restored-new" || selected.model != "restored-new-model" {
+                return Err(format!(
+                    "unexpected provider/model pair: {}/{}",
+                    selected.provider.id, selected.model
+                ));
+            }
+            let provider: Arc<dyn Provider> = selector_provider.clone();
+            Ok(provider)
+        }));
+        let thinking = vec![ThinkingBlock {
+            text: "restored thinking".to_string(),
+            signature: Some("sig-restored".to_string()),
+            redacted: false,
+        }];
+        let history = Arc::new(Mutex::new(vec![
+            Message::System(DEFAULT_SYSTEM_PROMPT.to_string()),
+            Message::User("old prompt".to_string()),
+            Message::Assistant {
+                text: "old answer".to_string(),
+                tool_calls: Vec::new(),
+                thinking: thinking.clone(),
+            },
+        ]));
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            assembled.compacting,
+            task_config,
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        send_session_provider_restore(
+            &input_tx,
+            "restored-new".to_string(),
+            "restored-new-model".to_string(),
+        );
+        input_tx
+            .send(UserInput::Prompt(
+                "delegate after session restore".to_string(),
+            ))
+            .unwrap();
+        wait_for_turn_complete_without_permission(&mut ui_rx).await;
+
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert!(old_provider.recorded_requests().is_empty());
+        assert!(matches!(
+            &history.lock().await[2],
+            Message::Assistant {
+                thinking: blocks, ..
+            } if blocks == &thinking
+        ));
+        let requests = new_provider.recorded_requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|request| request.model == "restored-new-model"));
+    }
+
+    #[tokio::test]
+    async fn set_model_keeps_provider_and_child_uses_new_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(delegate_round_responses()));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            agent_history(),
+            assembled.compacting,
+            task_hotswap(&temp, BTreeMap::new()),
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx
+            .send(UserInput::SetModel("same-provider-new-model".to_string()))
+            .unwrap();
+        input_tx
+            .send(UserInput::Prompt("delegate after model switch".to_string()))
+            .unwrap();
+        wait_for_turn_complete_without_permission(&mut ui_rx).await;
+
+        drop(input_tx);
+        handle.await.unwrap();
+
+        let requests = provider.recorded_requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|request| request.model == "same-provider-new-model"));
+    }
+
+    #[tokio::test]
     async fn run_agent_task_accumulates_history_across_prompts_without_terminal() {
         let temp = tempfile::tempdir().unwrap();
         let provider = Arc::new(MockProvider::new(vec![
@@ -3950,6 +4331,7 @@ model = "zhipu/glm-5.2"
                 cwd: temp.path().to_path_buf(),
                 max_output_bytes: 4096,
             },
+            provider_selector: None,
         };
         let history = agent_history();
         let handle = tokio::spawn(run_agent_task(
@@ -4379,6 +4761,7 @@ model = "zhipu/glm-5.2"
             &mut assembled.compacting,
             &mut history,
             ProviderSwitchKind::SessionRestore,
+            None,
         )
         .expect("mock provider restore should succeed");
 
@@ -5158,6 +5541,7 @@ model = "zhipu/glm-5.2"
                 cwd: temp.path().to_path_buf(),
                 max_output_bytes: 4096,
             },
+            provider_selector: None,
         };
         let handle = tokio::spawn(run_agent_task(
             assembled.agent,
@@ -5383,6 +5767,7 @@ model = "zhipu/glm-5.2"
                     cwd: temp.path().to_path_buf(),
                     max_output_bytes: 4096,
                 },
+                provider_selector: None,
             },
             input_rx,
             i_rx,
@@ -5492,5 +5877,616 @@ model = "zhipu/glm-5.2"
             &state.transcript[2],
             TranscriptBlock::Tool(c) if c.status == ToolCardStatus::Running && c.id == "call-1"
         ));
+    }
+
+    fn usage(input_tokens: u32, output_tokens: u32) -> Option<Usage> {
+        Some(Usage {
+            input_tokens,
+            output_tokens,
+        })
+    }
+
+    fn delegate_call_response(call_id: &str, usage: Option<Usage>) -> ModelResponse {
+        ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: call_id.to_string(),
+                name: DELEGATE_TASK_NAME.to_string(),
+                arguments: json!({"task": "read README.md and report its marker"}),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage,
+            thinking: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_tui_and_session_expose_only_outer_card_while_aggregating_child_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("README.md"),
+            "READONLY_SUBAGENT_ACTUAL_READ_MARKER\n",
+        )
+        .unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // root 普通轮
+            delegate_call_response("outer-delegate", usage(11, 2)),
+            // child 普通轮：真实调用 read_file；text/thinking 都只能留在 child 私有 history。
+            ModelResponse {
+                text: "CHILD_INTERNAL_TEXT_MUST_NOT_LEAK".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "child-read-file".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({"path": "README.md"}),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: usage(13, 3),
+                thinking: vec![ThinkingBlock {
+                    text: "CHILD_INTERNAL_THINKING_MUST_NOT_LEAK".to_string(),
+                    signature: Some("child-only-signature".to_string()),
+                    redacted: false,
+                }],
+            },
+            // child max_iterations=1 后的 forced-final。
+            ModelResponse {
+                text: "verified README marker".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: usage(17, 5),
+                thinking: Vec::new(),
+            },
+            // root max_iterations=1 后的 forced-final。
+            ModelResponse {
+                text: "ROOT_FINAL_VISIBLE".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: usage(19, 7),
+                thinking: Vec::new(),
+            },
+        ]));
+        let mut cfg = config();
+        cfg.max_iterations = 1;
+        let history = agent_history();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            provider.clone(),
+            &cfg,
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            assembled.compacting,
+            RunAgentTaskConfig {
+                profiles: BTreeMap::new(),
+                startup_config: cfg,
+                credentials_path: temp.path().join("credentials"),
+                tool_ctx: ToolContext {
+                    cwd: temp.path().to_path_buf(),
+                    max_output_bytes: 4096,
+                },
+                provider_selector: None,
+            },
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+
+        input_tx
+            .send(UserInput::Prompt("delegate actual read".to_string()))
+            .unwrap();
+        let mut state = super::app::AppState::new();
+        let mut calling_model_started_at = None;
+        let mut first_token_at = None;
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        let mut observed_usage = Vec::new();
+        loop {
+            let event = timeout(Duration::from_secs(2), ui_rx.recv())
+                .await
+                .expect("delegate turn timed out")
+                .expect("delegate event channel closed");
+            match &event {
+                AgentEvent::ToolCallStarted { id, name, .. } => {
+                    started.push((id.clone(), name.clone()));
+                }
+                AgentEvent::ToolCallFinished { id, .. } => finished.push(id.clone()),
+                AgentEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => observed_usage.push((*input_tokens, *output_tokens)),
+                AgentEvent::PermissionRequired(request) => {
+                    panic!(
+                        "readonly delegate requested permission: {}",
+                        request.tool_name
+                    )
+                }
+                AgentEvent::Interrupted => panic!("delegate turn unexpectedly interrupted"),
+                AgentEvent::Error(error) => panic!("delegate turn failed: {error}"),
+                _ => {}
+            }
+            let done = matches!(event, AgentEvent::TurnComplete);
+            super::handle_agent_event(
+                &mut state,
+                event,
+                &mut calling_model_started_at,
+                &mut first_token_at,
+                &input_tx,
+            );
+            if done {
+                break;
+            }
+        }
+        drop(input_tx);
+        handle.await.unwrap();
+
+        assert_eq!(
+            started,
+            vec![("outer-delegate".to_string(), DELEGATE_TASK_NAME.to_string())],
+            "Channel 只能创建 outer delegate 卡"
+        );
+        assert_eq!(finished, vec!["outer-delegate".to_string()]);
+        assert_eq!(
+            observed_usage,
+            vec![(11, 2), (13, 3), (17, 5), (19, 7)],
+            "root/child 的普通与 forced-final usage 必须全部聚合"
+        );
+        assert_eq!(state.idle_output_tokens(), 17);
+        let cards: Vec<_> = state
+            .transcript
+            .iter()
+            .filter_map(|block| match block {
+                TranscriptBlock::Tool(card) => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 1, "transcript 只能有一张 outer delegate 卡");
+        assert_eq!(cards[0].id, "outer-delegate");
+        assert_eq!(cards[0].name, DELEGATE_TASK_NAME);
+        assert_eq!(cards[0].status, super::app::ToolCardStatus::Done);
+        assert!(cards[0]
+            .output
+            .as_deref()
+            .is_some_and(|output| output.contains("verified README marker")));
+        let transcript_debug = format!("{:?}", state.transcript);
+        assert!(!transcript_debug.contains("child-read-file"));
+        assert!(!transcript_debug.contains("CHILD_INTERNAL_TEXT_MUST_NOT_LEAK"));
+        assert!(!transcript_debug.contains("CHILD_INTERNAL_THINKING_MUST_NOT_LEAK"));
+
+        {
+            let requests = provider.recorded_requests();
+            assert_eq!(requests.len(), 4);
+            assert!(
+                requests[2].messages.iter().any(|message| matches!(
+                    message,
+                    Message::ToolResult {
+                        call_id,
+                        content,
+                        is_error: false
+                    } if call_id == "child-read-file"
+                        && content.contains("READONLY_SUBAGENT_ACTUAL_READ_MARKER")
+                )),
+                "child 必须实际完成 read_file"
+            );
+            assert!(
+                requests[3]
+                    .messages
+                    .iter()
+                    .all(|message| !format!("{message:?}").contains("child-read-file")),
+                "root forced-final request 不得混入 child history"
+            );
+        }
+
+        let stored_history = history.lock().await.clone();
+        let history_debug = format!("{stored_history:?}");
+        assert!(history_debug.contains("outer-delegate"));
+        assert!(!history_debug.contains("child-read-file"));
+        assert!(!history_debug.contains(SUBAGENT_SYSTEM_PROMPT));
+        assert!(!history_debug.contains("CHILD_INTERNAL_TEXT_MUST_NOT_LEAK"));
+        assert_eq!(
+            stored_history
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    Message::ToolResult { call_id, .. } if call_id == "outer-delegate"
+                ))
+                .count(),
+            1
+        );
+
+        let store = SessionStore::new(temp.path().join("sessions"));
+        let meta = SessionMeta {
+            id: "delegate-outer-only".to_string(),
+            provider: "mock".to_string(),
+            model: "tui-test-model".to_string(),
+            created_at: "1".to_string(),
+            cwd: temp.path().to_path_buf(),
+            app_version: "1.2.0".to_string(),
+        };
+        store
+            .write(&meta, &stored_history, &state.transcript, None)
+            .unwrap();
+        let raw_jsonl = fs::read_to_string(store.session_path(&meta.id)).unwrap();
+        assert!(!raw_jsonl.contains("child-read-file"));
+        assert!(!raw_jsonl.contains(SUBAGENT_SYSTEM_PROMPT));
+        assert!(!raw_jsonl.contains("CHILD_INTERNAL_TEXT_MUST_NOT_LEAK"));
+        let (_, loaded_history, loaded_transcript, _) = store.load(&meta.id).unwrap();
+        assert_eq!(loaded_history, stored_history);
+        assert_eq!(loaded_transcript, state.transcript);
+        assert_eq!(
+            loaded_transcript
+                .iter()
+                .filter(|block| matches!(
+                    block,
+                    TranscriptBlock::Tool(card) if card.name == DELEGATE_TASK_NAME
+                ))
+                .count(),
+            1
+        );
+    }
+
+    struct PendingChildProvider {
+        calls: AtomicUsize,
+        child_entered: StdMutex<Option<oneshot::Sender<()>>>,
+        after_child: &'static str,
+        next_prompt: &'static str,
+    }
+
+    impl PendingChildProvider {
+        fn new(
+            after_child: &'static str,
+            next_prompt: &'static str,
+        ) -> (Arc<Self>, oneshot::Receiver<()>) {
+            let (child_entered_tx, child_entered_rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    child_entered: StdMutex::new(Some(child_entered_tx)),
+                    after_child,
+                    next_prompt,
+                }),
+                child_entered_rx,
+            )
+        }
+
+        fn text_response(text: &str, sink: &dyn DeltaSink) -> ModelResponse {
+            sink.on_text(text);
+            ModelResponse {
+                text: text.to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for PendingChildProvider {
+        fn name(&self) -> &str {
+            "pending-child"
+        }
+
+        async fn complete(
+            &self,
+            _req: ModelRequest,
+            sink: &dyn DeltaSink,
+        ) -> Result<ModelResponse, ProviderError> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(delegate_call_response("outer-pending", None)),
+                1 => {
+                    self.child_entered
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("child enters once")
+                        .send(())
+                        .ok();
+                    std::future::pending::<Result<ModelResponse, ProviderError>>().await
+                }
+                2 => Ok(Self::text_response(self.after_child, sink)),
+                3 => Ok(Self::text_response(self.next_prompt, sink)),
+                other => Err(ProviderError::Transport(format!(
+                    "unexpected provider call {other}"
+                ))),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn child_deadline_errors_outer_card_but_parent_accepts_next_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "deadline fixture\n").unwrap();
+        let (provider, child_entered) =
+            PendingChildProvider::new("PARENT_AFTER_CHILD_DEADLINE", "NEXT_AFTER_DEADLINE");
+        let history = agent_history();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history,
+            assembled.compacting,
+            task_hotswap(&temp, BTreeMap::new()),
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+        input_tx
+            .send(UserInput::Prompt("deadline child".to_string()))
+            .unwrap();
+        child_entered.await.expect("child provider entered");
+        tokio::time::advance(CHILD_TIMEOUT).await;
+
+        let mut state = super::app::AppState::new();
+        let mut calling_model_started_at = None;
+        let mut first_token_at = None;
+        let mut interrupted = 0usize;
+        loop {
+            let event = timeout(Duration::from_secs(1), ui_rx.recv())
+                .await
+                .expect("parent did not finish after child deadline")
+                .expect("ui channel closed");
+            if matches!(event, AgentEvent::Interrupted) {
+                interrupted += 1;
+            }
+            let done = matches!(event, AgentEvent::TurnComplete);
+            super::handle_agent_event(
+                &mut state,
+                event,
+                &mut calling_model_started_at,
+                &mut first_token_at,
+                &input_tx,
+            );
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            interrupted, 0,
+            "child-only deadline must not interrupt parent"
+        );
+        assert!(!handle.is_finished(), "parent task must stay alive");
+        assert!(state.transcript.iter().any(|block| matches!(
+            block,
+            TranscriptBlock::Tool(card)
+                if card.id == "outer-pending"
+                    && card.status == super::app::ToolCardStatus::Error
+                    && card.output.as_deref().is_some_and(|output| output.contains("child deadline exceeded"))
+        )));
+        assert!(state.transcript.iter().any(|block| matches!(
+            block,
+            TranscriptBlock::Assistant(text) if text.contains("PARENT_AFTER_CHILD_DEADLINE")
+        )));
+
+        input_tx
+            .send(UserInput::Prompt("next after deadline".to_string()))
+            .unwrap();
+        loop {
+            let event = timeout(Duration::from_secs(1), ui_rx.recv())
+                .await
+                .expect("next prompt timed out")
+                .expect("ui channel closed");
+            let done = matches!(event, AgentEvent::TurnComplete);
+            super::handle_agent_event(
+                &mut state,
+                event,
+                &mut calling_model_started_at,
+                &mut first_token_at,
+                &input_tx,
+            );
+            if done {
+                break;
+            }
+        }
+        assert!(state.transcript.iter().any(|block| matches!(
+            block,
+            TranscriptBlock::Assistant(text) if text.contains("NEXT_AFTER_DEADLINE")
+        )));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+
+        drop(input_tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupt_pending_child_has_one_outer_synthetic_and_session_resume_stays_settled() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "interrupt fixture\n").unwrap();
+        let (provider, child_entered) = PendingChildProvider::new("NEXT_AFTER_INTERRUPT", "UNUSED");
+        let history = agent_history();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config(),
+            Box::new(normal_channel_decider(ui_tx.clone())),
+            None,
+            None,
+            None,
+        );
+        let handle = tokio::spawn(run_agent_task(
+            assembled.agent,
+            history.clone(),
+            assembled.compacting,
+            task_hotswap(&temp, BTreeMap::new()),
+            input_rx,
+            interrupt_rx,
+            ui_tx,
+        ));
+        input_tx
+            .send(UserInput::Prompt("interrupt child".to_string()))
+            .unwrap();
+        timeout(Duration::from_secs(2), child_entered)
+            .await
+            .expect("child provider did not start")
+            .expect("child entered signal dropped");
+        interrupt_tx.send(UserInput::Interrupt).unwrap();
+
+        let mut state = super::app::AppState::new();
+        let mut calling_model_started_at = None;
+        let mut first_token_at = None;
+        let mut interrupted = 0usize;
+        loop {
+            let event = timeout(Duration::from_secs(2), ui_rx.recv())
+                .await
+                .expect("interrupt timed out")
+                .expect("ui channel closed");
+            if matches!(event, AgentEvent::Interrupted) {
+                interrupted += 1;
+            }
+            let done = matches!(event, AgentEvent::Interrupted);
+            super::handle_agent_event(
+                &mut state,
+                event,
+                &mut calling_model_started_at,
+                &mut first_token_at,
+                &input_tx,
+            );
+            if done {
+                break;
+            }
+        }
+        assert_eq!(interrupted, 1);
+        assert!(!handle.is_finished(), "parent task must survive Interrupt");
+        let outer_cards: Vec<_> = state
+            .transcript
+            .iter()
+            .filter_map(|block| match block {
+                TranscriptBlock::Tool(card) => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outer_cards.len(), 1);
+        assert_eq!(outer_cards[0].id, "outer-pending");
+        assert_eq!(outer_cards[0].status, super::app::ToolCardStatus::Error);
+        assert!(state.transcript.iter().all(|block| !matches!(
+            block,
+            TranscriptBlock::Tool(card) if card.id != "outer-pending"
+        )));
+        {
+            let locked = history.lock().await;
+            let results: Vec<_> = locked
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } => Some((call_id.as_str(), content.as_str(), *is_error)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                results,
+                vec![(
+                    "outer-pending",
+                    "tool call interrupted before completion",
+                    true
+                )],
+                "history 只能有唯一 outer synthetic ToolResult"
+            );
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(ui_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "Interrupted 后不得有迟到 child status/tool/usage/Idle"
+        );
+
+        input_tx
+            .send(UserInput::Prompt("next immediately".to_string()))
+            .unwrap();
+        loop {
+            let event = timeout(Duration::from_secs(2), ui_rx.recv())
+                .await
+                .expect("next prompt timed out")
+                .expect("ui channel closed");
+            match &event {
+                AgentEvent::Interrupted => panic!("unexpected second Interrupted"),
+                AgentEvent::ToolCallStarted { id, .. }
+                | AgentEvent::ToolCallFinished { id, .. }
+                    if id != "outer-pending" =>
+                {
+                    panic!("late child tool event leaked: {id}")
+                }
+                _ => {}
+            }
+            let done = matches!(event, AgentEvent::TurnComplete);
+            super::handle_agent_event(
+                &mut state,
+                event,
+                &mut calling_model_started_at,
+                &mut first_token_at,
+                &input_tx,
+            );
+            if done {
+                break;
+            }
+        }
+        assert!(state.transcript.iter().any(|block| matches!(
+            block,
+            TranscriptBlock::Assistant(text) if text.contains("NEXT_AFTER_INTERRUPT")
+        )));
+
+        let store = SessionStore::new(temp.path().join("sessions"));
+        let meta = SessionMeta {
+            id: "delegate-interrupted".to_string(),
+            provider: "mock".to_string(),
+            model: "tui-test-model".to_string(),
+            created_at: "1".to_string(),
+            cwd: temp.path().to_path_buf(),
+            app_version: "1.2.0".to_string(),
+        };
+        let stored_history = history.lock().await.clone();
+        store
+            .write(&meta, &stored_history, &state.transcript, None)
+            .unwrap();
+        for _ in 0..2 {
+            let (_, activated_history, activated_transcript, _) =
+                load_session_for_activation(&store, &meta.id).unwrap();
+            assert_eq!(
+                activated_history
+                    .iter()
+                    .filter(|message| matches!(
+                        message,
+                        Message::ToolResult { call_id, .. } if call_id == "outer-pending"
+                    ))
+                    .count(),
+                1,
+                "continue/resume normalization 不得重复 synthetic"
+            );
+            assert!(activated_history
+                .iter()
+                .all(|message| !format!("{message:?}").contains("child-")));
+            assert!(activated_transcript.iter().all(|block| !matches!(
+                block,
+                TranscriptBlock::Tool(card)
+                    if card.status == super::app::ToolCardStatus::Running
+            )));
+        }
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            3,
+            "session load/continue-resume normalization 不得重跑 child"
+        );
+
+        drop(input_tx);
+        drop(interrupt_tx);
+        handle.await.unwrap();
     }
 }

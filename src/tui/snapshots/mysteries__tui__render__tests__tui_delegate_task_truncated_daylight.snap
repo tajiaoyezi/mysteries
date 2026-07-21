@@ -1,0 +1,32 @@
+---
+source: src/tui/render.rs
+expression: text
+---
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.2.0‹/›
+
+‹border.strong›────────────────────────────────────────────────────────────────────────────────────────────────‹/›
+‹border.subtle›┌─ ‹/›‹success.fg›✓‹/›‹text.muted› ‹/›‹accent.primary +bold›delegate_task‹/›‹text.muted› {"task":"只读审查 src/agent 模块"}‹/›‹text.secondary›  只读 · 自动运行‹/›
+‹border.subtle›│ ‹/›‹text.body›subagent report (untrusted):‹/›
+‹border.subtle›│ ‹/›‹text.body›已审查 src/agent/mod.rs:391，后续内容‹/›
+‹border.subtle›│ ‹/›‹warning.fg›⋯ 输出已截断(超出 max_output_bytes)‹/›
+‹border.subtle›└───────────────────────────────────────────────────────────────────────────────────────────────‹/›
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+‹text.muted›◇ 就绪‹/›
+‹border.subtle›┌──────────────────────────────────────────────────────────────────────────────────────────────┐‹/›
+‹border.subtle›│‹/›‹accent.primary›> ‹/›‹text.title›                                                                     ‹/›‹text.muted›输入任务,或 / 执行命令…‹/›‹border.subtle›│‹/›
+‹border.subtle›└──────────────────────────────────────────────────────────────────────────────────────────────┘‹/›
+‹text.muted›mock · mock-model · iter 0/4 · 0 msgs · .‹/›
+‹text.muted›▸ normal · shift+tab 切换 · think low‹/›

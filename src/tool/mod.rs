@@ -1,14 +1,16 @@
-use crate::agent::ExecutionCapabilities;
+use crate::agent::{AgentExecutionScope, AgentObserver, ExecutionCapabilities};
 use crate::permission::PermissionMode;
 use crate::provider::ToolSchema;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
 pub mod ask;
+#[allow(dead_code)]
+pub(crate) mod delegate;
 pub mod edit;
 pub mod fs;
 pub mod plan;
@@ -21,6 +23,10 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
     fn permission_level(&self) -> PermissionLevel;
+
+    fn required_child_depth(&self) -> u32 {
+        0
+    }
 
     /// 工具并发策略。默认 `Exclusive`（fail-safe 串行）；仅显式 opt-in 的工具可返回 `ParallelSafe`。
     fn concurrency(&self) -> ToolConcurrency {
@@ -42,6 +48,10 @@ pub trait Tool: Send + Sync {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome;
+
+    async fn execute_scoped(&self, args: Value, ctx: &ToolExecutionContext<'_>) -> ToolOutcome {
+        self.execute(args, ctx.tool).await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -177,6 +187,32 @@ impl ToolRegistry {
             })
             .collect()
     }
+
+    pub fn schemas_for_execution_scope(
+        &self,
+        mode: PermissionMode,
+        scope: &AgentExecutionScope,
+    ) -> Vec<ToolSchema> {
+        self.tools
+            .iter()
+            .filter(|tool| match mode {
+                PermissionMode::Plan => {
+                    matches!(
+                        tool.permission_level(),
+                        PermissionLevel::ReadOnly | PermissionLevel::Network
+                    ) || tool.plan_only()
+                }
+                _ => !tool.plan_only(),
+            })
+            .filter(|tool| scope.capabilities().allows(tool.as_ref()))
+            .filter(|tool| tool.required_child_depth() <= scope.budget().remaining_child_depth)
+            .map(|tool| ToolSchema {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.schema(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -207,6 +243,13 @@ pub struct NetworkPermissionPreview {
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub max_output_bytes: usize,
+}
+
+pub struct ToolExecutionContext<'a> {
+    pub tool: &'a ToolContext,
+    pub scope: &'a AgentExecutionScope,
+    pub observer: &'a dyn AgentObserver,
+    pub read_root: Option<&'a Path>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -292,10 +335,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolOutcome, ToolRegistry,
-        ToolRegistryError, ToolRegistryRestrictionError,
+        PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolExecutionContext, ToolOutcome,
+        ToolRegistry, ToolRegistryError, ToolRegistryRestrictionError,
     };
-    use crate::agent::ExecutionCapabilities;
+    use crate::agent::{AgentExecutionScope, ExecutionBudget, ExecutionCapabilities, NoopObserver};
     use crate::permission::PermissionMode;
     use crate::tool::ask::{Answer, AskUserTool, MockPrompter};
     use crate::tool::edit::{EditFileTool, WriteFileTool};
@@ -347,6 +390,38 @@ mod tests {
                 exit: None,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_tool_default_scoped_entry_forwards_exactly_once() {
+        let tool = StatefulTool {
+            calls: AtomicUsize::new(0),
+        };
+        let tool_context = ToolContext {
+            cwd: PathBuf::from("legacy-default-scoped"),
+            max_output_bytes: 1024,
+        };
+        let scope = AgentExecutionScope::root(
+            ExecutionBudget::new(1, None, 0),
+            ExecutionCapabilities::try_new(
+                std::iter::empty::<&str>(),
+                std::iter::empty::<PermissionLevel>(),
+            )
+            .unwrap(),
+        );
+        let observer = NoopObserver;
+        let scoped_context = ToolExecutionContext {
+            tool: &tool_context,
+            scope: &scope,
+            observer: &observer,
+            read_root: None,
+        };
+
+        assert_eq!(tool.required_child_depth(), 0);
+        let outcome = tool.execute_scoped(json!({}), &scoped_context).await;
+
+        assert_eq!(outcome.content, "call-1");
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     }
 
     #[async_trait]

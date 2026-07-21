@@ -1,5 +1,5 @@
 use crate::agent::message::Message;
-use crate::agent::DEFAULT_SYSTEM_PROMPT;
+use crate::agent::{Agent, ScopedAgentError, DEFAULT_SYSTEM_PROMPT};
 use crate::app::{assemble_agent, load_config, select_provider, AssemblyError};
 use crate::config::{write_config, Config, ConfigError, ConfigWritePatch, ProviderKind};
 use crate::credential::{
@@ -610,10 +610,29 @@ pub async fn run_cli(paths: CliPaths, prompt: &str) -> Result<(), CliError> {
     let sink = StdoutSink;
     let mut history = initial_history(prompt);
 
-    assembled.agent.run(&mut history, &ctx, &sink).await?;
+    run_headless_turn(&assembled.agent, &mut history, &ctx, &sink).await?;
     println!();
 
     Ok(())
+}
+
+async fn run_headless_turn(
+    agent: &Agent,
+    history: &mut Vec<Message>,
+    ctx: &ToolContext,
+    sink: &dyn DeltaSink,
+) -> Result<String, AgentError> {
+    let scope = agent.product_root_scope();
+    match agent.run_scoped(&scope, history, ctx, sink).await {
+        Ok(text) => Ok(text),
+        Err(ScopedAgentError::Agent(error)) => Err(error),
+        Err(ScopedAgentError::Cancelled) => Err(AgentError::Context(
+            "legacy root scope was unexpectedly cancelled".to_string(),
+        )),
+        Err(ScopedAgentError::DeadlineExceeded) => Err(AgentError::Context(
+            "legacy root scope unexpectedly reached a deadline".to_string(),
+        )),
+    }
 }
 
 fn read_stdin_line() -> Option<String> {
@@ -684,6 +703,12 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::io::{self, BufRead, Read, Write};
+
+    struct NoopSink;
+
+    impl crate::provider::DeltaSink for NoopSink {
+        fn on_text(&self, _text: &str) {}
+    }
 
     struct ScriptedAuthPrompter {
         lines: Vec<Option<String>>,
@@ -1391,6 +1416,91 @@ mod tests {
         let err = run_cli(paths, "hi").await.unwrap_err();
 
         assert_eq!(err, CliError::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn run_headless_product_scope_executes_delegate() {
+        use super::{run_headless_turn, StdinDecider};
+        use crate::app::assemble_agent;
+        use crate::provider::mock::MockProvider;
+        use crate::provider::{FinishReason, ModelResponse, ToolCall};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::config::resolve(
+            parse(
+                r#"
+model = "headless-model"
+max_iterations = 4
+
+[provider]
+kind = "mock"
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "delegate-1".to_string(),
+                    name: "delegate_task".to_string(),
+                    arguments: json!({ "task": "inspect workspace" }),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+                thinking: Vec::new(),
+            },
+            ModelResponse {
+                text: "child report".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            },
+            ModelResponse {
+                text: "parent done".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            },
+        ]));
+        let assembled = assemble_agent(
+            provider.clone(),
+            &config,
+            Box::new(StdinDecider),
+            None,
+            None,
+            None,
+        );
+        let mut history = initial_history("delegate now");
+        let ctx = crate::tool::ToolContext {
+            cwd: temp.path().to_path_buf(),
+            max_output_bytes: 4096,
+        };
+
+        let text = run_headless_turn(&assembled.agent, &mut history, &ctx, &NoopSink)
+            .await
+            .unwrap();
+
+        assert_eq!(text, "parent done");
+        let requests = provider.recorded_requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0]
+            .tools
+            .iter()
+            .any(|schema| schema.name == "delegate_task"));
+        assert_eq!(
+            requests[1]
+                .tools
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["list_dir", "read_file", "glob", "grep"]
+        );
     }
 
     #[test]

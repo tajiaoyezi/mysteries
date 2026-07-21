@@ -1,4 +1,4 @@
-use crate::agent::{AgentObserver, AgentStatus};
+use crate::agent::{AgentObserver, AgentStatus, RunIdentity};
 use crate::config::append_allowed_command;
 use crate::permission::{
     auto_allows, PermissionCheck, PermissionDecider, PermissionDecision, PermissionMode,
@@ -139,6 +139,12 @@ impl AgentObserver for ChannelObserver {
         let _ = self.tx.send(AgentEvent::StatusChanged(status));
     }
 
+    fn on_scoped_status(&self, identity: &RunIdentity, status: AgentStatus) {
+        if identity.parent_run_id().is_none() {
+            self.on_status(status);
+        }
+    }
+
     fn on_tool_call_started(&self, id: &str, name: &str, args: &Value, readonly: bool) {
         let _ = self.tx.send(AgentEvent::ToolCallStarted {
             id: id.to_string(),
@@ -148,6 +154,19 @@ impl AgentObserver for ChannelObserver {
         });
     }
 
+    fn on_scoped_tool_call_started(
+        &self,
+        identity: &RunIdentity,
+        id: &str,
+        name: &str,
+        args: &Value,
+        readonly: bool,
+    ) {
+        if identity.parent_run_id().is_none() {
+            self.on_tool_call_started(id, name, args, readonly);
+        }
+    }
+
     fn on_tool_call_finished(&self, id: &str, outcome: &ToolOutcome) {
         let _ = self.tx.send(AgentEvent::ToolCallFinished {
             id: id.to_string(),
@@ -155,11 +174,26 @@ impl AgentObserver for ChannelObserver {
         });
     }
 
+    fn on_scoped_tool_call_finished(
+        &self,
+        identity: &RunIdentity,
+        id: &str,
+        outcome: &ToolOutcome,
+    ) {
+        if identity.parent_run_id().is_none() {
+            self.on_tool_call_finished(id, outcome);
+        }
+    }
+
     fn on_usage(&self, usage: &crate::provider::Usage) {
         let _ = self.tx.send(AgentEvent::Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
         });
+    }
+
+    fn on_scoped_usage(&self, _identity: &RunIdentity, usage: &crate::provider::Usage) {
+        self.on_usage(usage);
     }
 }
 
@@ -383,13 +417,16 @@ mod tests {
         AgentEvent, ChannelDecider, ChannelObserver, ChannelPlanApprover, ChannelProgressReporter,
         ChannelPrompter, ChannelSink,
     };
-    use crate::agent::{AgentObserver, AgentStatus};
+    use crate::agent::{
+        AgentExecutionScope, AgentObserver, AgentStatus, ExecutionBudget, ExecutionCapabilities,
+        RunIdentity,
+    };
     use crate::config::read_raw_config;
     use crate::permission::{
         PermissionCheck, PermissionDecider, PermissionDecision, PermissionMode, PermissionReply,
         PolicyEngine,
     };
-    use crate::provider::{DeltaSink, ToolCall};
+    use crate::provider::{DeltaSink, ToolCall, Usage};
     use crate::tool::ask::{Question, UserPrompter};
     use crate::tool::plan::{
         Plan, PlanApprover, PlanDecision, PlanProgressReporter, PlanProgressUpdate, StepStatus,
@@ -423,6 +460,17 @@ mod tests {
             tool,
             network_preview: Some(preview),
         }
+    }
+
+    fn observer_identities() -> (RunIdentity, RunIdentity) {
+        let capabilities =
+            ExecutionCapabilities::try_new(["read_file"], [PermissionLevel::ReadOnly]).unwrap();
+        let root =
+            AgentExecutionScope::root(ExecutionBudget::new(8, None, 1), capabilities.clone());
+        let child = root
+            .derive_child(ExecutionBudget::new(8, None, 0), capabilities)
+            .unwrap();
+        (root.identity(), child.identity())
     }
 
     #[test]
@@ -497,6 +545,120 @@ mod tests {
             }
             other => panic!("expected ToolCallFinished, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn channel_observer_forwards_only_root_scoped_statuses() {
+        let (root, child) = observer_identities();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let observer = ChannelObserver::new(tx);
+
+        observer.on_scoped_status(&root, AgentStatus::CallingModel);
+        observer.on_scoped_status(&child, AgentStatus::ExecutingTool("read_file".to_string()));
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::StatusChanged(status) => assert_eq!(status, AgentStatus::CallingModel),
+            other => panic!("expected root StatusChanged, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "child status must not overwrite the root TUI status"
+        );
+    }
+
+    #[test]
+    fn channel_observer_ignores_child_tool_events_even_with_duplicate_outer_call_id() {
+        let (root, child) = observer_identities();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let observer = ChannelObserver::new(tx);
+        let root_outcome = ToolOutcome {
+            content: "outer complete".to_string(),
+            is_error: false,
+            truncated: false,
+            exit: None,
+        };
+        let child_outcome = ToolOutcome {
+            content: "child complete".to_string(),
+            is_error: false,
+            truncated: false,
+            exit: None,
+        };
+
+        observer.on_scoped_tool_call_started(
+            &root,
+            "duplicate-id",
+            "delegate_task",
+            &json!({ "task": "inspect" }),
+            true,
+        );
+        observer.on_scoped_tool_call_started(
+            &child,
+            "duplicate-id",
+            "read_file",
+            &json!({ "path": "README.md" }),
+            true,
+        );
+        observer.on_scoped_tool_call_finished(&child, "duplicate-id", &child_outcome);
+        observer.on_scoped_tool_call_finished(&root, "duplicate-id", &root_outcome);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCallStarted { id, name, .. } => {
+                assert_eq!(id, "duplicate-id");
+                assert_eq!(name, "delegate_task");
+            }
+            other => panic!("expected outer ToolCallStarted, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCallFinished { id, outcome } => {
+                assert_eq!(id, "duplicate-id");
+                assert_eq!(outcome, root_outcome);
+            }
+            other => panic!(
+                "child duplicate id must not close or replace the outer tool card, got {other:?}"
+            ),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "only the root start/finish pair may reach TUI"
+        );
+    }
+
+    #[test]
+    fn channel_observer_aggregates_root_and_child_scoped_usage() {
+        let (root, child) = observer_identities();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let observer = ChannelObserver::new(tx);
+
+        observer.on_scoped_usage(
+            &root,
+            &Usage {
+                input_tokens: 2,
+                output_tokens: 3,
+            },
+        );
+        observer.on_scoped_usage(
+            &child,
+            &Usage {
+                input_tokens: 5,
+                output_tokens: 7,
+            },
+        );
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => assert_eq!((input_tokens, output_tokens), (2, 3)),
+            other => panic!("expected root Usage, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => assert_eq!((input_tokens, output_tokens), (5, 7)),
+            other => panic!("expected child Usage, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     struct ExecuteTool;
