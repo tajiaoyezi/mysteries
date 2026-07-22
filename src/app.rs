@@ -1,5 +1,5 @@
 use crate::agent::context::ContextStrategy;
-use crate::agent::{Agent, Compacting, CompactionSettings};
+use crate::agent::{Agent, AgentRuntime, Compacting, CompactionSettings};
 use crate::config::{self, Config, ConfigError, ProviderKind, RawConfig};
 use crate::credential::CredentialChain;
 use crate::permission::PermissionDecider;
@@ -8,6 +8,7 @@ use crate::provider::mock::MockProvider;
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::{FinishReason, ModelResponse, Provider};
 use crate::tool::ask::AskUserTool;
+use crate::tool::delegate::DelegateTaskTool;
 use crate::tool::edit::{EditFileTool, WriteFileTool};
 use crate::tool::fs::{GlobTool, GrepTool, ListDirTool, ReadFileTool};
 use crate::tool::plan::{SubmitPlanTool, UpdatePlanTool};
@@ -158,17 +159,20 @@ pub struct AssembledAgent {
     pub compacting: Compacting,
 }
 
-pub fn assemble_agent(
-    provider: Arc<dyn Provider>,
-    config: &Config,
-    decider: Box<dyn PermissionDecider>,
+fn assemble_registry(
+    runtime: AgentRuntime,
     plan_approver: Option<Box<dyn crate::tool::plan::PlanApprover>>,
     user_prompter: Option<Box<dyn crate::tool::ask::UserPrompter>>,
     progress_reporter: Option<Box<dyn crate::tool::plan::PlanProgressReporter>>,
-) -> AssembledAgent {
-    let compacting = build_compacting(provider.clone(), config);
-    let strategy: Box<dyn ContextStrategy> = Box::new(build_compacting(provider.clone(), config));
+) -> ToolRegistry {
     let mut registry = default_registry();
+    let child_registry = registry
+        .restricted_to(["list_dir", "read_file", "glob", "grep"])
+        .expect("default registry must contain all four child read tools");
+    registry
+        .register(Box::new(DelegateTaskTool::new(runtime, child_registry)))
+        .expect("delegate_task should register once");
+
     if let Some(approver) = plan_approver {
         registry
             .register(Box::new(SubmitPlanTool::new(approver)))
@@ -184,21 +188,40 @@ pub fn assemble_agent(
             .register(Box::new(UpdatePlanTool::new(reporter)))
             .expect("update_plan should register once");
     }
-    let mut agent = Agent::new(
-        provider,
-        registry,
-        decider,
-        config.model.clone(),
-        config.max_iterations,
+
+    registry
+}
+
+pub fn assemble_agent(
+    provider: Arc<dyn Provider>,
+    config: &Config,
+    decider: Box<dyn PermissionDecider>,
+    plan_approver: Option<Box<dyn crate::tool::plan::PlanApprover>>,
+    user_prompter: Option<Box<dyn crate::tool::ask::UserPrompter>>,
+    progress_reporter: Option<Box<dyn crate::tool::plan::PlanProgressReporter>>,
+) -> AssembledAgent {
+    let compacting = build_compacting(provider.clone(), config);
+    let strategy: Box<dyn ContextStrategy> = Box::new(build_compacting(provider.clone(), config));
+    let runtime = AgentRuntime::new(provider, config.model.clone());
+    let registry = assemble_registry(
+        runtime.clone(),
+        plan_approver,
+        user_prompter,
+        progress_reporter,
     );
+    let mut agent = Agent::with_runtime(runtime, registry, decider, config.max_iterations);
     agent.set_strategy(strategy);
     AssembledAgent { agent, compacting }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_agent, default_registry, load_config, select_provider, AssemblyError};
+    use super::{
+        assemble_agent, assemble_registry, default_registry, load_config, select_provider,
+        AssemblyError,
+    };
     use crate::agent::message::Message;
+    use crate::agent::AgentRuntime;
     use crate::config::{
         AuthType, Config, ConfigError, ProviderConfig, ProviderKind, DEFAULT_COMPACT_TRIGGER_RATIO,
         DEFAULT_KEEP_RECENT_TURNS, DEFAULT_THINKING,
@@ -209,6 +232,7 @@ mod tests {
     use crate::provider::mock::MockProvider;
     use crate::provider::{DeltaSink, ModelRequest};
     use crate::provider::{FinishReason, ModelResponse, ToolCall};
+    use crate::tool::delegate::DELEGATE_TASK_NAME;
     use crate::tool::{PermissionLevel, ToolContext};
     use async_trait::async_trait;
     use serde_json::json;
@@ -481,6 +505,7 @@ kind = "mock"
     #[test]
     fn default_registry_contains_all_builtin_tools() {
         let registry = default_registry();
+        assert_eq!(registry.schemas().len(), 9);
         let mut names = registry
             .schemas()
             .into_iter()
@@ -692,36 +717,122 @@ kind = "mock"
     }
 
     #[test]
-    fn assemble_agent_some_registers_update_plan_with_twelve_schemas() {
-        use crate::tool::ask::{Answer, AskUserTool, MockPrompter};
-        use crate::tool::plan::{
-            MockPlanApprover, MockPlanProgressReporter, PlanDecision, SubmitPlanTool,
-            UpdatePlanTool,
-        };
+    fn assembled_registry_adds_delegate_after_the_nine_tool_base() {
+        let runtime = AgentRuntime::new(
+            Arc::new(MockProvider::new(Vec::new())),
+            "configured-model".to_string(),
+        );
 
-        let mut registry = default_registry();
-        registry
-            .register(Box::new(SubmitPlanTool::new(Box::new(
-                MockPlanApprover::new(PlanDecision::Approve),
-            ))))
-            .unwrap();
-        registry
-            .register(Box::new(AskUserTool::new(Box::new(MockPrompter::new(
-                Answer {
-                    selected: Vec::new(),
-                    supplement: None,
-                },
-            )))))
-            .unwrap();
-        registry
-            .register(Box::new(UpdatePlanTool::new(Box::new(
-                MockPlanProgressReporter::new(),
-            ))))
-            .unwrap();
+        let registry = assemble_registry(runtime, None, None, None);
+        let schemas = registry.schemas();
+
+        assert_eq!(schemas.len(), 10);
+        assert_eq!(schemas[9].name, DELEGATE_TASK_NAME);
+    }
+
+    #[test]
+    fn assembled_registry_with_three_optional_tools_has_thirteen_schemas() {
+        use crate::tool::ask::{Answer, MockPrompter};
+        use crate::tool::plan::{MockPlanApprover, MockPlanProgressReporter, PlanDecision};
+
+        let runtime = AgentRuntime::new(
+            Arc::new(MockProvider::new(Vec::new())),
+            "configured-model".to_string(),
+        );
+        let registry = assemble_registry(
+            runtime,
+            Some(Box::new(MockPlanApprover::new(PlanDecision::Approve))),
+            Some(Box::new(MockPrompter::new(Answer {
+                selected: Vec::new(),
+                supplement: None,
+            }))),
+            Some(Box::new(MockPlanProgressReporter::new())),
+        );
 
         let schemas = registry.schemas();
-        assert_eq!(schemas.len(), 12);
+        assert_eq!(schemas.len(), 13);
+        assert_eq!(schemas[9].name, DELEGATE_TASK_NAME);
+        assert!(schemas.iter().any(|schema| schema.name == "submit_plan"));
+        assert!(schemas.iter().any(|schema| schema.name == "ask_user"));
         assert!(schemas.iter().any(|schema| schema.name == "update_plan"));
+    }
+
+    #[tokio::test]
+    async fn assembled_parent_and_delegate_observe_the_same_switched_runtime_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_for(ProviderKind::Mock);
+        let old_provider = Arc::new(MockProvider::new(Vec::new()));
+        let new_provider = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "delegate-1".to_string(),
+                    name: DELEGATE_TASK_NAME.to_string(),
+                    arguments: json!({ "task": "inspect workspace" }),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+                thinking: Vec::new(),
+            },
+            ModelResponse {
+                text: "child report".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            },
+            ModelResponse {
+                text: "parent done".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                thinking: Vec::new(),
+            },
+        ]));
+        let mut assembled = assemble_agent(
+            old_provider.clone(),
+            &config,
+            Box::new(AllowAll),
+            None,
+            None,
+            None,
+        );
+        assembled
+            .agent
+            .restore_provider_model(new_provider.clone(), "switched-model".to_string());
+        let scope = assembled.agent.product_root_scope();
+        let mut history = vec![Message::User("delegate now".to_string())];
+
+        let text = assembled
+            .agent
+            .run_scoped(
+                &scope,
+                &mut history,
+                &ctx(temp.path().to_path_buf()),
+                &NoopSink,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(text, "parent done");
+        assert!(old_provider.recorded_requests().is_empty());
+        let requests = new_provider.recorded_requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|request| request.model == "switched-model"));
+        assert!(requests[0]
+            .tools
+            .iter()
+            .any(|schema| schema.name == DELEGATE_TASK_NAME));
+        assert_eq!(
+            requests[1]
+                .tools
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["list_dir", "read_file", "glob", "grep"]
+        );
     }
 
     #[tokio::test]

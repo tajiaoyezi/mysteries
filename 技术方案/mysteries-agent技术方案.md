@@ -271,10 +271,10 @@ struct ToolRegistry { tools: HashMap<String, Box<dyn Tool>> }
 
 | 工具 | 类别 | 权限 | 实现要点 |
 |---|---|---|---|
-| `list_dir` | 浏览 | ReadOnly | `ignore` crate,gitignore 感知 |
+| `list_dir` | 浏览 | ReadOnly | `ignore` crate,root保持gitignore感知；child的parent与规则文件读取受canonical read root约束 |
 | `read_file` | 读取 | ReadOnly | 带 `offset`/`limit` 分页,输出截断 |
 | `glob` | 文件匹配 | ReadOnly | `globset` |
-| `grep` | 内容搜索 | ReadOnly | `ignore` 遍历 + `regex`,结果行数上限 |
+| `grep` | 内容搜索 | ReadOnly | `ignore` 遍历 + `regex`；child ignore metadata受canonical read root约束 |
 | `write_file` | 写入 | RequiresConfirmation | 新建/覆盖,确认时显示 diff |
 | `edit_file` | 编辑 | RequiresConfirmation | str-replace,要求唯一匹配,否则报错 |
 | `run_shell` | 执行 | RequiresConfirmation | `tokio::process`,捕获 stdout/stderr/exit + timeout |
@@ -370,6 +370,16 @@ flowchart TD
 **终止条件**:① 模型返回无 `tool_calls` = 最终回复;② `iteration >= max_iterations`(config 读)= 超轮次终止;③ 不可恢复错误(见 §9)= 终止。可恢复错误(工具失败、权限拒绝、单次 provider 重试范围内的失败)不终止,作为结果入 history 继续。
 
 【决策】**1.0 同一轮的多个 tool_calls 顺序执行。** 并行留给 1.5。注意:**不得**仅按 `PermissionLevel::ReadOnly` 推断可并发——交互 / 计划工具也是 `ReadOnly` 却不能重叠。1.5 改为独立 `ToolConcurrency`(默认 `Exclusive`),仅显式 opt-in 的本地读取进入 work-conserving 有界安全段。
+
+### 6.1 单层只读 `delegate_task`([Unreleased])
+
+产品TUI与headless入口可让root Agent通过`delegate_task`创建临时child Agent。每个child只得到`list_dir`、`read_file`、`glob`、`grep`四个`ReadOnly`工具,固定Normal mode与Low thinking,不复制parent history、Plan状态或session。child工具参数先按canonical path验证必须等于workspace root或位于其下,绝对workspace外路径、`..`逃逸及指向外部的symlink / junction均fail-closed；目录walker的parent discovery止于canonical read root,可能加载的`.ignore` / `.gitignore`也在解析前做canonical containment,外部parent规则不生效、内部规则链接越界则拒绝。提示词只做defense-in-depth,真正边界由registry、execution scope与path containment共同强制。
+
+`delegate_task`复用既有`ParallelSafe` scheduler。同一eligible segment中outer同时active的读取 / delegate future合计最多4个,第五个及以后work-conserving等待；4是并发上限,**不是**一次模型回复中的delegate occurrence总量上限。物理完成可以乱序,但ToolResult、observer finished与下一轮Provider可见history必须按原occurrence发布。
+
+每个child的`max_iterations=min(parent.max_iterations, 8)`,触顶时至多再发一次既有forced-final Provider调用；deadline为`min(parent.deadline, invocation_time+120s)`,从有效参数通过后立即计时,覆盖blocking permit等待、workspace canonicalization preflight、child构造和完整run。因此单个child最多8次tool-enabled调用加1次forced-final,一次回复的Provider成本最坏放大为`delegate occurrence数 × 最多9`。当前没有per-response occurrence cap、跨child token总预算或child-only扫描字节硬上限；四个fs工具仍先完成读取 / 遍历 / 匹配收集,其中`read_file`与`grep`再按`max_output_bytes`后置截断,`list_dir`与`glob`的既有输出没有该硬上限。不能把输出截断解释为扫描早停或总内存上界。
+
+本阶段只交付单层、同步等待、临时且只读的child:child remaining depth固定0,没有递归、后台任务、独立child session、写入、Execute、Network、Plan或交互工具。TUI只显示outer `delegate_task`标准工具卡；child status/tool事件按run identity隔离,usage仍计入当前turn。session也只保存outer ToolCall/ToolResult,恢复时不重跑child。
 
 ---
 
@@ -487,9 +497,11 @@ struct MockProvider { script: Vec<ModelResponse>, cursor: AtomicUsize }
 | **1.2 持久化** | `Session` 已 `derive(Serialize)`,是天然落盘单元 | 加 `SessionStore` trait(file/sqlite);1.0 无实现 |
 | **1.3 权限工效** | 权限门 `gate()` 已集中决策点 | 在 `ask` 前插 `PolicyEngine`(allowlist/风险分级/always-allow) |
 | **1.4 TUI 体验** | 渲染隔离在 `tui/` | 纯加法:markdown 渲染、diff 高亮、折叠 |
-| **1.5 并行工具** | 独立 `ToolConcurrency` + 默认 Exclusive;连续 ParallelSafe 段 work-conserving 有界并行(上限 4);Exclusive / Network / Edit / Execute / 交互为屏障 | 不按 ReadOnly 推断;TUI Interrupt 收口仅是 turn 级 helper,不是通用 Agent / child cancellation API |
-| **2.0 MCP** | `ToolRegistry` 持 `Box<dyn Tool>` | MCP 工具作为另一种 `Tool` 实现,代理到 MCP server |
-| **2.0 subagent** | Agent Loop 即可构造的单元(Session+Registry+Provider) | child = 带独立 context 预算 + 受限 registry 的另一个 Loop;依赖 1.1 预算 + 1.5 有界调度先例 + 1.3 作用域;须另设计可复用 cancellation |
+| **1.5 并行工具** | 独立 `ToolConcurrency` + 默认 Exclusive;连续 ParallelSafe 段 work-conserving 有界并行(上限 4);Exclusive / Network / Edit / Execute / 交互为屏障 | 不按 ReadOnly 推断;已由通用 Agent execution scope 取代早期 TUI turn helper,Provider / permission / 串并行工具统一响应 cancellation |
+| **1.3 execution scope** | 每次 run 有稳定 identity、parent→child cancellation、iteration/deadline/depth 预算与 capability 上限;受限 registry 共享 `Arc<dyn Tool>` | child scope 只能收紧预算、工具名与权限级,不能扩权;Provider 回复前取消会从后续模型history隔离未提交Prompt,但保留TUI transcript;取消只收口 Agent future/history/observer,不硬取消已进入 blocking pool 的 OS 工作 |
+| **2.0 MCP** | `ToolRegistry` 内部持共享 `Arc<dyn Tool>`,注册边界仍接受 `Box<dyn Tool>` | MCP 工具可作为另一种 `Tool` 实现,代理到 MCP server;本阶段未实现 |
+| **1.3 单层只读 subagent** | Agent Loop + 可派生 execution scope + 共享runtime snapshot + 受限 `ToolRegistry` | 已提供临时`delegate_task`:单层、只读、同步等待、canonical workspace confinement;不含递归、后台任务、child session、写 / Network child或独立subagent UI |
+| **2.0 subagent 扩展** | 现有单层只读child与observer identity是安全基线 | 更深递归、全局token / occurrence预算、后台调度、持久child session、专用model和独立UI必须另行设计,不得从当前MVP默认外推 |
 | **OAuth 登录** | `CredentialChain` 已是可扩展链 | 加 `OAuthCredentialSource`,配合 1.2 存 token |
 
 ---

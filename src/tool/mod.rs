@@ -1,13 +1,16 @@
+use crate::agent::{AgentExecutionScope, AgentObserver, ExecutionCapabilities};
 use crate::permission::PermissionMode;
 use crate::provider::ToolSchema;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
 pub mod ask;
+#[allow(dead_code)]
+pub(crate) mod delegate;
 pub mod edit;
 pub mod fs;
 pub mod plan;
@@ -20,6 +23,10 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
     fn permission_level(&self) -> PermissionLevel;
+
+    fn required_child_depth(&self) -> u32 {
+        0
+    }
 
     /// 工具并发策略。默认 `Exclusive`（fail-safe 串行）；仅显式 opt-in 的工具可返回 `ParallelSafe`。
     fn concurrency(&self) -> ToolConcurrency {
@@ -41,17 +48,29 @@ pub trait Tool: Send + Sync {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutcome;
+
+    async fn execute_scoped(&self, args: Value, ctx: &ToolExecutionContext<'_>) -> ToolOutcome {
+        self.execute(args, ctx.tool).await
+    }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ToolRegistryError {
     #[error("duplicate tool registration: {0}")]
     Duplicate(String),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ToolRegistryRestrictionError {
+    #[error("duplicate tool requested for restricted registry: {0}")]
+    Duplicate(String),
+    #[error("unknown tool requested for restricted registry: {0}")]
+    Unknown(String),
 }
 
 impl ToolRegistry {
@@ -69,7 +88,7 @@ impl ToolRegistry {
             return Err(ToolRegistryError::Duplicate(name.to_string()));
         }
 
-        self.tools.push(tool);
+        self.tools.push(Arc::from(tool));
         Ok(())
     }
 
@@ -110,6 +129,90 @@ impl ToolRegistry {
             })
             .collect()
     }
+
+    pub fn restricted_to<I, S>(
+        &self,
+        names: I,
+    ) -> Result<ToolRegistry, ToolRegistryRestrictionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut requested = std::collections::BTreeSet::new();
+        for name in names {
+            let name = name.as_ref().to_string();
+            if !requested.insert(name.clone()) {
+                return Err(ToolRegistryRestrictionError::Duplicate(name));
+            }
+        }
+
+        if let Some(name) = requested
+            .iter()
+            .find(|name| self.get(name.as_str()).is_none())
+        {
+            return Err(ToolRegistryRestrictionError::Unknown(name.clone()));
+        }
+
+        Ok(ToolRegistry {
+            tools: self
+                .tools
+                .iter()
+                .filter(|tool| requested.contains(tool.name()))
+                .cloned()
+                .collect(),
+        })
+    }
+
+    pub fn schemas_for_scope(
+        &self,
+        mode: PermissionMode,
+        capabilities: &ExecutionCapabilities,
+    ) -> Vec<ToolSchema> {
+        self.tools
+            .iter()
+            .filter(|tool| match mode {
+                PermissionMode::Plan => {
+                    matches!(
+                        tool.permission_level(),
+                        PermissionLevel::ReadOnly | PermissionLevel::Network
+                    ) || tool.plan_only()
+                }
+                _ => !tool.plan_only(),
+            })
+            .filter(|tool| capabilities.allows(tool.as_ref()))
+            .map(|tool| ToolSchema {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.schema(),
+            })
+            .collect()
+    }
+
+    pub fn schemas_for_execution_scope(
+        &self,
+        mode: PermissionMode,
+        scope: &AgentExecutionScope,
+    ) -> Vec<ToolSchema> {
+        self.tools
+            .iter()
+            .filter(|tool| match mode {
+                PermissionMode::Plan => {
+                    matches!(
+                        tool.permission_level(),
+                        PermissionLevel::ReadOnly | PermissionLevel::Network
+                    ) || tool.plan_only()
+                }
+                _ => !tool.plan_only(),
+            })
+            .filter(|tool| scope.capabilities().allows(tool.as_ref()))
+            .filter(|tool| tool.required_child_depth() <= scope.budget().remaining_child_depth)
+            .map(|tool| ToolSchema {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.schema(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,7 +245,14 @@ pub struct ToolContext {
     pub max_output_bytes: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolExecutionContext<'a> {
+    pub tool: &'a ToolContext,
+    pub scope: &'a AgentExecutionScope,
+    pub observer: &'a dyn AgentObserver,
+    pub read_root: Option<&'a Path>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionLevel {
     ReadOnly,
     Network,
@@ -225,9 +335,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolOutcome, ToolRegistry,
-        ToolRegistryError,
+        PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolExecutionContext, ToolOutcome,
+        ToolRegistry, ToolRegistryError, ToolRegistryRestrictionError,
     };
+    use crate::agent::{AgentExecutionScope, ExecutionBudget, ExecutionCapabilities, NoopObserver};
     use crate::permission::PermissionMode;
     use crate::tool::ask::{Answer, AskUserTool, MockPrompter};
     use crate::tool::edit::{EditFileTool, WriteFileTool};
@@ -246,6 +357,71 @@ mod tests {
         description: &'static str,
         permission_level: PermissionLevel,
         plan_only: bool,
+    }
+
+    struct StatefulTool {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Tool for StatefulTool {
+        fn name(&self) -> &str {
+            "stateful"
+        }
+
+        fn description(&self) -> &str {
+            "Stateful tool"
+        }
+
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            ToolOutcome {
+                content: format!("call-{call}"),
+                is_error: false,
+                truncated: false,
+                exit: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_tool_default_scoped_entry_forwards_exactly_once() {
+        let tool = StatefulTool {
+            calls: AtomicUsize::new(0),
+        };
+        let tool_context = ToolContext {
+            cwd: PathBuf::from("legacy-default-scoped"),
+            max_output_bytes: 1024,
+        };
+        let scope = AgentExecutionScope::root(
+            ExecutionBudget::new(1, None, 0),
+            ExecutionCapabilities::try_new(
+                std::iter::empty::<&str>(),
+                std::iter::empty::<PermissionLevel>(),
+            )
+            .unwrap(),
+        );
+        let observer = NoopObserver;
+        let scoped_context = ToolExecutionContext {
+            tool: &tool_context,
+            scope: &scope,
+            observer: &observer,
+            read_root: None,
+        };
+
+        assert_eq!(tool.required_child_depth(), 0);
+        let outcome = tool.execute_scoped(json!({}), &scoped_context).await;
+
+        assert_eq!(outcome.content, "call-1");
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     }
 
     #[async_trait]
@@ -504,6 +680,90 @@ mod tests {
         assert!(registry.get("unique").is_some());
     }
 
+    #[tokio::test]
+    async fn restricted_registry_shares_same_stateful_tool_instance() {
+        let mut parent = ToolRegistry::new();
+        parent
+            .register(Box::new(StatefulTool {
+                calls: AtomicUsize::new(0),
+            }))
+            .unwrap();
+
+        let restricted = parent.restricted_to(["stateful"]).unwrap();
+        let parent_tool = parent.get("stateful").unwrap();
+        let restricted_tool = restricted.get("stateful").unwrap();
+
+        assert!(std::ptr::eq(parent_tool, restricted_tool));
+        assert_eq!(
+            parent_tool.execute(json!({}), &ctx()).await.content,
+            "call-1"
+        );
+        assert_eq!(
+            restricted_tool.execute(json!({}), &ctx()).await.content,
+            "call-2"
+        );
+    }
+
+    #[test]
+    fn restricted_registry_keeps_parent_order_not_request_order() {
+        let mut parent = ToolRegistry::new();
+        for name in ["list_dir", "read_file", "glob", "grep"] {
+            parent
+                .register(Box::new(mock_tool(
+                    name,
+                    "Ordered tool",
+                    PermissionLevel::ReadOnly,
+                )))
+                .unwrap();
+        }
+
+        let restricted = parent.restricted_to(["grep", "list_dir"]).unwrap();
+
+        assert_eq!(
+            restricted
+                .schemas()
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["list_dir", "grep"]
+        );
+    }
+
+    #[test]
+    fn restricted_registry_accepts_empty_selection() {
+        let parent = registry_with_mixed_tools();
+
+        let restricted = parent.restricted_to(Vec::<String>::new()).unwrap();
+
+        assert!(restricted.schemas().is_empty());
+        assert!(restricted.schemas_for(PermissionMode::Normal).is_empty());
+        assert!(restricted.get("read_tool").is_none());
+    }
+
+    #[test]
+    fn restricted_registry_rejects_unknown_name_without_partial_registry() {
+        let parent = registry_with_mixed_tools();
+
+        let result = parent.restricted_to(["read_tool", "missing"]);
+
+        assert!(matches!(
+            result,
+            Err(ToolRegistryRestrictionError::Unknown(name)) if name == "missing"
+        ));
+    }
+
+    #[test]
+    fn restricted_registry_rejects_duplicate_name_without_partial_registry() {
+        let parent = registry_with_mixed_tools();
+
+        let result = parent.restricted_to(["read_tool", "read_tool"]);
+
+        assert!(matches!(
+            result,
+            Err(ToolRegistryRestrictionError::Duplicate(name)) if name == "read_tool"
+        ));
+    }
+
     fn registry_with_mixed_tools() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         registry
@@ -592,6 +852,26 @@ mod tests {
                 "mode={mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn schemas_for_scope_intersects_mode_tool_names_and_permission_levels() {
+        let registry = registry_with_mixed_tools();
+        let capabilities = ExecutionCapabilities::try_new(
+            ["exec_tool", "read_tool"],
+            [PermissionLevel::ReadOnly, PermissionLevel::Execute],
+        )
+        .unwrap();
+
+        let schemas = registry.schemas_for_scope(PermissionMode::Normal, &capabilities);
+
+        assert_eq!(
+            schemas
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_tool", "exec_tool"]
+        );
     }
 
     #[test]

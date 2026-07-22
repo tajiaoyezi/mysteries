@@ -1,18 +1,35 @@
 pub mod compacting;
 pub mod context;
+#[cfg(test)]
+mod delegate_concurrency_tests;
 pub mod message;
+#[cfg(test)]
+mod publication_tests;
+mod runtime;
+pub mod scope;
+#[cfg(test)]
+mod scope_tests;
 
 pub use compacting::run_compact_command;
 pub use compacting::{CompactCommandOutcome, Compacting, CompactionSettings, SUMMARY_HEADER};
 pub use context::{ContextError, ContextStrategy, Passthrough};
+pub(crate) use runtime::{AgentRuntime, RuntimeSnapshot};
+pub use scope::{
+    AgentExecutionScope, ExecutionBudget, ExecutionCapabilities, RunIdentity, ScopeDeriveError,
+    ScopedAgentError, StopReason,
+};
 
 use crate::agent::message::Message;
 use crate::error::{AgentError, ProviderError};
 use crate::permission::{
-    gate, PermissionDecider, PermissionDenial, PermissionGateOutcome, PermissionMode,
+    ensure_tool_in_execution_scope, gate_scoped, PermissionDecider, PermissionDenial,
+    PermissionGateOutcome, PermissionMode,
 };
 use crate::provider::{DeltaSink, Depth, ModelRequest, Provider, ThinkingConfig, ToolCall, Usage};
-use crate::tool::{PermissionLevel, ToolConcurrency, ToolContext, ToolOutcome, ToolRegistry};
+use crate::tool::{
+    PermissionLevel, ToolConcurrency, ToolContext, ToolExecutionContext, ToolOutcome, ToolRegistry,
+};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Mysteries, a helpful coding assistant. Do not claim to be Claude, ChatGPT, OpenAI, Anthropic, or any specific upstream model. If asked about your model identity, say you are running inside Mysteries and the configured model name is shown in the status line.";
@@ -58,6 +75,10 @@ pub enum AgentStatus {
 pub trait AgentObserver: Send + Sync {
     fn on_status(&self, _status: AgentStatus) {}
 
+    fn on_scoped_status(&self, _identity: &RunIdentity, status: AgentStatus) {
+        self.on_status(status);
+    }
+
     fn on_tool_call_started(
         &self,
         _id: &str,
@@ -67,9 +88,33 @@ pub trait AgentObserver: Send + Sync {
     ) {
     }
 
+    fn on_scoped_tool_call_started(
+        &self,
+        _identity: &RunIdentity,
+        id: &str,
+        name: &str,
+        args: &serde_json::Value,
+        readonly: bool,
+    ) {
+        self.on_tool_call_started(id, name, args, readonly);
+    }
+
     fn on_tool_call_finished(&self, _id: &str, _outcome: &crate::tool::ToolOutcome) {}
 
+    fn on_scoped_tool_call_finished(
+        &self,
+        _identity: &RunIdentity,
+        id: &str,
+        outcome: &crate::tool::ToolOutcome,
+    ) {
+        self.on_tool_call_finished(id, outcome);
+    }
+
     fn on_usage(&self, _usage: &Usage) {}
+
+    fn on_scoped_usage(&self, _identity: &RunIdentity, usage: &Usage) {
+        self.on_usage(usage);
+    }
 }
 
 pub struct NoopObserver;
@@ -77,14 +122,14 @@ pub struct NoopObserver;
 impl AgentObserver for NoopObserver {}
 
 pub struct Agent {
-    provider: Arc<dyn Provider>,
+    runtime: AgentRuntime,
     registry: ToolRegistry,
     decider: Box<dyn PermissionDecider>,
-    model: String,
     max_iterations: u32,
     strategy: Box<dyn ContextStrategy>,
     permission_mode: Arc<Mutex<PermissionMode>>,
     thinking_depth: Arc<Mutex<Depth>>,
+    read_root: Option<PathBuf>,
 }
 
 impl Agent {
@@ -95,16 +140,40 @@ impl Agent {
         model: String,
         max_iterations: u32,
     ) -> Self {
-        Self {
-            provider,
+        Self::with_runtime(
+            AgentRuntime::new(provider, model),
             registry,
             decider,
-            model,
+            max_iterations,
+        )
+    }
+
+    pub(crate) fn with_runtime(
+        runtime: AgentRuntime,
+        registry: ToolRegistry,
+        decider: Box<dyn PermissionDecider>,
+        max_iterations: u32,
+    ) -> Self {
+        Self {
+            runtime,
+            registry,
+            decider,
             max_iterations,
             strategy: Box::new(Passthrough),
             permission_mode: Arc::new(Mutex::new(PermissionMode::Normal)),
             thinking_depth: Arc::new(Mutex::new(Depth::Low)),
+            read_root: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime(&self) -> AgentRuntime {
+        self.runtime.clone()
+    }
+
+    pub(crate) fn with_read_root(mut self, canonical_read_root: PathBuf) -> Self {
+        self.read_root = Some(canonical_read_root);
+        self
     }
 
     pub fn set_thinking_depth(&mut self, depth: Arc<Mutex<Depth>>) {
@@ -127,17 +196,67 @@ impl Agent {
 
     /// Session 恢复等路径：只更新 model / ContextStrategy，不碰 thinking。
     pub fn restore_model(&mut self, model: String) {
-        self.model = model.clone();
+        self.runtime.set_model(model.clone());
         self.strategy.set_model(model);
     }
 
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
-        self.provider = provider.clone();
+        self.runtime.set_provider(provider.clone());
         self.strategy.set_provider(provider);
+    }
+
+    pub(crate) fn replace_provider_model(&mut self, provider: Arc<dyn Provider>, model: String) {
+        self.strategy.set_provider(provider.clone());
+        self.strategy.set_model(model.clone());
+        self.runtime.replace_provider_model(provider, model);
+    }
+
+    pub(crate) fn set_provider_model(
+        &mut self,
+        provider: Arc<dyn Provider>,
+        model: String,
+        history: &mut [Message],
+    ) {
+        for message in history.iter_mut() {
+            if let Message::Assistant { thinking, .. } = message {
+                thinking.clear();
+            }
+        }
+        self.replace_provider_model(provider, model);
+    }
+
+    pub(crate) fn restore_provider_model(&mut self, provider: Arc<dyn Provider>, model: String) {
+        self.replace_provider_model(provider, model);
     }
 
     pub fn set_strategy(&mut self, strategy: Box<dyn ContextStrategy>) {
         self.strategy = strategy;
+    }
+
+    pub fn root_scope(&self) -> AgentExecutionScope {
+        self.root_scope_with_depth(0)
+    }
+
+    pub(crate) fn product_root_scope(&self) -> AgentExecutionScope {
+        self.root_scope_with_depth(1)
+    }
+
+    fn root_scope_with_depth(&self, remaining_child_depth: u32) -> AgentExecutionScope {
+        AgentExecutionScope::root(
+            ExecutionBudget::new(self.max_iterations, None, remaining_child_depth),
+            ExecutionCapabilities::from_known_unique(
+                self.registry
+                    .schemas()
+                    .into_iter()
+                    .map(|schema| schema.name),
+                [
+                    PermissionLevel::ReadOnly,
+                    PermissionLevel::Network,
+                    PermissionLevel::Edit,
+                    PermissionLevel::Execute,
+                ],
+            ),
+        )
     }
 
     pub async fn run(
@@ -149,17 +268,65 @@ impl Agent {
         self.run_observed(history, ctx, sink, &NoopObserver).await
     }
 
-    pub async fn run_observed(
+    pub async fn run_scoped(
         &self,
+        scope: &AgentExecutionScope,
+        history: &mut Vec<Message>,
+        ctx: &ToolContext,
+        sink: &dyn DeltaSink,
+    ) -> Result<String, ScopedAgentError> {
+        self.run_observed_scoped(scope, history, ctx, sink, &NoopObserver)
+            .await
+    }
+
+    pub async fn run_observed_scoped(
+        &self,
+        scope: &AgentExecutionScope,
         history: &mut Vec<Message>,
         ctx: &ToolContext,
         sink: &dyn DeltaSink,
         observer: &dyn AgentObserver,
-    ) -> Result<String, AgentError> {
-        let mut last_usage: Option<Usage> = None;
+    ) -> Result<String, ScopedAgentError> {
+        let pending_user_index = history
+            .len()
+            .checked_sub(1)
+            .filter(|&index| matches!(history[index], Message::User(_)));
+        let result = self
+            .run_observed_scoped_inner(scope, history, ctx, sink, observer)
+            .await;
 
-        for _ in 0..self.max_iterations {
-            observer.on_status(AgentStatus::CallingModel);
+        if matches!(
+            result,
+            Err(ScopedAgentError::Cancelled | ScopedAgentError::DeadlineExceeded)
+        ) {
+            if let Some(index) = pending_user_index {
+                let assistant_committed = history[index + 1..]
+                    .iter()
+                    .any(|message| matches!(message, Message::Assistant { .. }));
+                if !assistant_committed {
+                    history.remove(index);
+                }
+            }
+        }
+
+        result
+    }
+
+    async fn run_observed_scoped_inner(
+        &self,
+        scope: &AgentExecutionScope,
+        history: &mut Vec<Message>,
+        ctx: &ToolContext,
+        sink: &dyn DeltaSink,
+        observer: &dyn AgentObserver,
+    ) -> Result<String, ScopedAgentError> {
+        let mut last_usage: Option<Usage> = None;
+        let identity = scope.identity();
+        let max_iterations = self.max_iterations.min(scope.budget().max_iterations);
+
+        for _ in 0..max_iterations {
+            Self::scope_checkpoint(scope)?;
+            observer.on_scoped_status(&identity, AgentStatus::CallingModel);
             let depth = *self
                 .thinking_depth
                 .lock()
@@ -168,29 +335,39 @@ impl Agent {
                 .permission_mode
                 .lock()
                 .expect("permission_mode mutex poisoned");
-            let mut msgs = self.strategy.prepare(history, last_usage.as_ref()).await?;
+            let mut msgs =
+                Self::wait_scoped(scope, self.strategy.prepare(history, last_usage.as_ref()))
+                    .await?
+                    .map_err(AgentError::from)
+                    .map_err(ScopedAgentError::Agent)?;
             if mode == PermissionMode::Plan {
                 msgs.insert(0, Message::System(PLAN_MODE_INSTRUCTION.to_string()));
             }
-            let response = self
-                .provider
-                .complete(
+            let RuntimeSnapshot { provider, model } = self.runtime.snapshot();
+            let response = Self::wait_scoped(
+                scope,
+                provider.complete(
                     ModelRequest {
-                        model: self.model.clone(),
+                        model,
                         messages: msgs,
-                        tools: self.registry.schemas_for(mode),
+                        tools: self.registry.schemas_for_execution_scope(mode, scope),
                         max_tokens: None,
                         thinking: Some(ThinkingConfig { depth }),
                     },
                     sink,
-                )
-                .await?;
+                ),
+            )
+            .await?
+            .map_err(AgentError::from)
+            .map_err(ScopedAgentError::Agent)?;
+            Self::scope_checkpoint(scope)?;
+
             let text = response.text;
             let tool_calls = response.tool_calls;
             let thinking = response.thinking;
             last_usage = response.usage;
             if let Some(ref usage) = last_usage {
-                observer.on_usage(usage);
+                observer.on_scoped_usage(&identity, usage);
             }
 
             history.push(Message::Assistant {
@@ -200,94 +377,209 @@ impl Agent {
             });
 
             if tool_calls.is_empty() {
-                observer.on_status(AgentStatus::Idle);
+                if !text.is_empty() {
+                    observer.on_scoped_status(&identity, AgentStatus::Idle);
+                }
                 return Ok(text);
             }
 
-            self.dispatch_tool_calls(&tool_calls, mode, history, ctx, observer)
-                .await;
+            self.dispatch_tool_calls_scoped(&tool_calls, mode, scope, history, ctx, observer)
+                .await?;
         }
 
+        Self::scope_checkpoint(scope)?;
         let depth = *self
             .thinking_depth
             .lock()
             .expect("thinking_depth mutex poisoned");
-        let msgs = self.strategy.prepare(history, last_usage.as_ref()).await?;
-        let response = self
-            .provider
-            .complete(
+        let msgs = Self::wait_scoped(scope, self.strategy.prepare(history, last_usage.as_ref()))
+            .await?
+            .map_err(AgentError::from)
+            .map_err(ScopedAgentError::Agent)?;
+        Self::scope_checkpoint(scope)?;
+        observer.on_scoped_status(&identity, AgentStatus::CallingModel);
+        let RuntimeSnapshot { provider, model } = self.runtime.snapshot();
+        let response = Self::wait_scoped(
+            scope,
+            provider.complete(
                 ModelRequest {
-                    model: self.model.clone(),
+                    model,
                     messages: msgs,
                     tools: Vec::new(),
                     max_tokens: None,
                     thinking: Some(ThinkingConfig { depth }),
                 },
                 sink,
-            )
-            .await?;
-        let text = response.text;
-        let tool_calls = response.tool_calls;
-        let thinking = response.thinking;
+            ),
+        )
+        .await?
+        .map_err(AgentError::from)
+        .map_err(ScopedAgentError::Agent)?;
+        Self::scope_checkpoint(scope)?;
+        if let Some(ref usage) = response.usage {
+            observer.on_scoped_usage(&identity, usage);
+        }
 
+        let text = response.text;
         history.push(Message::Assistant {
             text: text.clone(),
-            tool_calls,
-            thinking,
+            tool_calls: response.tool_calls,
+            thinking: response.thinking,
         });
 
         if text.is_empty() {
-            return Err(AgentError::MaxIterations {
-                limit: self.max_iterations,
-            });
+            return Err(ScopedAgentError::Agent(AgentError::MaxIterations {
+                limit: max_iterations,
+            }));
         }
 
+        observer.on_scoped_status(&identity, AgentStatus::Idle);
         Ok(text)
     }
 
-    /// 工具存在 + ParallelSafe + ReadOnly + !plan_only 才可进入并行段（host clamp）。
-    fn is_parallel_eligible(&self, call: &ToolCall) -> bool {
+    pub async fn run_observed(
+        &self,
+        history: &mut Vec<Message>,
+        ctx: &ToolContext,
+        sink: &dyn DeltaSink,
+        observer: &dyn AgentObserver,
+    ) -> Result<String, AgentError> {
+        let scope = self.root_scope();
+        match self
+            .run_observed_scoped(&scope, history, ctx, sink, observer)
+            .await
+        {
+            Ok(text) => Ok(text),
+            Err(ScopedAgentError::Agent(error)) => Err(error),
+            Err(ScopedAgentError::Cancelled) => Err(AgentError::Context(
+                "legacy root scope was unexpectedly cancelled".to_string(),
+            )),
+            Err(ScopedAgentError::DeadlineExceeded) => Err(AgentError::Context(
+                "legacy root scope unexpectedly reached a deadline".to_string(),
+            )),
+        }
+    }
+
+    fn scope_checkpoint(scope: &AgentExecutionScope) -> Result<(), ScopedAgentError> {
+        scope
+            .termination_reason()
+            .map_or(Ok(()), |reason| Err(reason.into()))
+    }
+
+    async fn wait_scoped<T>(
+        scope: &AgentExecutionScope,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<T, ScopedAgentError> {
+        tokio::select! {
+            biased;
+            reason = scope.terminated() => Err(reason.into()),
+            value = operation => Ok(value),
+        }
+    }
+
+    /// 工具存在 + scope允许 + ParallelSafe + ReadOnly + !plan_only 才可进入并行段。
+    fn is_parallel_eligible(&self, call: &ToolCall, scope: &AgentExecutionScope) -> bool {
         let Some(tool) = self.registry.get(&call.name) else {
             return false;
         };
+        if ensure_tool_in_execution_scope(tool, scope).is_err() {
+            return false;
+        }
         tool.concurrency() == ToolConcurrency::ParallelSafe
             && tool.permission_level() == PermissionLevel::ReadOnly
             && !tool.plan_only()
     }
 
-    async fn dispatch_tool_calls(
+    async fn dispatch_tool_calls_scoped(
         &self,
         tool_calls: &[ToolCall],
         mode: PermissionMode,
+        scope: &AgentExecutionScope,
         history: &mut Vec<Message>,
         ctx: &ToolContext,
         observer: &dyn AgentObserver,
-    ) {
+    ) -> Result<(), ScopedAgentError> {
         let mut index = 0;
         while index < tool_calls.len() {
-            if self.is_parallel_eligible(&tool_calls[index]) {
+            if let Err(error) = Self::scope_checkpoint(scope) {
+                Self::append_termination_results(history, &tool_calls[index..], &error);
+                return Err(error);
+            }
+
+            if self.is_parallel_eligible(&tool_calls[index], scope) {
                 let mut end = index + 1;
-                while end < tool_calls.len() && self.is_parallel_eligible(&tool_calls[end]) {
+                while end < tool_calls.len() && self.is_parallel_eligible(&tool_calls[end], scope) {
                     end += 1;
                 }
                 let batch = &tool_calls[index..end];
                 if batch.len() == 1 {
-                    self.execute_tool_call_serial(&batch[0], mode, history, ctx, observer)
-                        .await;
+                    if let Err(error) = self
+                        .execute_tool_call_serial_scoped(
+                            &batch[0], mode, scope, history, ctx, observer,
+                        )
+                        .await
+                    {
+                        Self::append_termination_results(history, &tool_calls[index..], &error);
+                        return Err(error);
+                    }
                 } else {
-                    self.execute_parallel_safe_batch(batch, history, ctx, observer)
-                        .await;
+                    match self
+                        .execute_parallel_safe_batch_scoped(batch, scope, history, ctx, observer)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err((error, published)) => {
+                            Self::append_termination_results(
+                                history,
+                                &tool_calls[index + published..],
+                                &error,
+                            );
+                            return Err(error);
+                        }
+                    }
                 }
                 index = end;
             } else {
-                self.execute_tool_call_serial(&tool_calls[index], mode, history, ctx, observer)
-                    .await;
+                if let Err(error) = self
+                    .execute_tool_call_serial_scoped(
+                        &tool_calls[index],
+                        mode,
+                        scope,
+                        history,
+                        ctx,
+                        observer,
+                    )
+                    .await
+                {
+                    Self::append_termination_results(history, &tool_calls[index..], &error);
+                    return Err(error);
+                }
                 index += 1;
             }
         }
+
+        Ok(())
+    }
+
+    fn append_termination_results(
+        history: &mut Vec<Message>,
+        tool_calls: &[ToolCall],
+        error: &ScopedAgentError,
+    ) {
+        let content = match error {
+            ScopedAgentError::Cancelled => "tool call interrupted before completion",
+            ScopedAgentError::DeadlineExceeded => "tool call deadline exceeded before completion",
+            ScopedAgentError::Agent(_) => return,
+        };
+        history.extend(tool_calls.iter().map(|call| Message::ToolResult {
+            call_id: call.id.clone(),
+            content: content.to_string(),
+            is_error: true,
+        }));
     }
 
     fn publish_tool_outcome(
+        identity: &RunIdentity,
         history: &mut Vec<Message>,
         observer: &dyn AgentObserver,
         call_id: &str,
@@ -298,17 +590,20 @@ impl Agent {
             content: outcome.content.clone(),
             is_error: outcome.is_error,
         });
-        observer.on_tool_call_finished(call_id, &outcome);
+        observer.on_scoped_tool_call_finished(identity, call_id, &outcome);
     }
 
-    async fn execute_tool_call_serial(
+    async fn execute_tool_call_serial_scoped(
         &self,
         call: &ToolCall,
         mode: PermissionMode,
+        scope: &AgentExecutionScope,
         history: &mut Vec<Message>,
         ctx: &ToolContext,
         observer: &dyn AgentObserver,
-    ) {
+    ) -> Result<(), ScopedAgentError> {
+        Self::scope_checkpoint(scope)?;
+        let identity = scope.identity();
         let Some(tool) = self.registry.get(&call.name) else {
             let outcome = ToolOutcome {
                 content: format!("unknown tool: {}", call.name),
@@ -316,12 +611,27 @@ impl Agent {
                 truncated: false,
                 exit: None,
             };
-            Self::publish_tool_outcome(history, observer, &call.id, outcome);
-            return;
+            Self::publish_tool_outcome(&identity, history, observer, &call.id, outcome);
+            return Ok(());
         };
 
+        if let Err(violation) = ensure_tool_in_execution_scope(tool, scope) {
+            history.push(Message::ToolResult {
+                call_id: call.id.clone(),
+                content: violation.to_string(),
+                is_error: true,
+            });
+            return Ok(());
+        }
+
         let readonly = tool.permission_level() == PermissionLevel::ReadOnly;
-        observer.on_tool_call_started(&call.id, &call.name, &call.arguments, readonly);
+        observer.on_scoped_tool_call_started(
+            &identity,
+            &call.id,
+            &call.name,
+            &call.arguments,
+            readonly,
+        );
 
         if mode == PermissionMode::Plan
             && matches!(
@@ -335,8 +645,8 @@ impl Agent {
                 truncated: false,
                 exit: None,
             };
-            Self::publish_tool_outcome(history, observer, &call.id, outcome);
-            return;
+            Self::publish_tool_outcome(&identity, history, observer, &call.id, outcome);
+            return Ok(());
         }
 
         if mode != PermissionMode::Plan && tool.plan_only() {
@@ -346,15 +656,30 @@ impl Agent {
                 truncated: false,
                 exit: None,
             };
-            Self::publish_tool_outcome(history, observer, &call.id, outcome);
-            return;
+            Self::publish_tool_outcome(&identity, history, observer, &call.id, outcome);
+            return Ok(());
         }
 
         if !readonly {
-            observer.on_status(AgentStatus::WaitingForPermission);
+            observer.on_scoped_status(&identity, AgentStatus::WaitingForPermission);
         }
 
-        let gate_outcome = gate(call, tool, self.decider.as_ref()).await;
+        let gate_outcome = match Self::wait_scoped(
+            scope,
+            gate_scoped(call, tool, self.decider.as_ref(), scope.capabilities()),
+        )
+        .await?
+        {
+            Ok(outcome) => outcome,
+            Err(violation) => {
+                history.push(Message::ToolResult {
+                    call_id: call.id.clone(),
+                    content: violation.to_string(),
+                    is_error: true,
+                });
+                return Ok(());
+            }
+        };
         if let PermissionGateOutcome::Deny(denial) = gate_outcome {
             let outcome = ToolOutcome {
                 content: match denial {
@@ -365,32 +690,55 @@ impl Agent {
                 truncated: false,
                 exit: None,
             };
-            Self::publish_tool_outcome(history, observer, &call.id, outcome);
-            return;
+            Self::publish_tool_outcome(&identity, history, observer, &call.id, outcome);
+            return Ok(());
         }
 
-        observer.on_status(AgentStatus::ExecutingTool(call.name.clone()));
-        let outcome = tool.execute(call.arguments.clone(), ctx).await;
-        Self::publish_tool_outcome(history, observer, &call.id, outcome);
+        observer.on_scoped_status(&identity, AgentStatus::ExecutingTool(call.name.clone()));
+        let execution_context = ToolExecutionContext {
+            tool: ctx,
+            scope,
+            observer,
+            read_root: self.read_root.as_deref(),
+        };
+        let outcome = Self::wait_scoped(
+            scope,
+            tool.execute_scoped(call.arguments.clone(), &execution_context),
+        )
+        .await?;
+        Self::scope_checkpoint(scope)?;
+        Self::publish_tool_outcome(&identity, history, observer, &call.id, outcome);
+        Ok(())
     }
 
     /// 连续 ParallelSafe 段：先按模型顺序发全部 started + ExecutingTools(total)，
     /// 再以 indexed stream + `buffer_unordered(MAX_PARALLEL_TOOL_CALLS)` 执行；
     /// ready buffer 只发布连续 ready 前缀（模型公开 occurrence 顺序）。
-    async fn execute_parallel_safe_batch(
+    async fn execute_parallel_safe_batch_scoped(
         &self,
         batch: &[ToolCall],
+        scope: &AgentExecutionScope,
         history: &mut Vec<Message>,
         ctx: &ToolContext,
         observer: &dyn AgentObserver,
-    ) {
+    ) -> Result<(), (ScopedAgentError, usize)> {
         use futures_util::stream::{self, StreamExt as _};
 
+        if let Err(error) = Self::scope_checkpoint(scope) {
+            return Err((error, 0));
+        }
+        let identity = scope.identity();
         for call in batch {
             // eligible 保证 ReadOnly
-            observer.on_tool_call_started(&call.id, &call.name, &call.arguments, true);
+            observer.on_scoped_tool_call_started(
+                &identity,
+                &call.id,
+                &call.name,
+                &call.arguments,
+                true,
+            );
         }
-        observer.on_status(AgentStatus::ExecutingTools(batch.len()));
+        observer.on_scoped_status(&identity, AgentStatus::ExecutingTools(batch.len()));
 
         // ReadOnly gate 恒 Allow；启动前串行过 gate 保持契约，不并发授权。
         for call in batch {
@@ -398,7 +746,23 @@ impl Agent {
                 .registry
                 .get(&call.name)
                 .expect("parallel eligible implies tool exists");
-            let _ = gate(call, tool, self.decider.as_ref()).await;
+            let gate_result = match Self::wait_scoped(
+                scope,
+                gate_scoped(call, tool, self.decider.as_ref(), scope.capabilities()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => return Err((error, 0)),
+            };
+            if let Err(violation) = gate_result {
+                history.extend(batch.iter().map(|remaining| Message::ToolResult {
+                    call_id: remaining.id.clone(),
+                    content: violation.to_string(),
+                    is_error: true,
+                }));
+                return Ok(());
+            }
         }
 
         let call_ids: Vec<String> = batch.iter().map(|c| c.id.clone()).collect();
@@ -414,16 +778,36 @@ impl Agent {
                 .get(&call.name)
                 .expect("parallel eligible implies tool exists");
             let args = call.arguments.clone();
-            async move { (idx, tool.execute(args, ctx).await) }
+            async move {
+                let execution_context = ToolExecutionContext {
+                    tool: ctx,
+                    scope,
+                    observer,
+                    read_root: self.read_root.as_deref(),
+                };
+                (idx, tool.execute_scoped(args, &execution_context).await)
+            }
         });
 
         let mut completed = stream::iter(execs).buffer_unordered(MAX_PARALLEL_TOOL_CALLS);
-        while let Some((idx, outcome)) = completed.next().await {
+        loop {
+            let completed_item = tokio::select! {
+                biased;
+                reason = scope.terminated() => return Err((reason.into(), next_publish)),
+                item = completed.next() => item,
+            };
+            let Some((idx, outcome)) = completed_item else {
+                break;
+            };
             ready[idx] = Some(outcome);
             while next_publish < n {
                 match ready[next_publish].take() {
                     Some(outcome) => {
+                        if let Err(error) = Self::scope_checkpoint(scope) {
+                            return Err((error, next_publish));
+                        }
                         Self::publish_tool_outcome(
+                            &identity,
                             history,
                             observer,
                             &call_ids[next_publish],
@@ -440,6 +824,7 @@ impl Agent {
             next_publish, n,
             "buffer_unordered drain must publish every occurrence"
         );
+        Ok(())
     }
 }
 
@@ -452,8 +837,8 @@ impl From<ContextError> for AgentError {
 #[cfg(test)]
 mod tests {
     use super::{
-        run_single_turn, Agent, AgentObserver, AgentStatus, ContextStrategy, DEFAULT_SYSTEM_PROMPT,
-        PLAN_MODE_INSTRUCTION,
+        run_single_turn, Agent, AgentExecutionScope, AgentObserver, AgentStatus, ContextStrategy,
+        ExecutionBudget, ExecutionCapabilities, DEFAULT_SYSTEM_PROMPT, PLAN_MODE_INSTRUCTION,
     };
     use crate::agent::message::Message;
     use crate::error::{AgentError, ProviderError};
@@ -785,6 +1170,36 @@ mod tests {
         }
     }
 
+    struct CountingAllow {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PermissionDecider for CountingAllow {
+        async fn decide(&self, _check: PermissionCheck<'_>) -> PermissionDecision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            PermissionDecision::Allow
+        }
+    }
+
+    #[test]
+    fn root_scope_factory_creates_distinct_root_identities() {
+        let provider = Arc::new(MockProvider::new(Vec::new()));
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            Box::new(DenyAll),
+            "model".to_string(),
+            2,
+        );
+        let first = agent.root_scope();
+        let second = agent.root_scope();
+
+        assert_ne!(first.identity().run_id(), second.identity().run_id());
+        assert_eq!(first.identity().parent_run_id(), None);
+        assert_eq!(second.identity().parent_run_id(), None);
+    }
+
     struct EchoTool;
 
     #[async_trait]
@@ -1000,6 +1415,60 @@ mod tests {
             .register(Box::new(ConfirmTool { executions }))
             .unwrap();
         registry
+    }
+
+    #[tokio::test]
+    async fn scoped_dispatch_rejects_hidden_registered_tool_before_decider_and_execute() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let decisions = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "hidden-1".to_string(),
+                name: "confirm".to_string(),
+                arguments: json!({}),
+            }]),
+            response("done"),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry_with_confirm_tool(executions.clone()),
+            Box::new(CountingAllow {
+                calls: decisions.clone(),
+            }),
+            "model".to_string(),
+            4,
+        );
+        let scope = AgentExecutionScope::root(
+            ExecutionBudget::new(4, None, 0),
+            ExecutionCapabilities::try_new(
+                Vec::<String>::new(),
+                [
+                    PermissionLevel::ReadOnly,
+                    PermissionLevel::Network,
+                    PermissionLevel::Edit,
+                    PermissionLevel::Execute,
+                ],
+            )
+            .unwrap(),
+        );
+        let mut history = vec![Message::User("use hidden tool".to_string())];
+
+        let result = agent
+            .run_scoped(&scope, &mut history, &ctx(), &NoopSink)
+            .await
+            .unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(decisions.load(Ordering::SeqCst), 0);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(history.iter().any(|message| matches!(
+            message,
+            Message::ToolResult {
+                call_id,
+                content,
+                is_error: true,
+            } if call_id == "hidden-1" && content.contains("execution scope")
+        )));
     }
 
     fn registry_with_network_tool(tool: NetworkTool) -> ToolRegistry {
@@ -1871,6 +2340,7 @@ mod tests {
             err,
             AgentError::Provider(ProviderError::Transport(_))
         ));
+        assert_eq!(history, vec![Message::User("hello".to_string())]);
     }
 
     struct FlippingPlanApprover {

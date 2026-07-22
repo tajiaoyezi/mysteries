@@ -4560,6 +4560,146 @@ mod tests {
         assert_eq!(ask_preview, ask_no_question.to_string());
     }
 
+    const DELEGATE_SNAPSHOT_WIDTH: u16 = 96;
+    const DELEGATE_SNAPSHOT_HEIGHT: u16 = 28;
+    const DELEGATE_SNAPSHOT_TASK: &str = "只读审查 src/agent 模块";
+
+    fn delegate_card_state(
+        status: ToolCardStatus,
+        output: Option<&str>,
+        truncated: bool,
+    ) -> AppState {
+        let mut state = AppState::new();
+        let is_running = matches!(status, ToolCardStatus::Running);
+        state.spinner_frame = 3;
+        state.tools_expanded = true;
+        state.transcript.push(TranscriptBlock::Tool(ToolCard {
+            id: "delegate-task-snapshot".to_string(),
+            name: "delegate_task".to_string(),
+            args: json!({ "task": DELEGATE_SNAPSHOT_TASK }),
+            readonly: true,
+            status,
+            output: output.map(str::to_string),
+            truncated,
+            exit: None,
+        }));
+        if is_running {
+            state.phase = Phase::ExecutingTool("delegate_task".to_string());
+        }
+        state
+    }
+
+    fn render_delegate_card(state: &AppState, theme: &Theme) -> String {
+        render_to_styled_with_size(
+            state,
+            theme,
+            DELEGATE_SNAPSHOT_WIDTH,
+            DELEGATE_SNAPSHOT_HEIGHT,
+        )
+    }
+
+    #[test]
+    fn delegate_task_running_midnight_snapshot() {
+        let state = delegate_card_state(ToolCardStatus::Running, None, false);
+        let text = render_delegate_card(&state, &Theme::midnight());
+
+        assert!(text.contains("delegate_task"));
+        assert!(text.contains("运行中…"));
+        insta::assert_snapshot!("tui_delegate_task_running_midnight", text);
+    }
+
+    #[test]
+    fn delegate_task_running_daylight_snapshot() {
+        let state = delegate_card_state(ToolCardStatus::Running, None, false);
+        let text = render_delegate_card(&state, &Theme::daylight());
+
+        assert!(text.contains("delegate_task"));
+        assert!(text.contains("运行中…"));
+        insta::assert_snapshot!("tui_delegate_task_running_daylight", text);
+    }
+
+    #[test]
+    fn delegate_task_success_midnight_snapshot() {
+        let state = delegate_card_state(
+            ToolCardStatus::Done,
+            Some(
+                "subagent report (untrusted):\n已审查 src/agent/mod.rs:391，forced-final 路径符合约束。",
+            ),
+            false,
+        );
+        let text = render_delegate_card(&state, &Theme::midnight());
+
+        assert!(text.contains("subagent report (untrusted):"));
+        insta::assert_snapshot!("tui_delegate_task_success_midnight", text);
+    }
+
+    #[test]
+    fn delegate_task_success_daylight_snapshot() {
+        let state = delegate_card_state(
+            ToolCardStatus::Done,
+            Some(
+                "subagent report (untrusted):\n已审查 src/agent/mod.rs:391，forced-final 路径符合约束。",
+            ),
+            false,
+        );
+        let text = render_delegate_card(&state, &Theme::daylight());
+
+        assert!(text.contains("subagent report (untrusted):"));
+        insta::assert_snapshot!("tui_delegate_task_success_daylight", text);
+    }
+
+    #[test]
+    fn delegate_task_error_midnight_snapshot() {
+        let state = delegate_card_state(
+            ToolCardStatus::Error,
+            Some("delegate_task failed: child deadline exceeded"),
+            false,
+        );
+        let text = render_delegate_card(&state, &Theme::midnight());
+
+        assert!(text.contains("delegate_task failed: child deadline exceeded"));
+        insta::assert_snapshot!("tui_delegate_task_error_midnight", text);
+    }
+
+    #[test]
+    fn delegate_task_error_daylight_snapshot() {
+        let state = delegate_card_state(
+            ToolCardStatus::Error,
+            Some("delegate_task failed: child deadline exceeded"),
+            false,
+        );
+        let text = render_delegate_card(&state, &Theme::daylight());
+
+        assert!(text.contains("delegate_task failed: child deadline exceeded"));
+        insta::assert_snapshot!("tui_delegate_task_error_daylight", text);
+    }
+
+    #[test]
+    fn delegate_task_truncated_midnight_snapshot() {
+        let state = delegate_card_state(
+            ToolCardStatus::Done,
+            Some("subagent report (untrusted):\n已审查 src/agent/mod.rs:391，后续内容"),
+            true,
+        );
+        let text = render_delegate_card(&state, &Theme::midnight());
+
+        assert!(text.contains("⋯ 输出已截断(超出 max_output_bytes)"));
+        insta::assert_snapshot!("tui_delegate_task_truncated_midnight", text);
+    }
+
+    #[test]
+    fn delegate_task_truncated_daylight_snapshot() {
+        let state = delegate_card_state(
+            ToolCardStatus::Done,
+            Some("subagent report (untrusted):\n已审查 src/agent/mod.rs:391，后续内容"),
+            true,
+        );
+        let text = render_delegate_card(&state, &Theme::daylight());
+
+        assert!(text.contains("⋯ 输出已截断(超出 max_output_bytes)"));
+        insta::assert_snapshot!("tui_delegate_task_truncated_daylight", text);
+    }
+
     #[test]
     fn tool_card_running_snapshot() {
         let mut state = AppState::new();
