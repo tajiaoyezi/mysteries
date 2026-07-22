@@ -1758,7 +1758,7 @@ mod tests {
             let tool_context = ctx(&workspace, 4096);
 
             for tool in tools {
-                let args = directory_args(tool, path_arg(&workspace));
+                let args = directory_args(tool, path_arg(&canonical_workspace));
                 let root_none =
                     assert_root_none_matches_direct(tool, args.clone(), &tool_context).await;
                 assert!(
@@ -1853,6 +1853,7 @@ mod tests {
         fs::write(target.join(".dot-hidden.txt"), "SCOPED_NEEDLE dot hidden\n").unwrap();
         fs::write(target.join("visible.txt"), "SCOPED_NEEDLE visible\n").unwrap();
         let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+        let canonical_target = fs::canonicalize(&target).unwrap();
         let tool_context = ctx(&workspace, 4096);
         let list_dir = ListDirTool;
         let glob = GlobTool;
@@ -1862,7 +1863,7 @@ mod tests {
         for tool in tools {
             let outcome = execute_scoped(
                 tool,
-                directory_args(tool, path_arg(&target)),
+                directory_args(tool, path_arg(&canonical_target)),
                 &tool_context,
                 Some(&canonical_workspace),
             )
@@ -1907,10 +1908,11 @@ mod tests {
             .unwrap();
             fs::write(target.join("visible.txt"), "SCOPED_NEEDLE visible\n").unwrap();
             let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+            let canonical_target = fs::canonicalize(&target).unwrap();
             let tool_context = ctx(&workspace, 4096);
 
             for tool in tools {
-                let args = directory_args(tool, path_arg(&target));
+                let args = directory_args(tool, path_arg(&canonical_target));
                 let baseline =
                     assert_root_none_matches_direct(tool, args.clone(), &tool_context).await;
                 assert!(
@@ -1964,6 +1966,7 @@ mod tests {
             fs::write(target.join(name), content).unwrap();
         }
         let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+        let canonical_target = fs::canonicalize(&target).unwrap();
         let tool_context = ctx(&workspace, 4096);
         let list_dir = ListDirTool;
         let glob = GlobTool;
@@ -1971,7 +1974,7 @@ mod tests {
         let tools: [&dyn Tool; 3] = [&list_dir, &glob, &grep];
 
         for tool in tools {
-            let args = directory_args(tool, path_arg(&target));
+            let args = directory_args(tool, path_arg(&canonical_target));
             let baseline = assert_root_none_matches_direct(tool, args.clone(), &tool_context).await;
             let scoped =
                 execute_scoped(tool, args, &tool_context, Some(&canonical_workspace)).await;
