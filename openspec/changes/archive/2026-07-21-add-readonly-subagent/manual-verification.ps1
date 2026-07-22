@@ -537,9 +537,21 @@ function Test-OwnerProcessIsCurrent {
     return $ActualTicks -eq [long]$State.owner_start_utc_ticks
 }
 
-$RepoRoot = [System.IO.Path]::GetFullPath(
-    (Join-Path $PSScriptRoot '..\..\..')
-)
+function Find-RepoRoot {
+    param([Parameter(Mandatory)][string]$StartPath)
+
+    $Current = Get-Item -Force -LiteralPath $StartPath
+    while ($null -ne $Current) {
+        if ((Test-Path -LiteralPath (Join-Path $Current.FullName 'Cargo.toml') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $Current.FullName 'openspec') -PathType Container)) {
+            return $Current.FullName
+        }
+        $Current = $Current.Parent
+    }
+    throw "无法从脚本位置定位repo root: $StartPath"
+}
+
+$RepoRoot = Find-RepoRoot -StartPath $PSScriptRoot
 $Exe = Join-Path $RepoRoot 'target\codex-readonly-subagent\release\mysteries.exe'
 $ServerScript = Join-Path $PSScriptRoot 'manual-fixture-server.ps1'
 $FixturePointer = Join-Path $env:TEMP $PointerName

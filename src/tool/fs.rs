@@ -61,7 +61,7 @@ impl Tool for GrepTool {
             return error_outcome("missing or invalid pattern");
         }
         let path = string_arg(&args, "path").unwrap_or(".");
-        let unresolved_target = resolve_path(&ctx.tool.cwd, path);
+        let unresolved_target = resolve_scoped_path(read_root, path);
         let read_root = read_root.to_path_buf();
         let tool_context = ctx.tool.clone();
         run_contained_fs(
@@ -186,7 +186,7 @@ impl Tool for GlobTool {
             return error_outcome("missing or invalid pattern");
         }
         let path = string_arg(&args, "path").unwrap_or(".");
-        let unresolved_target = resolve_path(&ctx.tool.cwd, path);
+        let unresolved_target = resolve_scoped_path(read_root, path);
         let read_root = read_root.to_path_buf();
         run_contained_fs(
             read_root,
@@ -301,7 +301,7 @@ impl Tool for ListDirTool {
             return self.execute(args, ctx.tool).await;
         };
         let path = string_arg(&args, "path").unwrap_or(".");
-        let unresolved_target = resolve_path(&ctx.tool.cwd, path);
+        let unresolved_target = resolve_scoped_path(read_root, path);
         let read_root = read_root.to_path_buf();
         run_contained_fs(
             read_root,
@@ -401,7 +401,7 @@ impl Tool for ReadFileTool {
         let Some(path) = string_arg(&args, "path") else {
             return error_outcome("missing or invalid path");
         };
-        let unresolved_target = resolve_path(&ctx.tool.cwd, path);
+        let unresolved_target = resolve_scoped_path(read_root, path);
         let read_root = read_root.to_path_buf();
         let tool_context = ctx.tool.clone();
         run_contained_fs(
@@ -456,6 +456,18 @@ fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     }
 }
 
+fn resolve_scoped_path(read_root: &Path, path: &str) -> PathBuf {
+    use std::path::Component;
+
+    let path = Path::new(path);
+    match path.components().next() {
+        None | Some(Component::CurDir | Component::ParentDir | Component::Normal(_)) => {
+            read_root.join(path)
+        }
+        Some(Component::Prefix(_) | Component::RootDir) => path.to_path_buf(),
+    }
+}
+
 async fn run_contained_fs<F>(read_root: PathBuf, unresolved_target: PathBuf, work: F) -> ToolOutcome
 where
     F: FnOnce(PathBuf, PathBuf) -> ToolOutcome + Send + 'static,
@@ -463,6 +475,9 @@ where
     #[cfg(test)]
     let invocation_id = test_probe::next_invocation_id();
     run_blocking_tool(&process_blocking_limiter(), move || {
+        let Some(relative_target) = lexical_relative_target(&read_root, &unresolved_target) else {
+            return error_outcome("path escapes read root");
+        };
         let canonical_root = match fs::canonicalize(&read_root) {
             Ok(path) => path,
             Err(err) => {
@@ -472,10 +487,14 @@ where
         if !canonical_root.is_dir() {
             return error_outcome("read root is not a directory");
         }
+        if let Err(outcome) = reject_linked_components(&canonical_root, &relative_target) {
+            return outcome;
+        }
+        let target = canonical_root.join(&relative_target);
 
         #[cfg(test)]
-        test_probe::record_canonicalize(&unresolved_target, invocation_id);
-        let canonical_target = match fs::canonicalize(&unresolved_target) {
+        test_probe::record_canonicalize(&target, invocation_id);
+        let canonical_target = match fs::canonicalize(&target) {
             Ok(path) => path,
             Err(err) => return error_outcome(format!("failed to canonicalize path: {err}")),
         };
@@ -488,6 +507,138 @@ where
         work(canonical_root, canonical_target)
     })
     .await
+}
+
+#[cfg(windows)]
+fn lexical_relative_target(read_root: &Path, target: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+
+    fn component_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+        left.as_encoded_bytes()
+            .eq_ignore_ascii_case(right.as_encoded_bytes())
+    }
+
+    fn local_absolute_parts(path: &Path) -> Option<(u8, Vec<std::ffi::OsString>)> {
+        let mut components = path.components();
+        let drive = match components.next()? {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive.to_ascii_uppercase(),
+                Prefix::Verbatim(_)
+                | Prefix::VerbatimUNC(_, _)
+                | Prefix::UNC(_, _)
+                | Prefix::DeviceNS(_) => return None,
+            },
+            _ => return None,
+        };
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            return None;
+        }
+
+        let mut parts = Vec::new();
+        for component in components {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    parts.pop()?;
+                }
+                Component::Normal(part) if part == std::ffi::OsStr::new(".") => {}
+                Component::Normal(part) if part == std::ffi::OsStr::new("..") => {
+                    parts.pop()?;
+                }
+                Component::Normal(part) => parts.push(part.to_os_string()),
+                Component::Prefix(_) | Component::RootDir => return None,
+            }
+        }
+        Some((drive, parts))
+    }
+
+    let (root_drive, root_parts) = local_absolute_parts(read_root)?;
+    let (target_drive, target_parts) = local_absolute_parts(target)?;
+    if root_drive != target_drive
+        || target_parts.len() < root_parts.len()
+        || !target_parts
+            .iter()
+            .zip(&root_parts)
+            .all(|(target, root)| component_eq(target, root))
+    {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for part in &target_parts[root_parts.len()..] {
+        relative.push(part);
+    }
+    Some(relative)
+}
+
+#[cfg(not(windows))]
+fn lexical_relative_target(read_root: &Path, target: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    fn absolute_parts(path: &Path) -> Option<Vec<std::ffi::OsString>> {
+        let mut components = path.components();
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            return None;
+        }
+
+        let mut parts = Vec::new();
+        for component in components {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    parts.pop()?;
+                }
+                Component::Normal(part) => parts.push(part.to_os_string()),
+                Component::Prefix(_) | Component::RootDir => return None,
+            }
+        }
+        Some(parts)
+    }
+
+    let root_parts = absolute_parts(read_root)?;
+    let target_parts = absolute_parts(target)?;
+    if target_parts.len() < root_parts.len() || target_parts[..root_parts.len()] != root_parts {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for part in &target_parts[root_parts.len()..] {
+        relative.push(part);
+    }
+    Some(relative)
+}
+
+fn reject_linked_components(read_root: &Path, relative_target: &Path) -> Result<(), ToolOutcome> {
+    let mut current = read_root.to_path_buf();
+    for component in relative_target.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(error_outcome("path escapes read root"));
+        };
+        current.push(part);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return Err(error_outcome("failed to validate path")),
+        };
+        if is_link_or_reparse(&metadata) {
+            return Err(error_outcome("path escapes read root"));
+        }
+    }
+    Ok(())
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 fn normalize_relative_path(path: &Path) -> String {
@@ -559,10 +710,15 @@ impl ScopedIgnoreRules {
             #[cfg(test)]
             test_probe::record_ignore_control(&candidate);
             match fs::symlink_metadata(&candidate) {
+                Ok(metadata) if is_link_or_reparse(&metadata) => {
+                    return Err(error_outcome("path escapes read root"));
+                }
                 Ok(_) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => return Err(error_outcome("failed to validate ignore file")),
             }
+            #[cfg(test)]
+            test_probe::record_control_canonicalize(&candidate);
             let canonical = fs::canonicalize(&candidate)
                 .map_err(|_| error_outcome("failed to validate ignore file"))?;
             if canonical != read_root && !canonical.starts_with(read_root) {
@@ -571,7 +727,7 @@ impl ScopedIgnoreRules {
 
             // Gitignore::new preserves valid rules when a file is only
             // partially parseable, matching the walker's existing behavior.
-            let (matcher, _) = Gitignore::new(&candidate);
+            let (matcher, _) = Gitignore::new(&canonical);
             rules.push(matcher);
         }
         Ok(())
@@ -734,6 +890,7 @@ mod test_probe {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum FsProbeStage {
         Canonicalize,
+        ControlCanonicalize,
         IgnoreControl,
         TargetIo,
     }
@@ -794,6 +951,20 @@ mod test_probe {
                 .count()
         }
 
+        pub(super) fn canonicalize_count(&self) -> usize {
+            self.events()
+                .iter()
+                .filter(|event| event.stage == FsProbeStage::Canonicalize)
+                .count()
+        }
+
+        pub(super) fn control_canonicalize_count(&self) -> usize {
+            self.events()
+                .iter()
+                .filter(|event| event.stage == FsProbeStage::ControlCanonicalize)
+                .count()
+        }
+
         pub(super) fn ignore_control_count(&self) -> usize {
             self.events()
                 .iter()
@@ -842,6 +1013,11 @@ mod test_probe {
     pub(super) fn record_ignore_control(path: &Path) {
         let invocation_id = ACTIVE_INVOCATION_ID.with(Cell::get);
         record(path, FsProbeStage::IgnoreControl, invocation_id);
+    }
+
+    pub(super) fn record_control_canonicalize(path: &Path) {
+        let invocation_id = ACTIVE_INVOCATION_ID.with(Cell::get);
+        record(path, FsProbeStage::ControlCanonicalize, invocation_id);
     }
 
     fn record(path: &Path, stage: FsProbeStage, invocation_id: Option<u64>) {
@@ -990,6 +1166,52 @@ mod tests {
             "SKIP {kind}: OS does not permit creating the required link; raw_os_error={:?}; error={err}",
             err.raw_os_error()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_windows_paths_reject_network_device_and_ambiguous_forms_lexically() {
+        let root = Path::new(r"\\?\C:\workspace");
+
+        for path in [
+            r"\\server\share\file.txt",
+            r"\\?\UNC\server\share\file.txt",
+            r"\\.\C:\workspace\file.txt",
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\file.txt",
+            r"\Windows\system.ini",
+            r"C:drive-relative.txt",
+            r"D:\workspace\file.txt",
+            r"C:\workspace-escape\file.txt",
+        ] {
+            let candidate = super::resolve_scoped_path(root, path);
+            assert!(
+                super::lexical_relative_target(root, &candidate).is_none(),
+                "unsafe Windows path passed lexical containment: {path}"
+            );
+        }
+
+        for (path, expected) in [
+            (r"inside\..\visible.txt", PathBuf::from("visible.txt")),
+            (
+                r"C:\workspace\inside\visible.txt",
+                PathBuf::from(r"inside\visible.txt"),
+            ),
+            (
+                r"c:\WORKSPACE\inside\visible.txt",
+                PathBuf::from(r"inside\visible.txt"),
+            ),
+            (
+                r"\\?\C:\workspace\inside\visible.txt",
+                PathBuf::from(r"inside\visible.txt"),
+            ),
+        ] {
+            let candidate = super::resolve_scoped_path(root, path);
+            assert_eq!(
+                super::lexical_relative_target(root, &candidate),
+                Some(expected),
+                "safe Windows path failed lexical containment: {path}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1195,13 +1417,15 @@ mod tests {
                     )
                 });
                 let target_io_count = probe.target_io_count();
+                let canonicalize_count = probe.canonicalize_count();
 
                 if !outcome.is_error
+                    || canonicalize_count != 0
                     || target_io_count != 0
                     || outcome.content.contains(EXTERNAL_SECRET_MARKER)
                 {
                     failures.push(format!(
-                        "{} {kind}: is_error={}, target_io_count={target_io_count}, content={:?}",
+                        "{} {kind}: is_error={}, canonicalize_count={canonicalize_count}, target_io_count={target_io_count}, content={:?}",
                         tool.name(),
                         outcome.is_error,
                         outcome.content
@@ -1319,9 +1543,11 @@ mod tests {
 
         assert!(
             outcome.is_error
+                && probe.canonicalize_count() == 0
                 && probe.target_io_count() == 0
                 && !outcome.content.contains(EXTERNAL_SECRET_MARKER),
-            "external file symlink reached content I/O: count={}, outcome={outcome:?}",
+            "external file symlink reached canonicalize/content I/O: canonicalize_count={}, target_io_count={}, outcome={outcome:?}",
+            probe.canonicalize_count(),
             probe.target_io_count()
         );
     }
@@ -1350,13 +1576,15 @@ mod tests {
                 Some(&fixture.canonical_workspace),
             )
             .await;
+            let canonicalize_count = probe.canonicalize_count();
             let target_io_count = probe.target_io_count();
             if !outcome.is_error
+                || canonicalize_count != 0
                 || target_io_count != 0
                 || outcome.content.contains(EXTERNAL_SECRET_MARKER)
             {
                 failures.push(format!(
-                    "{}: is_error={}, target_io_count={target_io_count}, content={:?}",
+                    "{}: is_error={}, canonicalize_count={canonicalize_count}, target_io_count={target_io_count}, content={:?}",
                     tool.name(),
                     outcome.is_error,
                     outcome.content
@@ -1418,12 +1646,14 @@ mod tests {
         )
         .await;
         if !file_outcome.is_error
+            || file_probe.canonicalize_count() != 0
             || file_probe.target_io_count() != 0
             || file_outcome.content.contains(EXTERNAL_SECRET_MARKER)
         {
             failures.push(format!(
-                "read_file: is_error={}, target_io_count={}, content={:?}",
+                "read_file: is_error={}, canonicalize_count={}, target_io_count={}, content={:?}",
                 file_outcome.is_error,
+                file_probe.canonicalize_count(),
                 file_probe.target_io_count(),
                 file_outcome.content
             ));
@@ -1439,13 +1669,15 @@ mod tests {
                 Some(&fixture.canonical_workspace),
             )
             .await;
+            let canonicalize_count = probe.canonicalize_count();
             let target_io_count = probe.target_io_count();
             if !outcome.is_error
+                || canonicalize_count != 0
                 || target_io_count != 0
                 || outcome.content.contains(EXTERNAL_SECRET_MARKER)
             {
                 failures.push(format!(
-                    "{}: is_error={}, target_io_count={target_io_count}, content={:?}",
+                    "{}: is_error={}, canonicalize_count={canonicalize_count}, target_io_count={target_io_count}, content={:?}",
                     tool.name(),
                     outcome.is_error,
                     outcome.content
@@ -1581,7 +1813,7 @@ mod tests {
             let tool_context = fixture.tool_context(4096);
 
             for tool in tools {
-                let probe = FsProbe::install(fixture.canonical_workspace.clone());
+                let probe = FsProbe::install(link.clone());
                 let outcome = execute_scoped(
                     tool,
                     directory_args(tool, "."),
@@ -1593,10 +1825,12 @@ mod tests {
                 assert!(
                     outcome.is_error
                         && outcome.content == "path escapes read root"
+                        && probe.control_canonicalize_count() == 0
                         && probe.target_io_count() == 0
                         && !outcome.content.contains(EXTERNAL_SECRET_MARKER),
-                    "{} followed external {ignore_name} before containment: count={}, outcome={outcome:?}",
+                    "{} followed external {ignore_name} before containment: control_canonicalize_count={}, target_io_count={}, outcome={outcome:?}",
                     tool.name(),
+                    probe.control_canonicalize_count(),
                     probe.target_io_count()
                 );
                 drop(probe);

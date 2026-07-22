@@ -9,7 +9,7 @@
 - [ ] **9.3** 在项目根目录复制下面一条命令，之后只照屏幕提示操作：
 
   ```powershell
-  pwsh -NoProfile -File .\openspec\changes\add-readonly-subagent\manual-verification.ps1 -Section 9.3
+  pwsh -NoProfile -File .\openspec\changes\archive\2026-07-21-add-readonly-subagent\manual-verification.ps1 -Section 9.3
   ```
 
   弹出`§9.3 stall ready`后，关闭弹窗、回到TUI，只按一次`Esc`。
@@ -17,7 +17,7 @@
 - [ ] **9.4** 9.3完成后复制下面一条命令：
 
   ```powershell
-  pwsh -NoProfile -File .\openspec\changes\add-readonly-subagent\manual-verification.ps1 -Section 9.4
+  pwsh -NoProfile -File .\openspec\changes\archive\2026-07-21-add-readonly-subagent\manual-verification.ps1 -Section 9.4
   ```
 
   这一项全自动，不需要操作TUI。出现`SKIP`时保留脚本给出的原始OS原因即可。
@@ -25,7 +25,7 @@
 - [ ] **9.5** 9.4完成后复制下面一条命令，之后只照屏幕提示操作：
 
   ```powershell
-  pwsh -NoProfile -File .\openspec\changes\add-readonly-subagent\manual-verification.ps1 -Section 9.5
+  pwsh -NoProfile -File .\openspec\changes\archive\2026-07-21-add-readonly-subagent\manual-verification.ps1 -Section 9.5
   ```
 
 ## 怎么算完成
@@ -35,7 +35,7 @@
 ## 仅在异常退出时使用
 
 ```powershell
-pwsh -NoProfile -File .\openspec\changes\add-readonly-subagent\manual-verification.ps1 -Action CleanupStale
+pwsh -NoProfile -File .\openspec\changes\archive\2026-07-21-add-readonly-subagent\manual-verification.ps1 -Action CleanupStale
 ```
 
 脚本不会kill进程或修改`tasks.md`。
