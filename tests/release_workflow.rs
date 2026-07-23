@@ -1256,24 +1256,31 @@ fn find_bash() -> Option<PathBuf> {
         }
     }
     #[cfg(not(windows))]
-    candidates.push(PathBuf::from("bash"));
+    {
+        candidates.extend([PathBuf::from("/usr/bin/bash"), PathBuf::from("/bin/bash")]);
+        if let Some(path) = env::var_os("PATH") {
+            candidates.extend(env::split_paths(&path).map(|entry| entry.join("bash")));
+        }
+    }
 
     let query = format!(
         "for tool in {}; do command -v \"$tool\" >/dev/null || exit 1; done",
         REQUIRED_TOOLS.join(" ")
     );
-    candidates.into_iter().find(|candidate| {
-        let version_ok = Command::new(candidate)
+    candidates.into_iter().find_map(|candidate| {
+        let candidate = fs::canonicalize(candidate).ok()?;
+        let version_ok = Command::new(&candidate)
             .arg("--version")
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false);
-        version_ok
-            && Command::new(candidate)
+        (version_ok
+            && Command::new(&candidate)
                 .args(["-lc", &query])
                 .output()
                 .map(|output| output.status.success())
-                .unwrap_or(false)
+                .unwrap_or(false))
+        .then_some(candidate)
     })
 }
 
