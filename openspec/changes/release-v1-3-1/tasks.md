@@ -31,10 +31,10 @@
 
 ## 5. Implementation PR 与远端设置
 
-- [ ] 5.1 创建implementation branch/commit/PR；确认release-sensitive PR触发CI、Security与Release validation，且不创建tag、Release、asset或environment deployment。
-- [ ] 5.2 验证PR Windows/Ubuntu CI、RustSec、metadata、双平台package与aggregate全部success，publish/public verify skipped；revision markers、run `head_sha`与PR endpoint `.head.sha`精确一致。
-- [ ] 5.3 下载PR `release-bundle-1.3.1`，离线验证四文件sealed bundle、checksums、archive根文件集、binary version/help与release notes identity。
-- [ ] 5.4 展示当前environment/settings精确diff，在本轮用户明确授予的自主授权范围内独立记录admin mutation批准后，把`release` environment唯一custom tag policy从`v1.3.0`切换为`name=v1.3.1,type=tag`；重读证明reviewer/self-review/admin-bypass/custom-policy、immutable releases及两个repository rulesets contract均保持批准状态。
+- [x] 5.1 创建implementation branch/commit/PR；确认release-sensitive PR触发CI、Security与Release validation，且不创建tag、Release、asset或environment deployment。
+- [x] 5.2 验证PR Windows/Ubuntu CI、RustSec、metadata、双平台package与aggregate全部success，publish/public verify skipped；revision markers、run `head_sha`与PR endpoint `.head.sha`精确一致。
+- [x] 5.3 下载PR `release-bundle-1.3.1`，离线验证四文件sealed bundle、checksums、archive根文件集、binary version/help与release notes identity。
+- [x] 5.4 展示当前environment/settings精确diff，在本轮用户明确授予的自主授权范围内独立记录admin mutation批准后，把`release` environment唯一custom tag policy从`v1.3.0`切换为`name=v1.3.1,type=tag`；重读证明reviewer/self-review/admin-bypass/custom-policy、immutable releases及两个repository rulesets contract均保持批准状态。
 - [ ] 5.5 展示implementation PR head、checks、review与merge+dispatch精确对象，在本轮用户明确授予的自主授权范围内独立记录批准后合入PR，冻结唯一merge SHA为candidate，并立即以`ref=master`dispatch release dry-run、锁定其run ID/head SHA；期间不得让未审查commit替换candidate事实。
 
 ## 6. Master 门禁与 v1.3.1 tag
