@@ -2,7 +2,7 @@
 source: src/tui/render.rs
 expression: text
 ---
-‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.3.0‹/›
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.3.1‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────────────────────‹/›
 ‹border.subtle›┌─ ‹/›‹accent.primary›⠸‹/›‹text.muted› ‹/›‹accent.primary +bold›delegate_task‹/›‹text.muted› {"task":"只读审查 src/agent 模块"}‹/›‹text.secondary›  只读 · 自动运行‹/›

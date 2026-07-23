@@ -912,39 +912,169 @@ jobs:
           test -z "$matches"
 
       - name: Create draft Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
-            --title "mysteries $TAG" --notes-file bundle/release-notes.md
-
-      - name: Upload draft assets
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
-            "bundle/$WINDOWS_ASSET" "bundle/$LINUX_ASSET" bundle/SHA256SUMS
-
-      - name: Fetch draft Release metadata through API
         id: draft_release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mapfile -t release_ids < <(
-            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              --jq ".[] | select(.tag_name == \"$TAG\") | .id"
-          )
-          test "${#release_ids[@]}" -eq 1
-          release_id="${release_ids[0]}"
-          [[ "$release_id" =~ ^[0-9]+$ ]]
-          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > draft.json
+          request="$RUNNER_TEMP/create-release-request.json"
+          response="$RUNNER_TEMP/create-release.json"
+          jq -n \
+            --arg tag "$TAG" \
+            --arg name "mysteries $TAG" \
+            --rawfile body bundle/release-notes.md '
+              {
+                tag_name: $tag,
+                name: $name,
+                body: $body,
+                draft: true,
+                prerelease: false,
+                generate_release_notes: false
+              }
+            ' > "$request"
+          status="$(
+            curl --silent --show-error \
+              --output "$response" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "User-Agent: mysteries-release-workflow" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --header "Content-Type: application/json" \
+              --data-binary "@$request" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases"
+          )"
+          test "$status" = "201"
+
+          release_id="$(jq -er '
+            .id |
+            select(type == "number" and . > 0 and floor == .)
+          ' "$response")"
+          api_url="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id"
+          upload_url="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets{?name,label}"
+          jq -e \
+            --argjson id "$release_id" \
+            --arg tag "$TAG" \
+            --arg name "mysteries $TAG" \
+            --arg api_url "$api_url" \
+            --arg upload_url "$upload_url" '
+              type == "object" and
+              .id == $id and
+              .tag_name == $tag and
+              .name == $name and
+              .draft == true and
+              .prerelease == false and
+              (.target_commitish | type == "string" and length > 0) and
+              (.assets | type == "array" and length == 0) and
+              .url == $api_url and
+              .upload_url == $upload_url
+            ' "$response" >/dev/null
+          jq -e -r -j '
+            if (.body | type) == "string"
+            then .body
+            else error("created draft body must be a string")
+            end
+          ' "$response" > "$RUNNER_TEMP/create-release-body"
+          cmp -s bundle/release-notes.md "$RUNNER_TEMP/create-release-body"
+
           printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+          printf 'api_url=%s\n' "$api_url" >> "$GITHUB_OUTPUT"
+          printf 'upload_url=%s\n' "$upload_url" >> "$GITHUB_OUTPUT"
+
+      - name: Upload draft assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.release_id }}
+          UPLOAD_URL: ${{ steps.draft_release.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          expected_upload_url="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets{?name,label}"
+          test "$UPLOAD_URL" = "$expected_upload_url"
+          upload_base="${UPLOAD_URL::-13}"
+          test "$upload_base" != "$UPLOAD_URL"
+
+          responses="$RUNNER_TEMP/upload-responses"
+          mkdir "$responses"
+          : > "$RUNNER_TEMP/uploaded-assets.ndjson"
+          for asset in "$WINDOWS_ASSET" "$LINUX_ASSET" SHA256SUMS; do
+            file="bundle/$asset"
+            test -f "$file"
+            test -s "$file"
+            size="$(stat --printf='%s' "$file")"
+            digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            response="$responses/$asset.json"
+            status="$(
+              curl --silent --show-error \
+                --output "$response" \
+                --write-out '%{http_code}' \
+                --request POST \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "User-Agent: mysteries-release-workflow" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --header "Content-Type: application/octet-stream" \
+                --data-binary "@$file" \
+                "$upload_base?name=$asset"
+            )"
+            test "$status" = "201"
+            jq -e \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg name "$asset" \
+              --argjson size "$size" \
+              --arg digest "$digest" '
+                type == "object" and
+                (.id | type == "number" and . > 0 and floor == .) and
+                .name == $name and
+                .state == "uploaded" and
+                .size == $size and
+                .url == (
+                  "https://api.github.com/repos/" + $repository +
+                  "/releases/assets/" + (.id | tostring)
+                ) and
+                (
+                  (has("digest") | not) or
+                  .digest == null or
+                  .digest == $digest
+                )
+              ' "$response" >/dev/null
+            jq -c '
+              {
+                id,
+                name,
+                state,
+                size,
+                url,
+                digest: (.digest // null)
+              }
+            ' "$response" >> "$RUNNER_TEMP/uploaded-assets.ndjson"
+          done
+
+          jq -s \
+            --arg windows "$WINDOWS_ASSET" \
+            --arg linux "$LINUX_ASSET" '
+              select(length == 3) |
+              select((map(.id) | unique | length) == 3) |
+              select(
+                (map(.name) | sort) ==
+                ([$windows, $linux, "SHA256SUMS"] | sort)
+              )
+            ' "$RUNNER_TEMP/uploaded-assets.ndjson" \
+            > "$RUNNER_TEMP/uploaded-assets.json"
+          test -s "$RUNNER_TEMP/uploaded-assets.json"
+
+      - name: Fetch draft Release metadata through API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > draft.json
 
       - name: Verify draft Release metadata and body identity locally
         shell: bash
@@ -961,6 +1091,25 @@ jobs:
             (.target_commitish | type == "string" and length > 0) and
             ([.assets[] | select(.size <= 0)] | length == 0)
           ' draft.json >/dev/null
+          jq -S '
+            [
+              .assets[] |
+              {
+                id,
+                name,
+                state,
+                size,
+                url,
+                digest: (.digest // null)
+              }
+            ] |
+            sort_by(.name)
+          ' draft.json > "$RUNNER_TEMP/draft-assets.json"
+          jq -S 'sort_by(.name)' "$RUNNER_TEMP/uploaded-assets.json" \
+            > "$RUNNER_TEMP/upload-response-assets.json"
+          cmp -s \
+            "$RUNNER_TEMP/upload-response-assets.json" \
+            "$RUNNER_TEMP/draft-assets.json"
           diff -u \
             <(printf '%s\n' "$WINDOWS_ASSET" "$LINUX_ASSET" SHA256SUMS | sort) \
             <(jq -r '.assets[].name' draft.json | sort)

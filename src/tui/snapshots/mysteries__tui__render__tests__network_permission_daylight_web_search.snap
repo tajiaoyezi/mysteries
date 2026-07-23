@@ -2,7 +2,7 @@
 source: src/tui/render.rs
 expression: "render_to_styled_with_size(&network_permission_state(true),\n&Theme::daylight(), 80, 24)"
 ---
-‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.3.0‹/›
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.3.1‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 ‹text.title›                   ‹/›‹accent.primary›〔/help〕‹/›‹text.title› 查看内置命令‹/›
