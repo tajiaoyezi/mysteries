@@ -85,14 +85,50 @@ tag run 等待审批后走最短 UI 路径：
 ```powershell
 $Release = Invoke-RestMethod 'https://api.github.com/repos/tajiaoyezi/mysteries/releases/latest'
 if ($Release.tag_name -ne 'v1.3.0' -or -not $Release.immutable) { throw '公开 Release metadata 异常' }
+$DownloadDir = Join-Path $env:TEMP "mysteries-v1.3.0-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $DownloadDir | Out-Null
 $Asset = 'mysteries-v1.3.0-x86_64-pc-windows-msvc.zip'
 $Base = 'https://github.com/tajiaoyezi/mysteries/releases/download/v1.3.0'
-Invoke-WebRequest "$Base/$Asset" -OutFile "$env:TEMP\$Asset"
-Invoke-WebRequest "$Base/SHA256SUMS" -OutFile "$env:TEMP\SHA256SUMS"
-Expand-Archive "$env:TEMP\$Asset" -DestinationPath "$env:TEMP\mysteries-v1.3.0"
-& "$env:TEMP\mysteries-v1.3.0\mysteries.exe" --version
-& "$env:TEMP\mysteries-v1.3.0\mysteries.exe" --help
-& "$env:TEMP\mysteries-v1.3.0\mysteries.exe"
+$Archive = Join-Path $DownloadDir $Asset
+$Manifest = Join-Path $DownloadDir 'SHA256SUMS'
+Invoke-WebRequest "$Base/$Asset" -OutFile $Archive
+Invoke-WebRequest "$Base/SHA256SUMS" -OutFile $Manifest
+$Matches = @(Get-Content $Manifest | Where-Object { $_ -match "^[0-9a-f]{64}  $([regex]::Escape($Asset))$" })
+if ($Matches.Count -ne 1) { throw 'SHA256SUMS 记录缺失或重复' }
+$Expected = ($Matches[0] -split '\s+')[0]
+$Actual = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($Actual -ne $Expected) { throw 'SHA-256 不匹配' }
+
+$AppDir = Join-Path $DownloadDir 'app'
+Expand-Archive $Archive -DestinationPath $AppDir
+$Exe = Join-Path $AppDir 'mysteries.exe'
+$SmokeHome = Join-Path $DownloadDir 'smoke-home'
+New-Item -ItemType Directory -Path $SmokeHome | Out-Null
+$SavedHome = $env:HOME
+$SavedUserProfile = $env:USERPROFILE
+$SavedXdgConfigHome = $env:XDG_CONFIG_HOME
+try {
+    $env:HOME = $SmokeHome
+    $env:USERPROFILE = $SmokeHome
+    $env:XDG_CONFIG_HOME = $SmokeHome
+    Push-Location $SmokeHome
+    try {
+        $Version = (& $Exe --version | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $Version -ne 'mysteries 1.3.0') { throw "--version 异常: $Version" }
+        & $Exe --help | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '--help 失败' }
+        & $Exe
+        if ($LASTEXITCODE -ne 0) { throw 'TUI 非正常退出' }
+    }
+    finally {
+        Pop-Location
+    }
+}
+finally {
+    $env:HOME = $SavedHome
+    $env:USERPROFILE = $SavedUserProfile
+    $env:XDG_CONFIG_HOME = $SavedXdgConfigHome
+}
 ```
 
 - [ ] checksum 匹配，`--version` 为 `mysteries 1.3.0`，`--help` 正常。

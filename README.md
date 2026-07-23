@@ -108,6 +108,8 @@ $ActualVersion
 GNU/Linux：
 
 ```bash
+(
+set -euo pipefail
 latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/tajiaoyezi/mysteries/releases/latest)"
 tag="${latest_url##*/}"
 [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
@@ -126,6 +128,7 @@ tar -xzf "$asset" -C "$directory"
 actual_version="$("./$directory/mysteries" --version)"
 test "$actual_version" = "mysteries $version"
 printf '%s\n' "$actual_version"
+)
 ```
 
 GNU/Linux 预编译包的支持基线为 x86_64、glibc 2.35-compatible（Ubuntu 22.04 或更新的兼容环境）。更老的 glibc 或 musl 环境请从源码构建。
