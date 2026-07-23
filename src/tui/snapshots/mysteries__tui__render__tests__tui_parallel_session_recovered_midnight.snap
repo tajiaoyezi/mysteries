@@ -3,7 +3,7 @@ source: src/tui/render.rs
 assertion_line: 4474
 expression: text
 ---
-‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.3.0‹/›
+‹text.secondary +bold›✦ mysteries‹/›‹text.muted›  agent · v1.3.1‹/›
 
 ‹border.strong›────────────────────────────────────────────────────────────────────────────────‹/›
 ‹error.fg›✗‹/›‹text.muted› ‹/›‹accent.primary +bold›read_file‹/›‹text.muted› {}‹/›‹text.secondary›  只读 · 自动运行 · 1 行 ⌄‹/›‹text.muted› · ctrl+o 展开‹/›

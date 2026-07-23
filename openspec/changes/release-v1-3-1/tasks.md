@@ -7,27 +7,27 @@
 
 ## 2. v1.3.1 版本与文档
 
-- [ ] 2.1 将根`Cargo.toml`与根package lock entry从`1.3.0`机械更新为`1.3.1`，证明dependency解析零变化。
-- [ ] 2.2 更新`CHANGELOG.md`：保留空`Unreleased`，把`v1.3.0`如实标为保留tag/draft、未公开且已消耗，并将v1.3功能集与post-create list rediscovery failure window修复固化到带计划tag UTC日期的`1.3.1`条目；不得把eventual-consistency写成已证实根因。
-- [ ] 2.3 更新README中本次能力的版本归属为`v1.3.1`，保持动态`releases/latest`安装命令与既有v1.2.0历史真实；`deliverables/README.md`保持零diff。
-- [ ] 2.4 只把71份package-version-driven snapshots中的`v1.3.0`字面量更新为`v1.3.1`；Rust source及两个历史session version fixtures保持零diff，`.snap.new=0`。
+- [x] 2.1 将根`Cargo.toml`与根package lock entry从`1.3.0`机械更新为`1.3.1`，证明dependency解析零变化。
+- [x] 2.2 更新`CHANGELOG.md`：保留空`Unreleased`，把`v1.3.0`如实标为保留tag/draft、未公开且已消耗，并将v1.3功能集与post-create list rediscovery failure window修复固化到带计划tag UTC日期的`1.3.1`条目；不得把eventual-consistency写成已证实根因。
+- [x] 2.3 更新README中本次能力的版本归属为`v1.3.1`，保持动态`releases/latest`安装命令与既有v1.2.0历史真实；`deliverables/README.md`保持零diff。
+- [x] 2.4 只把71份package-version-driven snapshots中的`v1.3.0`字面量更新为`v1.3.1`；Rust runtime source及两个历史session version fixtures保持零diff，`.snap.new=0`。
 
 ## 3. Create响应捕获 TDD
 
-- [ ] 3.1 RED：建立无credential fixture/static assertions，证明现有workflow在Create成功但Release list仍不可见时失败，并覆盖create响应缺失/非法ID、URL/upload URL、tag/name/draft/prerelease/body/assets/target identity漂移、POST冲突与禁止create retry。
-- [ ] 3.2 RED：增加direct upload失败矩阵，覆盖非`201`、重复/非法asset ID、错误name/state/size/API URL/digest、同名占用、partial upload，以及upload响应tuple与随后captured Release GET `.assets` tuple串错；确认现有`gh release upload`/list rediscovery实现不能满足这些断言。
-- [ ] 3.3 GREEN：把draft创建改为官方Create Release REST POST，使用sealed notes构造请求并验证`201`响应；输出authoritative Release ID、API URL与upload URL，删除create后的list ID rediscovery且不自动retry。
-- [ ] 3.4 GREEN：通过captured upload URL上传三个固定assets并逐个验证`201`响应；随后仅以captured ID执行draft GET并断言`.id`一致，把三个upload响应的ID/name/size/API URL/digest tuple与draft `.assets`精确交叉绑定后再做asset下载与public PATCH；禁止`gh release upload`、clobber、list/tag/HTML ID推导。
-- [ ] 3.5 运行完整fixture矩阵，增加正向case证明Release list持续不可见时captured ID路径仍成功；所有负向case必须在asset upload或public PATCH的正确边界fail-closed且不访问真实credential。
+- [x] 3.1 RED：建立无credential fixture/static assertions，证明现有workflow在Create成功但Release list仍不可见时失败，并覆盖create响应缺失/非法ID、URL/upload URL、tag/name/draft/prerelease/body/assets/target identity漂移、POST冲突与禁止create retry。
+- [x] 3.2 RED：增加direct upload失败矩阵，覆盖非`201`、重复/非法asset ID、错误name/state/size/API URL/digest、同名占用、partial upload，以及upload响应tuple与随后captured Release GET `.assets` tuple串错；确认现有`gh release upload`/list rediscovery实现不能满足这些断言。
+- [x] 3.3 GREEN：把draft创建改为官方Create Release REST POST，使用sealed notes构造请求并验证`201`响应；输出authoritative Release ID、API URL与upload URL，删除create后的list ID rediscovery且不自动retry。
+- [x] 3.4 GREEN：通过captured upload URL上传三个固定assets并逐个验证`201`响应；随后仅以captured ID执行draft GET并断言`.id`一致，把三个upload响应的ID/name/size/API URL/digest tuple与draft `.assets`精确交叉绑定后再做asset下载与public PATCH；禁止`gh release upload`、clobber、list/tag/HTML ID推导。
+- [x] 3.5 运行完整43-case fixture矩阵，增加正向case证明Release list持续不可见时captured ID路径仍成功；所有负向case必须在asset upload或public PATCH的正确边界fail-closed且不访问真实credential。
 
 ## 4. 本地质量门与范围审计
 
-- [ ] 4.1 验证metadata、根manifest/lockfile、Changelog唯一heading、README/release notes及release binary version全部为`1.3.1`，lockfile除根version外零diff。
-- [ ] 4.2 运行`cargo fmt --all -- --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked`与`cargo build --release --locked`，再验证release binary `--version`/`--help`。
-- [ ] 4.3 运行固定`cargo-audit audit --deny unsound --file Cargo.lock`，要求0 vulnerability/0 unsound且不新增ignore。
-- [ ] 4.4 运行release metadata/package/evidence/permissions全部既有正负fixture及本change create/upload新增矩阵，确认PR/dispatch不发布、publish不checkout、token scope和job permissions未扩大。
-- [ ] 4.5 运行`openspec validate release-v1-3-1 --strict`、`openspec validate --all --strict`、`git diff --check`与scope扫描；确认Rust source、CI/Security workflows、dependency graph、binary/archive/checksum、credential、绝对用户路径及`deliverables/README.md`均零diff。
-- [ ] 4.6 独立对抗式审查spec、workflow、fixture、版本文档与snapshot diff；修复所有P0/P1/P2并循环复审至无问题。
+- [x] 4.1 验证metadata、根manifest/lockfile、Changelog唯一heading、README/release notes及release binary version全部为`1.3.1`，lockfile除根version外零diff。
+- [x] 4.2 运行`cargo fmt --all -- --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked`与`cargo build --release --locked`，再验证release binary `--version`/`--help`。
+- [x] 4.3 运行固定`cargo-audit audit --deny unsound --file Cargo.lock`，要求0 vulnerability/0 unsound且不新增ignore。
+- [x] 4.4 运行release metadata/package/evidence/permissions全部既有正负fixture及本change 43-case create/upload矩阵，确认PR/dispatch不发布、publish不checkout、token scope和job permissions未扩大。
+- [x] 4.5 运行`openspec validate release-v1-3-1 --strict`、`openspec validate --all --strict`、`git diff --check`与scope扫描；确认Rust runtime source、CI/Security workflows、dependency graph、binary/archive/checksum、credential、绝对用户路径及`deliverables/README.md`均零diff，持久fixture仅新增`tests/release_workflow.rs`。
+- [x] 4.6 独立对抗式审查spec、workflow、fixture、版本文档与snapshot diff；修复所有P0/P1/P2并循环复审至无问题。
 
 ## 5. Implementation PR 与远端设置
 

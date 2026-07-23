@@ -25,5 +25,5 @@
 ## Impact
 
 - 主要影响 `.github/workflows/release.yml`、根版本/发布文档、版本敏感 TUI snapshots，以及 `release-v1-3-0` / `release-v1-3-1` OpenSpec 证据；`deliverables/README.md` 保持零 diff。
-- 不修改 Rust source、CI/Security workflow、dependency graph、公开 CLI/API、session/config schema 或 TUI 交互。
+- 不修改 Rust runtime source、CI/Security workflow、dependency graph、公开 CLI/API、session/config schema 或 TUI 交互；允许新增只约束 release workflow 的 Rust integration test。
 - GitHub 远端新增的正式对象只能是新的 annotated `v1.3.1` tag 与其 Release；现有 `v1.3.0` 失败对象保持原状。

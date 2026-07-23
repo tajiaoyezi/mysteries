@@ -60,7 +60,7 @@ create前的 paginated preflight继续检查同 tag不存在任何 draft/public 
 
 ### 4. Patch version与文档保持机械、可审计
 
-根 `Cargo.toml` / `Cargo.lock` 仅把 package version从 `1.3.0` 改为 `1.3.1`。71份 package-version-driven snapshots只接受 `v1.3.0`→`v1.3.1` 字面量变化；Rust source与两个 `src/tui/mod.rs` 历史 `1.2.0` session fixtures保持零 diff。
+根 `Cargo.toml` / `Cargo.lock` 仅把 package version从 `1.3.0` 改为 `1.3.1`。71份 package-version-driven snapshots只接受 `v1.3.0`→`v1.3.1` 字面量变化；Rust runtime source与两个 `src/tui/mod.rs` 历史 `1.2.0` session fixtures保持零 diff。新增的 `tests/release_workflow.rs` 只作为持久、无credential的 workflow regression harness，不进入release binary。
 
 Changelog保留 `v1.3.0` 条目但明确其 tag/draft保留、未公开且版本已消耗；`v1.3.1` 记录为v1.3功能集的首次公开交付并包含post-create list rediscovery failure window修复，不把eventual-consistency假说写成已证实根因。README把能力版本归属更新到v1.3.1，动态 `releases/latest` 安装块保持不变；`deliverables/README.md`零 diff。
 
@@ -78,7 +78,7 @@ implementation PR通过后、tag前，把 `release` environment唯一 custom tag
 - **[Create成功后任一步失败留下partial draft]** → 这是既有fail-closed contract；保留draft作为证据，version立即消耗，禁止自动cleanup或rerun。
 - **[Token经curl泄露]** → token只注入create/upload/API steps，使用silent非verbose调用，不打印headers/request，不进入checkout、local checksum或public verify。
 - **[直接POST不含`gh release create --verify-tag`]** → 保留且不削弱create前的anonymous annotated-tag/peeled SHA、ruleset、candidate ancestry与preflight evidence重验。
-- **[版本机械更新引入snapshot churn]** → 逐文件归一化审计，只接受版本字面量变化，`.snap.new=0`，Rust source零 diff。
+- **[版本机械更新引入snapshot churn]** → 逐文件归一化审计，只接受版本字面量变化，`.snap.new=0`，Rust runtime source零 diff。
 - **[v1.3.0残留draft被误操作]** → 所有新请求与environment policy精确绑定 `v1.3.1`；preflight、task与archive log明确禁止触碰旧tag/draft。
 
 ## Migration Plan
