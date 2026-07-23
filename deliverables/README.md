@@ -9,7 +9,7 @@
   ./mysteries-v1.1.0-windows-x64.exe auth login   # 配置 provider + API Key
   ./mysteries-v1.1.0-windows-x64.exe              # 进入 TUI
   ```
-  当前版本请从 GitHub Release 下载 Windows/Linux archive，或自行 `cargo build --release`（产物在 `target/release/`）。v1.2.0 及后续 binary/archive/checksum 不再提交到本目录。
+  当前版本请按[根 README 安装说明](../README.md#-快速开始)从 GitHub Release 下载 Windows/Linux archive，或自行 `cargo build --release`（产物在 `target/release/`）。v1.2.0 及后续 binary/archive/checksum 不再提交到本目录。
 
 ## 🐍 Snake-Rogue demo
 

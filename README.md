@@ -39,8 +39,8 @@
 
 ## ✨ 特性
 
-- **Agent Loop 自研**:模型决策 → tool_calls 过权限门 → 执行回传 → 续推;每次 run 具有内核级 execution scope,可标识、可取消,并以 iteration/deadline/depth 预算及工具/权限 capability 上限阻止派生 run 扩权;Esc 中断由 Loop 统一收口 history,Provider 回复前中断的未提交 Prompt 不会污染下一轮模型上下文。同一回复中连续的本地读取 / 搜索(`list_dir` / `read_file` / `glob` / `grep`)与只读委派可进入既有上限 4 的有界安全段;变更 / 执行 / Network / 交互工具仍串行屏障,权限语义不变。
-- **单层只读委派([Unreleased])**:`delegate_task`为每个 occurrence 创建临时child Agent,只暴露`list_dir` / `read_file` / `glob` / `grep`,并把读取限制在canonical workspace root内（包括目录walker加载的parent、`.ignore`与`.gitignore`规则文件）;无递归、后台任务、child session、写入或Network child。outer同时active的child最多4个,这不是单轮调用总量上限;每个child最多8次tool-enabled Provider调用,触顶后至多再发1次forced-final,且从调用开始共用120秒总wall-clock。成本最坏放大为`delegate occurrence数 × 最多9次Provider调用`。
+- **Agent Loop 自研**:模型决策 → tool_calls 过权限门 → 执行回传 → 续推;自v1.3.0起,每次 run 具有内核级 execution scope,可标识、可取消,并以 iteration/deadline/depth 预算及工具/权限 capability 上限阻止派生 run 扩权;Esc 中断由 Loop 统一收口 history,Provider 回复前中断的未提交 Prompt 不会污染下一轮模型上下文。同一回复中连续的本地读取 / 搜索(`list_dir` / `read_file` / `glob` / `grep`)与只读委派可进入既有上限 4 的有界安全段;变更 / 执行 / Network / 交互工具仍串行屏障,权限语义不变。
+- **单层只读委派(v1.3.0)**:`delegate_task`为每个 occurrence 创建临时child Agent,只暴露`list_dir` / `read_file` / `glob` / `grep`,并把读取限制在canonical workspace root内（包括目录walker加载的parent、`.ignore`与`.gitignore`规则文件）;无递归、后台任务、child session、写入或Network child。outer同时active的child最多4个,这不是单轮调用总量上限;每个child最多8次tool-enabled Provider调用,触顶后至多再发1次forced-final,且从调用开始共用120秒总wall-clock。成本最坏放大为`delegate occurrence数 × 最多9次Provider调用`。
 - **内置工具**:`list_dir` / `read_file` / `glob` / `grep` / `delegate_task`(单层只读委派)/ `write_file` / `edit_file`(唯一匹配替换)/ `run_shell` + 联网 `web_fetch` / `web_search`(SSRF 护栏)+ Plan 三件 `submit_plan` / `update_plan` / `ask_user`。
 - **四级权限 × 四种模式**:工具按 `ReadOnly/Network/Edit/Execute` 分级;`Normal / AcceptEdits / Yolo / Plan` 经 Shift+Tab 循环。有效 Network preview 在 Normal/AcceptEdits/Plan 下逐次确认,Yolo 仅自动放行可授权 preview;未知或畸形 Network 调用始终拒绝。命令白名单 + always-allow 仅适用于 Execute。
 - **Plan 模式**:先只读调研 → 交出带每步验收的结构化计划 → 你批准后逐步执行,常驻进度面板实时上报。
@@ -80,31 +80,52 @@
 
 ### 下载 GitHub Release（推荐）
 
-在 [v1.2.0 Release](https://github.com/tajiaoyezi/mysteries/releases/tag/v1.2.0) 下载对应平台的 archive 与 `SHA256SUMS`：
-
-- Windows x86_64：`mysteries-v1.2.0-x86_64-pc-windows-msvc.zip`
-- GNU/Linux x86_64：`mysteries-v1.2.0-x86_64-unknown-linux-gnu.tar.gz`
+先从公开 [latest stable Release](https://github.com/tajiaoyezi/mysteries/releases/latest) 解析真实 tag，再由该 tag 派生对应平台的 versioned archive、`SHA256SUMS`、解压目录与版本检查。下面的命令不需要 GitHub credential。
 
 Windows PowerShell：
 
 ```powershell
-$Asset = 'mysteries-v1.2.0-x86_64-pc-windows-msvc.zip'
-Invoke-WebRequest "https://github.com/tajiaoyezi/mysteries/releases/download/v1.2.0/$Asset" -OutFile $Asset
-Invoke-WebRequest 'https://github.com/tajiaoyezi/mysteries/releases/download/v1.2.0/SHA256SUMS' -OutFile SHA256SUMS
-$Expected = ((Get-Content SHA256SUMS | Where-Object { $_ -match "  $([regex]::Escape($Asset))$" }) -split '\s+')[0]
+$Release = Invoke-RestMethod 'https://api.github.com/repos/tajiaoyezi/mysteries/releases/latest'
+$Tag = [string]$Release.tag_name
+if ($Tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') { throw 'latest stable tag 格式异常' }
+$Version = $Tag.Substring(1)
+$Asset = "mysteries-v$Version-x86_64-pc-windows-msvc.zip"
+$Base = "https://github.com/tajiaoyezi/mysteries/releases/download/$Tag"
+Invoke-WebRequest "$Base/$Asset" -OutFile $Asset
+Invoke-WebRequest "$Base/SHA256SUMS" -OutFile SHA256SUMS
+$Matches = @(Get-Content SHA256SUMS | Where-Object { $_ -match "^[0-9a-f]{64}  $([regex]::Escape($Asset))$" })
+if ($Matches.Count -ne 1) { throw 'SHA256SUMS 记录缺失或重复' }
+$Expected = ($Matches[0] -split '\s+')[0]
 if ((Get-FileHash $Asset -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Expected) { throw 'SHA-256 不匹配' }
-Expand-Archive $Asset -DestinationPath mysteries-v1.2.0
-./mysteries-v1.2.0/mysteries.exe --version
+$Directory = "mysteries-$Tag"
+if (Test-Path -LiteralPath $Directory) { throw "解压目录已存在: $Directory" }
+Expand-Archive $Asset -DestinationPath $Directory
+$ActualVersion = (& "./$Directory/mysteries.exe" --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $ActualVersion -ne "mysteries $Version") { throw "--version 不匹配: $ActualVersion" }
+$ActualVersion
 ```
 
 GNU/Linux：
 
 ```bash
-curl -fLO https://github.com/tajiaoyezi/mysteries/releases/download/v1.2.0/mysteries-v1.2.0-x86_64-unknown-linux-gnu.tar.gz
-curl -fLO https://github.com/tajiaoyezi/mysteries/releases/download/v1.2.0/SHA256SUMS
-grep 'mysteries-v1.2.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS | sha256sum --check
-tar -xzf mysteries-v1.2.0-x86_64-unknown-linux-gnu.tar.gz
-./mysteries --version
+latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/tajiaoyezi/mysteries/releases/latest)"
+tag="${latest_url##*/}"
+[[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+version="${tag#v}"
+asset="mysteries-v${version}-x86_64-unknown-linux-gnu.tar.gz"
+base="https://github.com/tajiaoyezi/mysteries/releases/download/$tag"
+curl -fL --retry 3 -O "$base/$asset"
+curl -fL --retry 3 -O "$base/SHA256SUMS"
+checksum_line="$(
+  awk -v asset="$asset" '$2 == asset { count++; line=$0 } END { if (count != 1) exit 1; print line }' SHA256SUMS
+)"
+printf '%s\n' "$checksum_line" | sha256sum --check --strict
+directory="mysteries-$tag"
+mkdir "$directory"
+tar -xzf "$asset" -C "$directory"
+actual_version="$("./$directory/mysteries" --version)"
+test "$actual_version" = "mysteries $version"
+printf '%s\n' "$actual_version"
 ```
 
 GNU/Linux 预编译包的支持基线为 x86_64、glibc 2.35-compatible（Ubuntu 22.04 或更新的兼容环境）。更老的 glibc 或 musl 环境请从源码构建。

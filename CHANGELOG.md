@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-23
+
+> 收口 Agent execution scope 与单层只读 subagent；不引入 config/session wire 迁移或新的写入、Network child 能力。
+
 ### 新增
 - **Agent execution scope 基础**:每次 Agent run 具有稳定 identity、可传播 cancellation、iteration/deadline/child-depth 预算和单调收窄的工具/权限 capability;既有入口保持兼容,TUI Interrupt 改由 Agent Loop 内核收口 history,Provider 回复前中断会隔离未提交的旧 Prompt,避免下一轮继续旧任务。受限 `ToolRegistry` 共享同一工具实例,scope clamp 先于权限模式、allowlist 与用户决策生效;取消不硬终止已进入 blocking pool 的 OS 同步工作。
 - **单层只读 `delegate_task`**:TUI与headless可把workspace调研委派给临时child Agent;child只含`list_dir` / `read_file` / `glob` / `grep`,以canonical path限制在当前workspace（包含walker加载的parent、`.ignore`与`.gitignore`规则文件）,不复制parent history,结果用untrusted envelope返回。outer同时active的child固定≤4,但单轮delegate occurrence总数不设硬上限;每个child最多8次tool-enabled Provider调用加1次forced-final,从invocation开始以120秒覆盖preflight和完整run,成本放大上界为`delegate occurrence数 × 最多9次Provider调用`。本MVP不含递归、后台任务、child session、跨child token总预算、写入或Network child;child-only扫描字节也无硬上限。四fs工具继续先读取 / 遍历 / 收集；仅`read_file`与`grep`按输出cap后置截断，`list_dir`与`glob`的既有输出没有该硬上限。
@@ -68,7 +72,8 @@
 - **TUI 外壳**:ratatui + crossterm,双 task + channel 架构,Midnight/Daylight 双主题。
 - **凭据链**(env → 文件)、**配置分层**(用户级 + 项目级合并)、**首次运行引导**。
 
-[Unreleased]: https://github.com/tajiaoyezi/mysteries/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/tajiaoyezi/mysteries/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/tajiaoyezi/mysteries/releases/tag/v1.3.0
 [1.2.0]: https://github.com/tajiaoyezi/mysteries/releases/tag/v1.2.0
 [1.1.0]: https://github.com/tajiaoyezi/mysteries/commit/271d4ee67954dce7ea242144a0268adfd0cd4d61
 [1.0.0]: https://github.com/tajiaoyezi/mysteries/commit/8c99d0dda69eb5648d7e7ec8871179f73794d439
