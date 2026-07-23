@@ -2,13 +2,13 @@
 source: src/tui/render.rs
 expression: output
 ---
-✦ mysteries  agent · v1.2.0
+✦ mysteries  agent · v1.3.0
 
 ────────────────────────────────────────────────────────────────────────────────
 
 
                                   ✦ MYSTERIES
-                         AGENT · v1.2.0 · 终端编码助手
+                         AGENT · v1.3.0 · 终端编码助手
         读只读,写必询 —— 每一次文件改动与命令执行,都先把 diff 摊给你,等
                                你按下 y 才动手。
 
